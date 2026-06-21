@@ -13,15 +13,22 @@ spirit of the original [KodaCAD](https://dblanding.github.io/kodacad/).
   multiple CAD systems. See `docs/STEP_NOTES.md` for the full story,
   including a real upstream `build123d` bug found and worked around.
 - ✅ **GUI / 3D viewport** — native OCCT viewer embedded in PySide6:
-  render, orbit/pan/zoom, click-to-select picking (face-level),
+  render, orbit/pan/zoom, click-to-select picking (face/edge/vertex),
   assembly tree with show/hide and drag-and-drop reparenting,
   bidirectional selection sync between tree and viewport. See
   `docs/VIEWPORT_NOTES.md`.
-- ✅ **Pose math foundation** (`src/pose.py`) — `PointRef`/`DirectionRef`
-  picking-target resolution, `Plane`-based frame construction, one-shot
-  `from_plane`/`to_plane` transform composition. Proven via self-test.
-- 🚧 **Position/Mate-Align workflow, undo/redo, file format** — designed
-  in conversation, not yet built. See `docs/DESIGN_BACKLOG.md`.
+- ✅ **Pose math + real-geometry picking, proven end to end** —
+  `PointRef`/`DirectionRef` picking-target resolution (including a
+  circle-fit fallback for STEP files that don't encode clean `CIRCLE`
+  edges), `Plane`-based frame construction, and moving a real part in
+  place via `Shape.move()` — all verified together on a real,
+  multi-part STEP assembly: pick → resolve → move → export → reload
+  in an independent viewer. See `docs/DESIGN_BACKLOG.md` §5 for the
+  full account, including two real bugs found and fixed along the way.
+- 🚧 **Position/Mate-Align accumulator workflow, undo/redo, file
+  format** — designed in conversation, not yet built. The groundwork
+  above is the proven foundation the accumulator sits on. See
+  `docs/DESIGN_BACKLOG.md`.
 
 ## Layout
 
@@ -61,7 +68,9 @@ uv sync          # installs everything from pyproject.toml / uv.lock
 
 ```bash
 uv run src/step_assembly_poc.py [path/to/assembly.step]
-uv run gui/main_app.py [path/to/assembly.step]   # the real, merged app
+uv run src/pose.py                                # pose/circle-fit self-test (no GUI)
+uv run gui/main_app.py [path/to/assembly.step]     # the real, merged app
+uv run gui/test_move_rod_axially.py step/as1-oc-214.stp   # full pick->pose->move->export test
 ```
 
 ## Docs index
@@ -74,7 +83,9 @@ uv run gui/main_app.py [path/to/assembly.step]   # the real, merged app
   OCCT's native viewer in PySide6: setup, what "success" looks like,
   how to report a failure usefully.
 - [`docs/DESIGN_BACKLOG.md`](docs/DESIGN_BACKLOG.md) — running list of
-  designed-but-not-yet-built threads: the HP/CoCreate-style
-  Position/Mate-Align workflow, copy-vs-share UI pattern, undo/redo
-  (including an open, unverified question about whether it can even
-  apply to our build123d-based data model), file storage format.
+  designed-but-not-yet-built threads (the HP/CoCreate-style
+  Position/Mate-Align workflow, copy-vs-share UI pattern, undo/redo,
+  file storage format) plus §5: a full account of picking → pose →
+  move → export now proven end to end, including every real bug found
+  and fixed along the way — worth checking before assuming something
+  new is broken.

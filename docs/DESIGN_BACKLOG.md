@@ -9,9 +9,17 @@ relevant area's own doc (or into actual code) once they're resolved.
 
 ## 1. Position / Mate-Align workflow (HP/CoCreate pattern)
 
-**Status:** designed in conversation, not yet built. `pose.py`'s
-`Plane`/`compute_move()` math is the proven foundation underneath
-this; what's missing is the layer above it.
+**Status:** designed in conversation, not yet built -- but as of
+tonight, EVERY piece of groundwork underneath it is now proven on
+real geometry, not just synthetic test data. See Section 5 below for
+the full account. In short: picking (face/edge/vertex) resolves
+correctly through `pose.py`'s `PointRef`/`DirectionRef` on a real,
+complex STEP assembly, including circular edges that real-world STEP
+files don't always encode cleanly; and a part can be moved in place
+via `Shape.move()` with zero tree disruption, verified by export and
+reload in an independent viewer. What's still missing is purely the
+ACCUMULATOR layer described below -- the underlying mechanics are
+ready.
 
 **The reference UX** (from CoCreate / PTC Creo Elements/Direct
 Modeling, which Doug has used and wants to pattern this after):
@@ -186,7 +194,118 @@ and doesn't need a dedicated design session soon.
 
 ---
 
-## How to use this doc
+## 5. Picking -> pose -> move -> export, proven end to end (this session)
+
+**Status: DONE.** This was the big push this session, and every piece
+of it now works on real geometry from `as1-oc-214.stp`, not just
+synthetic test data. Worth a permanent record since several real bugs
+got found and fixed along the way -- future debugging should check
+this list before assuming something new is broken.
+
+### Picking: face, edge, and vertex selection
+
+Two real, confirmed bugs, both fixed:
+
+- **`AIS_Shape` selection-mode mismatch.** `AIS_Shape`'s own
+  selection-mode integers are NOT guaranteed to equal
+  `TopAbs_ShapeEnum`'s values -- there's a documented, sanctioned
+  translation method, but this OCP build exposes it as the STATIC
+  form `AIS_Shape.SelectionMode_s(TopAbs_EDGE)` (called on the class),
+  not an instance method. Passing `TopAbs_FACE` directly had "worked"
+  only by numeric coincidence; `TopAbs_EDGE` did not, which is why
+  edge clicks were returning `TopAbs_SOLID` instead of `TopAbs_EDGE`.
+  **Remember this pattern** (`Did you mean: 'X_s'?` in a traceback)
+  generally -- it's the same `_s`-suffix-means-static convention that
+  bit us once before during the STEP export investigation
+  (`FindShape`/`FindShape_s`).
+- **Default 2px selection tolerance.** OCCT's default pick tolerance
+  is tiny -- fine for faces (which cover most of a solid's visible
+  area) but makes edges/vertices nearly unhittable by eye. Fixed via
+  `SetSelectionSensitivity()`.
+
+Result: face, straight edge, and vertex picking all confirmed working
+in the live app, including on a real multi-part, multiply-instanced
+assembly.
+
+### The `GeomType` enum comparison bug
+
+`geom_type` returns a real `GeomType` ENUM, not a string -- confirmed
+via build123d's own documented examples (`e.geom_type ==
+GeomType.CIRCLE`). Every `geom_type == "CIRCLE"` string comparison in
+this codebase (in BOTH `pose.py`'s original circle resolution AND
+`assembly_viewer.py`'s terminal reporting) was wrong from the start --
+meaning a genuinely circular edge may never have correctly hit the
+"fast path" even before any of tonight's other work. Fixed at the
+root in both files. Worth grepping for `== "CIRCLE"` or similar bare
+string comparisons against any OTHER enum-returning property if this
+class of bug is ever suspected elsewhere.
+
+### Circle-fit fallback for non-CIRCLE-typed circular edges
+
+Confirmed REAL (not hypothetical): `as1-oc-214.stp`'s `rod` part has
+its end-cap boundary split into SEMI-circular arc edges (confirmed by
+Doug's own topology analysis: the rod is 4 shells -- 2 flat circular
+ends + 2 semi-cylindrical sides, joined along 2 longitudinal seams),
+and at least one such arc is encoded as `geom_type == BSPLINE`, not
+`CIRCLE`, despite being geometrically circular. `pose.py` now falls
+back to a from-scratch least-squares circle fit (Kasa method) when
+`geom_type` isn't `CIRCLE`, verified against: a full synthetic
+circle, a half-circle (matching the real rod case), AND a straight
+edge (which must be cleanly REJECTED, not crash -- see below). All
+three are now permanent, hard-assertion regression tests in
+`pose.py`'s `_self_test()`.
+
+**A real bug found via live picking, not caught by any prior test:**
+the fit's normal-estimation step sums cross products of sampled point
+pairs; for COLLINEAR points (i.e. calling the circle-fit on an
+ordinary STRAIGHT edge -- which happens on EVERY edge pick, since
+circle_center/circle_axis is tried first regardless of geom_type),
+every cross product is the zero vector, and normalizing a zero vector
+throws OCCT's `Standard_ConstructionError` -- NOT a Python
+`ValueError`, so it silently escaped every `except ValueError:`
+handler built around the function. Confirmed via real picking: two
+ordinary straight edges on `plate` crashed with this exact error.
+Fixed by detecting the degenerate case explicitly and raising a clean
+`ValueError` before ever calling `.normalized()`. This gap existed
+because every prior test only ever fed the fit genuinely curved
+input -- now covered by a dedicated straight-edge rejection test.
+
+### Moving a part: `Shape.move()`, not `.location.position +=`
+
+Doug's instinct -- "why do we need to do ANYTHING with the assembly
+structure, we're just moving one part" -- was correct, and led
+directly to both finding a real bug and the simpler, correct fix.
+
+**The bug:** `rod.location` returns a DETACHED COPY of the shape's
+location, not a live reference. `rod.location.position += delta`
+mutates that throwaway copy -- no exception, because the operation is
+valid Python, it just never touches `rod` itself. Confirmed via real
+testing: before/after position printouts were silently IDENTICAL.
+This also means the FIRST attempted fix (`rod.moved(move)` +
+`remove_node()`/`add_node()` tree surgery to swap the new object in)
+was unnecessary complexity that ALSO directly caused a separate,
+serious bug: re-exporting after that tree surgery corrupted
+`rod-assembly` into STEP header text (`Open CASCADE STEP translator
+7.9.1.1`) in the exported file, confirmed via CAD Assistant.
+
+**The fix:** `rod.move(delta)` -- build123d's own documented method,
+explicitly described as "relative change of THIS object" (the other
+three methods in their 2x2 matrix: `locate`=absolute+this,
+`located`=absolute+copy, `moved`=relative+copy). In-place, no new
+object, NO tree restructuring needed at all -- confirming Doug's
+original intuition was right both in spirit and in the specific
+mechanics. Verified end to end: numeric shift (50.0000mm along axis,
+0.000000 perpendicular), in-memory tree print (confirmed untouched),
+export, and reload in CAD Assistant (rod visibly, correctly moved).
+
+**Test script:** `gui/test_move_rod_axially.py` -- kept as a
+standalone, runnable reference for "pick real geometry -> resolve a
+pose -> move a real part -> export -> verify," the first time this
+full chain was exercised together.
+
+---
+
+
 
 When picking a backlog item up: read its section here first, then
 check whether anything in the wider conversation history /

@@ -44,6 +44,7 @@ from build123d import import_step
 # exact file (as1-oc-214.stp) in the previous step of this project.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from step_assembly_poc import load_assembly  # noqa: E402
+from pose import PointRef, DirectionRef  # noqa: E402
 
 
 # A small, deterministic fallback palette (RGB 0-1 floats) for parts
@@ -406,40 +407,83 @@ class OcctViewportWidget(QWidget):
             except Exception as e:
                 part_info = f"(could not resolve owning part: {e})"
 
-            # For EDGES specifically: report whether it's straight or
-            # circular, using the SAME build123d Edge wrapper (and the
-            # same .geom_type check) that pose.py's PointRef/
-            # DirectionRef resolution relies on -- so what prints here
-            # tells you directly which pose.py "kind" this pick would
-            # resolve to (e.g. a circular edge -> circle_center /
-            # circle_axis; a straight edge -> edge_direction only, no
-            # circle_center).
-            geom_detail = ""
-            if shape_type == TopAbs_EDGE:
-                try:
-                    from build123d import Edge as B123Edge, GeomType
-                    wrapped_edge = B123Edge(shape)
-                    geom_type = wrapped_edge.geom_type
-                    # FIX: compare against the GeomType ENUM member,
-                    # not the bare string "CIRCLE" -- confirmed via
-                    # build123d's own docs that geom_type returns a
-                    # real GeomType enum (e.g. "e.geom_type ==
-                    # GeomType.CIRCLE" in their documented examples).
-                    # This bug meant a genuinely CIRCLE-typed edge
-                    # would NEVER have hit this branch before -- worth
-                    # remembering when interpreting any PRIOR terminal
-                    # output that showed "GeomType.BSPLINE"/etc. here,
-                    # since a true circle would have been misreported
-                    # too, not just the rod's edge specifically.
-                    if geom_type == GeomType.CIRCLE:
-                        center = wrapped_edge.arc_center
-                        geom_detail = f"  [CIRCULAR edge, center={center}]"
-                    else:
-                        geom_detail = f"  [{geom_type} edge]"
-                except Exception as e:
-                    geom_detail = f"  [could not classify edge: {e}]"
+            # THE REAL INTEGRATION TEST: resolve this pick through
+            # pose.py's actual PointRef/DirectionRef classes, not just
+            # a manual geom_type print. This is the first time picked
+            # geometry from a REAL STEP file (not synthetic test data)
+            # flows through the full chain: OCCT pick -> raw
+            # TopoDS_Shape -> build123d wrapper -> PointRef/
+            # DirectionRef.resolve() -> (for circular edges) the
+            # circle-fit fallback, verified on synthetic geometry but
+            # never yet exercised against a real picked edge.
+            pose_detail = ""
+            try:
+                from build123d import Edge as B123Edge, Face as B123Face
 
-            print(f"Selected #{count}: {type_name}{geom_detail}  |  {part_info}")
+                if shape_type == TopAbs_EDGE:
+                    wrapped_edge = B123Edge(shape)
+                    # Try circle_center/circle_axis FIRST -- this now
+                    # includes the verified circle-fit fallback, so it
+                    # correctly handles both genuine geom_type==CIRCLE
+                    # edges AND edges like as1-oc-214.stp's rod (BSPLINE-
+                    # classified but geometrically circular/semi-
+                    # circular, per Doug's own topology analysis: the
+                    # rod is 4 shells, 2 flat circular ends + 2
+                    # semi-cylindrical sides).
+                    try:
+                        center = PointRef(kind="circle_center", shape=wrapped_edge).resolve()
+                        axis = DirectionRef(kind="circle_axis", shape=wrapped_edge).resolve()
+                        pose_detail = (
+                            f"  |  pose.py: circle_center={center}  "
+                            f"circle_axis={axis}"
+                        )
+                    except ValueError:
+                        # Genuinely not circular (even the fit fallback
+                        # rejected it) -- fall back to edge_direction,
+                        # the right resolution for a straight edge.
+                        #
+                        # DIAGNOSTIC ADDITION: this exact fallback path
+                        # crashed twice in testing ("vector has zero
+                        # norm" from position_at(0)==position_at(1)),
+                        # but a standalone re-check of several plate
+                        # edges via the SAME position_at() calls found
+                        # nothing wrong -- meaning the failure is
+                        # specific to particular edges not yet directly
+                        # inspected. Printing full diagnostic data
+                        # HERE, in the live failing path, so the next
+                        # reproduction captures everything about the
+                        # ACTUAL failing edge rather than a guess at a
+                        # similar one.
+                        print(f"    [debug] edge_direction about to resolve. "
+                              f"geom_type={wrapped_edge.geom_type}  "
+                              f"length={getattr(wrapped_edge, 'length', '?')}")
+                        try:
+                            p0 = wrapped_edge.position_at(0)
+                            p1 = wrapped_edge.position_at(1)
+                            print(f"    [debug] position_at(0)={p0}  position_at(1)={p1}")
+                            verts = wrapped_edge.vertices()
+                            print(f"    [debug] vertices()={[tuple(v) for v in verts]}")
+                        except Exception as debug_e:
+                            print(f"    [debug] (debug inspection itself failed: {debug_e})")
+
+                        direction = DirectionRef(kind="edge_direction", shape=wrapped_edge).resolve()
+                        midpoint = PointRef(kind="edge_midpoint", shape=wrapped_edge).resolve()
+                        pose_detail = (
+                            f"  |  pose.py: edge_midpoint={midpoint}  "
+                            f"edge_direction={direction}"
+                        )
+
+                elif shape_type == TopAbs_FACE:
+                    wrapped_face = B123Face(shape)
+                    center = PointRef(kind="face_center", shape=wrapped_face).resolve()
+                    normal = DirectionRef(kind="face_normal", shape=wrapped_face).resolve()
+                    pose_detail = (
+                        f"  |  pose.py: face_center={center}  face_normal={normal}"
+                    )
+            except Exception as e:
+                pose_detail = f"  |  pose.py resolution FAILED: {type(e).__name__}: {e}"
+
+            print(f"Selected #{count}: {type_name}{pose_detail}  |  {part_info}")
             self.context.NextSelected()
 
     def wheelEvent(self, event):

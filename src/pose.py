@@ -106,6 +106,38 @@ def _fit_circle_to_edge(edge: Edge, num_samples: int = 12) -> CircleFit:
         a = points[i] - centroid
         b = points[(i + 1) % len(points)] - centroid
         normal_accum = normal_accum + a.cross(b)
+
+    # FIX (confirmed real, not hypothetical): for COLLINEAR points --
+    # i.e. this function being called on a STRAIGHT edge -- every
+    # cross product above is the zero vector (cross product of
+    # parallel/anti-parallel vectors is always zero), so normal_accum
+    # itself ends up as the zero vector. Calling .normalized() on a
+    # zero vector throws OCCT's own Standard_ConstructionError
+    # ("gp_Vec::Normalized() - vector has zero norm") -- NOT a Python
+    # ValueError, so it silently escaped every "except ValueError"
+    # handler built around this function (confirmed via real picking
+    # in main_app.py: clicking an ordinary straight plate edge crashed
+    # with exactly this error, with NO debug output even printed,
+    # because the crash happened HERE, inside _fit_circle_to_edge,
+    # before circle_center/circle_axis's caller ever got a chance to
+    # fall back to edge_direction). This is also exactly WHY the
+    # self-test never caught it: every previous test only ever fed
+    # this function genuinely curved input (a full circle, a half
+    # circle) -- it was never tested against a straight edge, even
+    # though circle_center/circle_axis gets attempted on EVERY edge
+    # (circular or not) as the first try in the real picking flow.
+    #
+    # Detect this explicitly and raise a clean ValueError -- the
+    # exception type calling code already expects and handles -- BEFORE
+    # ever attempting the normalize that would otherwise crash.
+    if normal_accum.length < 1e-9:
+        raise ValueError(
+            "Cannot fit a circle: sampled points are collinear (or "
+            "otherwise produce a degenerate/zero normal) -- this edge "
+            "is not circular, even approximately. (Likely a straight "
+            "edge -- this is the expected, correct rejection for that "
+            "case, not a bug.)"
+        )
     normal = normal_accum.normalized()
 
     # Build an orthonormal in-plane basis (u, v) perpendicular to
@@ -570,6 +602,42 @@ def _self_test():
     print("UI and confirm clicking the rod's actual semi-circular edge")
     print("produces a sensible center/radius, not just plausible-looking")
     print("numbers.)")
+
+    # --- Straight-edge rejection test (the ACTUAL bug found via real
+    # picking, after the above tests were already passing) ---
+    # circle_center/circle_axis gets attempted on EVERY edge in the
+    # real picking flow (assembly_viewer.py), circular or not -- a
+    # straight edge needs to be cleanly REJECTED (a Python ValueError
+    # the caller can catch and fall back to edge_direction), not crash
+    # with an unhandled OCCT-level exception. This exact gap (no test
+    # had ever fed _fit_circle_to_edge a straight/collinear edge) is
+    # what let the bug through every prior test in this file.
+    print("\n--- Straight-edge rejection test (the bug found via REAL picking) ---")
+    from build123d import Line
+
+    straight_edge = Line((0, 0, 0), (100, 0, 0))
+    try:
+        bad_fit = _fit_circle_to_edge(straight_edge)
+        print(f"UNEXPECTED: straight edge did not raise -- got {bad_fit}")
+        assert False, (
+            "A straight/collinear edge should raise ValueError, not "
+            "silently return a (meaningless) fit!"
+        )
+    except ValueError as e:
+        print(f"Correctly raised ValueError: {e}")
+        print("(This is the FIX for the real crash found via picking --")
+        print(" confirms a straight edge is now cleanly rejected instead")
+        print(" of crashing with an unhandled OCCT exception.)")
+
+    # Also confirm the FULL circle_center/circle_axis path (not just
+    # the internal _fit_circle_to_edge helper) handles this correctly
+    # end-to-end, matching exactly what assembly_viewer.py's real
+    # picking code does.
+    try:
+        PointRef(kind="circle_center", shape=straight_edge).resolve()
+        assert False, "circle_center should have raised ValueError on a straight edge!"
+    except ValueError:
+        print("PointRef(circle_center) on a straight edge: correctly raised ValueError.")
 
 
 if __name__ == "__main__":
