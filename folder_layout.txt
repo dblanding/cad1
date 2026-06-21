@@ -1,0 +1,21 @@
+cad1/
+├── README.md                 # top-level overview, links to the others below
+├── pyproject.toml            # uv project file (already exists)
+├── uv.lock
+├── .python-version
+├── .venv/
+├── .git/  .gitignore
+│
+├── src/                      # core, non-GUI logic — geometry/STEP/tree ops
+│   ├── step_assembly_poc.py
+│   └── step_export_fix.py
+│
+├── gui/                      # everything Qt/viewport/UI related
+│   └── viewport_smoke_test.py
+│
+├── docs/                     # the detailed per-area READMEs
+│   ├── STEP_NOTES.md         # (rename of the original STEP round-trip README)
+│   └── VIEWPORT_NOTES.md     # (rename of the GUI smoke-test README)
+│
+└── archive_diagnostics/      # the debugging-trail scripts, kept for reference
+    └── (the ~11 diagnose_*.py scripts)
