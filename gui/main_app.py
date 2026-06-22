@@ -38,13 +38,14 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 
-from OCP.TopAbs import TopAbs_EDGE, TopAbs_VERTEX
+from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX
 from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
 from OCP.AIS import AIS_Shape
 
 sys.path.insert(0, os.path.dirname(__file__))
 from assembly_viewer import OcctViewportWidget  # noqa: E402
 from assembly_tree_widget import AssemblyTreeWidget  # noqa: E402
+from position_dialog import PositionDialog  # noqa: E402
 
 
 class SyncedViewportWidget(OcctViewportWidget):
@@ -67,6 +68,12 @@ class SyncedViewportWidget(OcctViewportWidget):
     # in self._ais_shape_to_node: {"label", "path", "node"}) whenever
     # a click resolves to a known part.
     part_selected = Signal(dict)
+
+    # Emits raw geometry when clicked, for the position dialog to
+    # consume in positioning mode. Carries the raw TopoDS_Shape and
+    # its shape type -- position_dialog.py's resolve_pick() handles
+    # the PointRef/DirectionRef resolution from there.
+    geometry_picked = Signal(object, object)  # (raw_shape, shape_type)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -197,28 +204,48 @@ class SyncedViewportWidget(OcctViewportWidget):
         except Exception as e:
             print(f"(could not resolve owning part for sync: {e})")
 
+        # Also emit the raw shape + type for the position dialog to
+        # consume when in positioning mode. Done unconditionally here
+        # (MainWindow decides whether to route it to the dialog or
+        # ignore it based on whether positioning mode is active).
+        try:
+            shape = self.context.SelectedShape()
+            shape_type = shape.ShapeType()
+            self.geometry_picked.emit(shape, shape_type)
+        except Exception as e:
+            print(f"(could not emit geometry_picked: {e})")
+
         # Now run the full base reporting (prints every selected
         # face/edge/vertex, same as the standalone script).
         super()._report_selection()
 
     def set_part_visible(self, node, visible: bool):
-        """
-        Show or hide a specific part's AIS_Shape, for the tree
-        widget's checkboxes to call. Uses context.Display()/Erase()
-        -- the same context already proven to handle Display() calls
-        correctly for every leaf during initial load.
-        """
+        """Show or hide a part, restoring face/edge/vertex selection modes after re-showing."""
         ais_shape = self._node_id_to_ais_shape.get(id(node))
         if ais_shape is None:
-            print(f"set_part_visible: no AIS_Shape found for node "
-                  f"{getattr(node, 'label', '?')!r} -- not a displayed leaf "
-                  f"(probably a sub-assembly container, which has no shape "
-                  f"of its own to show/hide directly).")
             return
+
         if visible:
-            self.context.Display(ais_shape, True)
+            # Display in shaded mode explicitly (mode 1 = AIS_Shaded)
+            # to avoid re-adding wireframe mode 0.
+            self.context.Display(ais_shape, False)
+            self.context.SetDisplayMode(ais_shape, 1, False)
+            face_mode = AIS_Shape.SelectionMode_s(TopAbs_FACE)
+            edge_mode = AIS_Shape.SelectionMode_s(TopAbs_EDGE)
+            vertex_mode = AIS_Shape.SelectionMode_s(TopAbs_VERTEX)
+            self.context.Deactivate(ais_shape, 0)
+            self.context.Activate(ais_shape, face_mode)
+            self.context.Activate(ais_shape, edge_mode)
+            self.context.Activate(ais_shape, vertex_mode)
+            try:
+                self.context.SetSelectionSensitivity(ais_shape, edge_mode, 6)
+                self.context.SetSelectionSensitivity(ais_shape, vertex_mode, 8)
+            except Exception:
+                pass
         else:
-            self.context.Erase(ais_shape, True)
+            self.context.Erase(ais_shape, False)
+
+        self.context.UpdateCurrentViewer()
         self.update()
 
     def highlight_node(self, node):
@@ -251,7 +278,19 @@ class MainWindow(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         outer_layout.addWidget(splitter)
 
-        # --- Left: tree, in its own panel with a hint label --------
+        from PySide6.QtWidgets import QMainWindow, QDockWidget
+        # MainWindow needs to be a QMainWindow to support dock widgets --
+        # but we're currently a QWidget. Promote to QMainWindow by
+        # re-parenting the existing layout into a central widget.
+        # (This is a one-time change; all existing child widgets stay
+        # the same, just hosted differently.)
+        # Actually -- simplest approach: float the PositionDialog as a
+        # regular QDialog window rather than a true dock, since we're
+        # already a QWidget and converting to QMainWindow mid-project
+        # would touch too much at once. The PositionDialog is already
+        # a QDockWidget but can float standalone just fine.
+
+        # --- Left: tree, in its own panel with buttons -----------------
         tree_panel = QWidget()
         tree_layout = QVBoxLayout(tree_panel)
         tree_layout.setContentsMargins(4, 4, 4, 4)
@@ -266,6 +305,19 @@ class MainWindow(QWidget):
 
         self.tree = AssemblyTreeWidget(tree_panel)
         tree_layout.addWidget(self.tree)
+
+        # Position button -- opens the Mate/Align dialog for whichever
+        # part/assembly is currently selected in the tree.
+        from PySide6.QtWidgets import QPushButton
+        self._position_btn = QPushButton("⊕  Position selected...")
+        self._position_btn.setEnabled(False)
+        self._position_btn.setToolTip(
+            "Open the Mate/Align positioning dialog for the\n"
+            "currently selected part or assembly."
+        )
+        self._position_btn.clicked.connect(self._on_position_clicked)
+        tree_layout.addWidget(self._position_btn)
+
         splitter.addWidget(tree_panel)
 
         # --- Right: the 3D viewport ----------------------------------
@@ -274,17 +326,27 @@ class MainWindow(QWidget):
 
         splitter.setSizes([350, 1050])
 
-        # --- Wire the two directions of sync --------------------------
+        # --- Position dialog (floating dock) -------------------------
+        self._position_dialog = PositionDialog(self)
+        self._position_dialog.hide()
+        self._position_dialog.request_redisplay.connect(self._on_redisplay_after_move)
+        self._position_dialog.positioning_done.connect(self._on_positioning_done)
+
+        # --- Wire the standard sync signals --------------------------
         self.viewport.part_selected.connect(self._on_part_selected_in_viewport)
+        self.viewport.geometry_picked.connect(self._on_geometry_picked)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
+        # Enable Position button when a tree row is selected.
+        self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
 
         self.step_path = step_path
+        self._assembly = None  # set by load()
 
     def load(self):
         print(f"Loading {self.step_path} ...")
-        assembly = self.viewport.load_and_display_assembly(self.step_path)
-        self.tree.load_assembly_into_tree(assembly)
+        self._assembly = self.viewport.load_and_display_assembly(self.step_path)
+        self.tree.load_assembly_into_tree(self._assembly)
         print("Loaded into both tree and viewport.")
 
     def _on_part_selected_in_viewport(self, node_info):
@@ -386,6 +448,118 @@ class MainWindow(QWidget):
 
         for i in range(item.childCount()):
             self._apply_visibility_recursive(item.child(i), visible)
+
+    # -----------------------------------------------------------------------
+    # Positioning dialog handlers
+    # -----------------------------------------------------------------------
+
+    def _on_tree_selection_changed(self):
+        """Enable the Position button when something is selected in the tree."""
+        selected = self.tree.selectedItems()
+        self._position_btn.setEnabled(len(selected) > 0)
+        # If dialog is open, update its moving node immediately.
+        if self._position_dialog.isVisible() and selected:
+            item = selected[0]
+            node = self.tree._item_to_node.get(id(item))
+            if node is not None:
+                self._position_dialog.set_moving_node(node)
+
+    def _on_position_clicked(self):
+        """Open the positioning dialog for the currently selected tree node."""
+        selected = self.tree.selectedItems()
+        if not selected:
+            return
+        item = selected[0]
+        node = self.tree._item_to_node.get(id(item))
+        if node is None:
+            return
+        self._position_dialog.set_moving_node(node)
+        # Show the dialog as a floating window next to the main window.
+        self._position_dialog.setFloating(True)
+        self._position_dialog.show()
+        self._position_dialog.raise_()
+
+    def _on_geometry_picked(self, raw_shape, shape_type):
+        """
+        Route a viewport pick to the position dialog when in positioning
+        mode. Normal tree-sync behavior (part_selected signal) still
+        fires regardless -- this is additive, not a replacement.
+        """
+        if self._position_dialog.isVisible() and \
+                self._position_dialog.is_in_positioning_mode():
+            self._position_dialog.receive_pick(raw_shape, shape_type)
+
+    def _on_redisplay_after_move(self, moved_node):
+        """
+        A move was applied to `moved_node` -- refresh its AIS_Shape(s)
+        in the viewport to reflect the new position.
+
+        Strategy: erase and re-display every leaf descendant of the
+        moved node (or the node itself if it's a leaf), since their
+        AIS_Shape objects were created with the OLD global_location
+        baked in -- we need to reconstruct them with the new position.
+
+        This is the simplest, most robust approach: same tree-walk as
+        the initial load, just on the moved subtree only.
+        """
+        if self._assembly is None:
+            return
+
+        # Collect every leaf descendant of moved_node (or just itself).
+        leaves = []
+        if not moved_node.children:
+            leaves = [moved_node]
+        else:
+            leaves = [n for n in moved_node.descendants if not n.children]
+
+        for leaf in leaves:
+            # Capture the original color BEFORE erasing the old shape.
+            old_ais = self.viewport._node_id_to_ais_shape.get(id(leaf))
+            original_color = None
+            if old_ais is not None:
+                old_info = self.viewport._ais_shape_to_node.get(id(old_ais))
+                if old_info is not None:
+                    original_color = old_info.get("color_rgb")
+                self.viewport.context.Erase(old_ais, False)
+                self.viewport._ais_shapes = [
+                    s for s in self.viewport._ais_shapes if s is not old_ais
+                ]
+                del self.viewport._ais_shape_to_node[id(old_ais)]
+                del self.viewport._node_id_to_ais_shape[id(leaf)]
+
+            # Re-display with the new position, reusing the original
+            # color if we captured it -- otherwise the palette_index
+            # approach assigns a different color since the index is now
+            # different (the moved leaves get added at the end of the
+            # list). Passing original_color via a temporary node color
+            # override isn't clean, so instead we patch the palette
+            # lookup directly: if we have a stored color, temporarily
+            # set node.color to a sentinel that _display_leaf will use.
+            # Simpler approach: just re-display and immediately override
+            # the color on the newly-created AIS_Shape.
+            palette_index = len(self.viewport._ais_shapes)
+            self.viewport._display_leaf(leaf, f"/{leaf.label}", palette_index)
+
+            # Override with the original color if we had one.
+            if original_color is not None:
+                new_ais = self.viewport._node_id_to_ais_shape.get(id(leaf))
+                if new_ais is not None:
+                    from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
+                    r, g, b = original_color
+                    color = Quantity_Color(r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB)
+                    new_ais.SetColor(color)
+                    self.viewport.context.Redisplay(new_ais, True)
+                    # Also update stored color in the tracking dict.
+                    info = self.viewport._ais_shape_to_node.get(id(new_ais))
+                    if info is not None:
+                        info["color_rgb"] = original_color
+
+        self.viewport.context.UpdateCurrentViewer()
+        self.viewport.update()
+
+    def _on_positioning_done(self):
+        """Positioning dialog closed -- hide it."""
+        self._position_dialog.hide()
 
 
 def main():

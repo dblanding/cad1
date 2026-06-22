@@ -302,6 +302,7 @@ class OcctViewportWidget(QWidget):
             "label": node.label,
             "path": path,
             "node": node,
+            "color_rgb": (r, g, b),  # stored so redisplay can reuse the original color
         }
 
     def paintEvent(self, event):

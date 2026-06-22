@@ -9,63 +9,163 @@ relevant area's own doc (or into actual code) once they're resolved.
 
 ## 1. Position / Mate-Align workflow (HP/CoCreate pattern)
 
-**Status:** designed in conversation, not yet built -- but as of
-tonight, EVERY piece of groundwork underneath it is now proven on
-real geometry, not just synthetic test data. See Section 5 below for
-the full account. In short: picking (face/edge/vertex) resolves
-correctly through `pose.py`'s `PointRef`/`DirectionRef` on a real,
-complex STEP assembly, including circular edges that real-world STEP
-files don't always encode cleanly; and a part can be moved in place
-via `Shape.move()` with zero tree disruption, verified by export and
-reload in an independent viewer. What's still missing is purely the
-ACCUMULATOR layer described below -- the underlying mechanics are
-ready.
+**Status:** design fully resolved, ready to build. All groundwork
+proven (see §5). Waiting on nothing -- the PTC documentation attached
+this session answered the last open question.
 
-**The reference UX** (from CoCreate / PTC Creo Elements/Direct
-Modeling, which Doug has used and wants to pattern this after):
+**Scope (deliberately narrow):** implementing just 2 of CoCreate's
+positioning techniques, sufficient for the 90% use case (importing
+STEP files and positioning them into an assembly):
+
+1. **Dynamic positioning** -- drag a part to get it out of the way
+   of overlapping geometry so you can see it clearly before Mate/Align.
+2. **Mate/Align** -- precision placement using face/edge/axis picks.
+
+---
+
+### Typical workflow this supports
+
+1. Import a STEP file → part/assembly appears at top level near origin
+2. Drag it in the tree to the correct parent assembly (already works)
+3. **Dynamic Move** → drag it somewhere visible, away from existing
+   geometry (new)
+4. **Mate/Align** → precision placement relative to the assembly (new)
+
+---
+
+### Mate/Align: fully designed
+
+**Source:** PTC Creo Elements/Direct Modeling Express documentation,
+read directly from the attached PDFs ("Mate or align parts and
+assemblies" + "Position a part, assembly, or workplane set").
+
+**The open design question is now answered:** each Mate/Align step
+commits **immediately** -- "the parts or assemblies become constrained
+by each mate or align step." The part moves after each pick pair, not
+batched until a final Apply. "Back" undoes one step; "Clear All"
+resets the constraint method but leaves the part at its current
+(moved) position. This is simpler to implement than the batched
+version would have been.
+
+**Constraint types** (confirming Doug's 3-2-1 characterization):
+- **Mate**: two faces opposing each other on the same plane (face-to-
+  face contact). Constrains 3 DOF: the normal direction + 2
+  in-plane translations.
+- **Align**: two faces/elements on the SAME side of a plane (flush).
+  Constrains 2 additional DOF.
+- **Align Axis**: aligns the axes of two cylindrical/circular
+  elements. Maps directly onto `circle_axis` DirectionRef picks,
+  already proven working on real STEP geometry.
+- **Parallel**: makes faces/edges parallel without coincident
+  placement (not in our minimal scope, but documented for later).
+- **Offset**: adds a gap value to Mate or Align (not in minimal
+  scope, but trivial to add once the basic case works).
+
+**How a single Mate/Align step works:**
+1. User picks a face/edge/axis on the **moving part** →
+   `PointRef`/`DirectionRef` resolve it to a point + direction
+   (already proven working for face, straight edge, circular edge)
+2. User picks the corresponding face/edge/axis on the **fixed
+   target** → same resolution
+3. Choose constraint type (Mate/Align/Align Axis)
+4. Compute the move: `compute_move(from_plane, to_plane)` from
+   `pose.py` -- already implemented, already self-tested
+5. Apply immediately: `moving_part.move(delta)` -- proven via the
+   rod-move test tonight
+6. Repeat steps 1-5 for each additional constraint (up to 3 to
+   fully constrain all 6 DOF -- the 3-2-1)
+
+**Key insight for implementation:** because each step commits
+immediately, step 2's picks resolve geometry on the **already-moved**
+part, not a snapshot from the start of the positioning operation.
+This means no need to track accumulated partial constraints -- just
+resolve fresh, compute, and apply, one step at a time. The
+accumulator is trivially just "do this N times."
+
+**What compute_move() needs to produce for each constraint type:**
+
+For **Mate** (faces opposing on same plane):
+- `from_plane`: origin = face_center of moving part's face,
+  z_dir = face_normal of that face
+- `to_plane`: origin = face_center of target face,
+  z_dir = -face_normal of target face  ← FLIPPED (opposing)
+- Result: the moving part's face lands flat against the target's
+  face, normals pointing toward each other.
+
+For **Align** (faces flush):
+- Same as Mate but z_dir = face_normal (same direction, NOT flipped)
+
+For **Align Axis** (cylindrical axes coincident):
+- `from_plane`: origin = circle_center, z_dir = circle_axis
+- `to_plane`: origin = circle_center of target, z_dir = circle_axis
+  of target
+- Result: the two axes become coincident.
+
+**Note:** after a Mate (3 DOF constrained), the part is still free to
+rotate around the face normal and translate along the face plane.
+After an Align (2 more DOF), only one rotational DOF remains (spin
+around the now-aligned axis). A final Align Axis or second Align pins
+the last DOF. None of this requires any special "partial constraint"
+tracking -- it falls out naturally from applying each step in sequence
+to the already-moved geometry.
+
+---
+
+### Dynamic positioning: design
+
+**Goal:** get a just-imported part (which may be overlapping existing
+geometry) to somewhere visible and roughly correct before Mate/Align.
+Precision is NOT required here -- that's what Mate/Align is for.
+
+**Minimal viable approach** (no AIS_Manipulator gizmo needed yet):
+- Select the part to move (already works via tree click or viewport
+  click)
+- Click a destination point in the viewport → the part's center
+  (or a picked point on it) translates to that point
+- This is just `move_location_only()` from `pose.py`, already
+  self-tested, applied to a real part (proven tonight)
+
+**Full CoCreate approach** (worth doing eventually):
+- `AIS_Manipulator` gizmo -- the OCCT built-in tri-ball/CoPilot
+  equivalent, confirmed to exist in OCCT earlier in this project.
+  Directional arrows for translate, rotation handles for rotate.
+  More intuitive but more new API surface to wire up.
+
+**Decision:** start with the click-to-translate minimal version,
+which lets the workflow work end to end. Add `AIS_Manipulator` as
+a polish step once Mate/Align is solid.
+
+---
+
+### Build order (suggested)
+
+1. **Mate/Align UI** -- a simple dialog (or toolbar mode) that:
+   - Shows current step (pick moving element → pick fixed element →
+     choose Mate/Align/Align Axis → apply)
+   - Wires picks through the existing picking pipeline →
+     `PointRef`/`DirectionRef` → `compute_move()` → `Shape.move()`
+   - Has a Back button (undo one step -- see §3 for the undo
+     situation, but even just "re-load from last STEP export" would
+     satisfy the poor-man's-undo precedent for now)
+   - Has a done/Apply button
+
+2. **Dynamic Move** (click-to-translate version) -- a mode where
+   clicking in the viewport moves the selected part's center to
+   the clicked point. Simple enough to be a 1-day addition once
+   Mate/Align works.
+
+3. **AIS_Manipulator gizmo** -- the slick drag version. After
+   everything else is working.
+
+---
+
+### The reference UX (screenshots)
 
 ![HP/CoCreate Position dialog](imgs/hp-position-dialog.png)
 
-- A persistent **Position** dialog, not a one-shot pick-everything
-  flow. Buttons: Direct / Selected, a Methods panel (`Dyn Pos`,
-  `Mate Align`, `Two Points`, `Dimension`), and under Mate Align:
-  `Mate`, `Align`, `Align Axis`, with `Offset` and `Reverse`.
-- **Mate**: two faces coplanar, normals OPPOSED (face-to-face contact).
-- **Align**: two faces/elements coplanar, normals SAME direction
-  (flush).
-- **Align Axis**: centers the axes of two cylindrical/circular
-  elements (maps onto `pose.py`'s existing `circle_axis`
-  `DirectionRef` kind).
-- Each Mate/Align/Align-Axis operation is **partial** -- it resolves
-  *some* DOF, not all 6. The user applies several in sequence
-  ("repeat these steps using multiple faces to fully lock a part's
-  degrees of freedom") until the part is fully constrained, or
-  leaves some DOF free on purpose.
-- Still **one-shot** overall, consistent with Doug's earlier decision
-  (no live constraint solver) -- but the INPUT is incremental even
-  though the OUTPUT is a single committed transform once the user is
-  satisfied.
-- Position is invoked **as part of the same flow that creates a part
-  instance**, not as a separate, later command. Confirmed via a
-  second CoCreate screenshot: the "Create Copy" dialog has `Dyn Pos`
-  / `Mate Align` method buttons built directly into it, with an
-  embedded, collapsible "Position" section -- copy-or-share and
-  positioning happen as one continuous operation, not two.
+![CoCreate Create Copy dialog, with Position embedded](imgs/cocreate-copy-share-with-position.png)
 
-**Open design question, not yet decided:** does each individual
-Mate/Align/Align-Axis pick commit immediately (part visibly moves
-after every single constraint), or do picks accumulate across
-multiple selections with the part only actually moving once, on a
-final Apply? The CoCreate UI (persistent dialog, `Back`/`Apply Prev`
-buttons, not close-after-one-pick) suggests the former. Worth
-deciding deliberately before building the accumulator layer.
 
-**What this implies for `pose.py`:** needs a new layer above
-`plane_from_picks()` -- something like an incremental constraint
-accumulator that starts from a part's current `Location` and narrows
-it with each Mate/Align/Align-Axis operation, rather than requiring a
-full 3-2-1 pick in one pass (Mate/Align as currently designed assume
-a complete `from_plane`/`to_plane` up front).
 
 ---
 
