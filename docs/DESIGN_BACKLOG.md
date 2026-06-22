@@ -9,9 +9,105 @@ relevant area's own doc (or into actual code) once they're resolved.
 
 ## 1. Position / Mate-Align workflow (HP/CoCreate pattern)
 
-**Status:** design fully resolved, ready to build. All groundwork
-proven (see §5). Waiting on nothing -- the PTC documentation attached
-this session answered the last open question.
+**Status: CORE WORKFLOW COMPLETE.** The full 3-2-1 Mate/Align
+sequence is working correctly with true purity of motion, confirmed
+via real testing on as1-oc-214.stp (L-bracket positioned onto plate
+in three steps: Mate → Align → Align).
+
+**What's working (confirmed via real testing):**
+- Position dialog (`gui/position_dialog.py`) fully functional
+- Mate, Align, Align Axis, Dynamic Move all wired up and working
+- **Full 3-2-1 sequence confirmed:** Mate (3 DOF) → Align (2 DOF) →
+  Align (1 DOF), each step consuming only its intended DOF without
+  disturbing previously-constrained DOF ("purity of motion")
+- **Purity of motion fix:** `compute_mate_move`/`compute_align_move`
+  decompose into: (1) pure rotation to align normals, (2) translation
+  along normal only to close plane gap. No in-plane movement in step 1.
+  Subsequent steps operate only in remaining free DOF.
+- **Coordinate frame fix:** world-space moves converted to parent-local
+  frame before applying via `_world_move_to_local()`. Required because
+  pick coordinates are always world-space but `Shape.move()` operates
+  in the parent node's local frame. Without this, nested nodes (e.g.
+  l-bracket inside l-bracket-assembly) moved incorrectly while
+  top-level nodes (whose parent is at the origin) worked fine.
+- Cylindrical face body clicks automatically extract cylinder axis
+  (via boundary edge circle-fit, handling BSPLINE-encoded cylinders)
+- Reverse button: flips direction of last applied step and re-applies
+- Back button: undoes one step correctly
+- Face/edge/vertex picking restored correctly after show/hide
+- Colors preserved across moves
+- Moving node selected via TREE (supports part or assembly)
+
+**Scope (deliberately narrow):** implementing just 2 of CoCreate's
+positioning techniques, sufficient for the 90% use case (importing
+STEP files and positioning them into an assembly):
+
+1. **Dynamic positioning** -- drag a part to get it out of the way
+   of overlapping geometry so you can see it clearly before Mate/Align.
+2. **Mate/Align** -- precision placement using face/edge/axis picks.
+
+---
+
+### Typical workflow this supports
+
+1. Import a STEP file → part/assembly appears at top level near origin
+2. Drag it in the tree to the correct parent assembly (already works)
+3. **Dynamic Move** → drag it somewhere visible, away from existing
+   geometry (new)
+4. **Mate/Align** → precision placement relative to the assembly (new)
+
+---
+
+### Mate/Align: design confirmed and implemented
+
+**Source:** PTC Creo Elements/Direct Modeling Express documentation,
+read directly from the attached PDFs ("Mate or align parts and
+assemblies" + "Position a part, assembly, or workplane set").
+
+**Each step commits immediately.** "Back" undoes one step.
+
+**Constraint types:**
+- **Mate**: two faces opposing each other on the same plane (face-to-
+  face contact). Constrains 3 DOF: 2 rotational + 1 normal translation.
+- **Align**: two faces/elements on the SAME side of a plane (flush).
+  Constrains 2 DOF (in-plane translation toward alignment).
+- **Align Axis**: aligns the axes of two cylindrical/circular
+  elements. Constrains up to 4 DOF at once (both translations
+  perpendicular to the axis + 2 rotational). Worth exploring as an
+  alternative to Mate+Align for cylindrical features.
+- **Parallel**: makes faces/edges parallel without coincident
+  placement (not in our minimal scope).
+- **Offset**: adds a gap value to Mate or Align (not in minimal
+  scope, but trivial to add).
+
+**Key implementation details:**
+- Moving node always selected via TREE (part or assembly)
+- Pick coordinates are world-space (from OCCT); converted to
+  parent-local frame before applying via `_world_move_to_local()`
+- `compute_mate_move` / `compute_align_move`: rotate to align normals
+  (using same-origin from/to planes for pure rotation), then translate
+  along normal only by `gap = (pick2.point - pick1.point).dot(target_z)`
+- `compute_align_axis_move`: uses full `compute_move()` since axis
+  alignment constrains both orientation AND axis position
+
+---
+
+### Next things to explore
+
+1. **Align Axis sequences** -- test whether Align Axis alone (4 DOF)
+   followed by one more Align (1 DOF) is a complete 2-step alternative
+   to the 3-step Mate/Align/Align sequence for cylindrical features.
+2. **Dynamic Move** -- implement click-to-translate for rough
+   positioning before Mate/Align.
+3. **AIS_Manipulator gizmo** -- the slick drag version, after
+   Dynamic Move click-to-translate is working.
+4. **Active Part concept** (CoCreate terminology) -- make the
+   currently-selected moving node more visually prominent in the
+   dialog and/or viewport so it's always clear what's about to move.
+
+---
+
+
 
 **Scope (deliberately narrow):** implementing just 2 of CoCreate's
 positioning techniques, sufficient for the 90% use case (importing
@@ -50,9 +146,9 @@ version would have been.
 **Constraint types** (confirming Doug's 3-2-1 characterization):
 - **Mate**: two faces opposing each other on the same plane (face-to-
   face contact). Constrains 3 DOF: the normal direction + 2
-  in-plane translations.
+  rotational.
 - **Align**: two faces/elements on the SAME side of a plane (flush).
-  Constrains 2 additional DOF.
+  Constrains 2 additional DOF (in-plane translation).
 - **Align Axis**: aligns the axes of two cylindrical/circular
   elements. Maps directly onto `circle_axis` DirectionRef picks,
   already proven working on real STEP geometry.
@@ -60,54 +156,6 @@ version would have been.
   placement (not in our minimal scope, but documented for later).
 - **Offset**: adds a gap value to Mate or Align (not in minimal
   scope, but trivial to add once the basic case works).
-
-**How a single Mate/Align step works:**
-1. User picks a face/edge/axis on the **moving part** →
-   `PointRef`/`DirectionRef` resolve it to a point + direction
-   (already proven working for face, straight edge, circular edge)
-2. User picks the corresponding face/edge/axis on the **fixed
-   target** → same resolution
-3. Choose constraint type (Mate/Align/Align Axis)
-4. Compute the move: `compute_move(from_plane, to_plane)` from
-   `pose.py` -- already implemented, already self-tested
-5. Apply immediately: `moving_part.move(delta)` -- proven via the
-   rod-move test tonight
-6. Repeat steps 1-5 for each additional constraint (up to 3 to
-   fully constrain all 6 DOF -- the 3-2-1)
-
-**Key insight for implementation:** because each step commits
-immediately, step 2's picks resolve geometry on the **already-moved**
-part, not a snapshot from the start of the positioning operation.
-This means no need to track accumulated partial constraints -- just
-resolve fresh, compute, and apply, one step at a time. The
-accumulator is trivially just "do this N times."
-
-**What compute_move() needs to produce for each constraint type:**
-
-For **Mate** (faces opposing on same plane):
-- `from_plane`: origin = face_center of moving part's face,
-  z_dir = face_normal of that face
-- `to_plane`: origin = face_center of target face,
-  z_dir = -face_normal of target face  ← FLIPPED (opposing)
-- Result: the moving part's face lands flat against the target's
-  face, normals pointing toward each other.
-
-For **Align** (faces flush):
-- Same as Mate but z_dir = face_normal (same direction, NOT flipped)
-
-For **Align Axis** (cylindrical axes coincident):
-- `from_plane`: origin = circle_center, z_dir = circle_axis
-- `to_plane`: origin = circle_center of target, z_dir = circle_axis
-  of target
-- Result: the two axes become coincident.
-
-**Note:** after a Mate (3 DOF constrained), the part is still free to
-rotate around the face normal and translate along the face plane.
-After an Align (2 more DOF), only one rotational DOF remains (spin
-around the now-aligned axis). A final Align Axis or second Align pins
-the last DOF. None of this requires any special "partial constraint"
-tracking -- it falls out naturally from applying each step in sequence
-to the already-moved geometry.
 
 ---
 
@@ -139,20 +187,14 @@ a polish step once Mate/Align is solid.
 
 ### Build order (suggested)
 
-1. **Mate/Align UI** -- a simple dialog (or toolbar mode) that:
-   - Shows current step (pick moving element → pick fixed element →
-     choose Mate/Align/Align Axis → apply)
-   - Wires picks through the existing picking pipeline →
-     `PointRef`/`DirectionRef` → `compute_move()` → `Shape.move()`
-   - Has a Back button (undo one step -- see §3 for the undo
-     situation, but even just "re-load from last STEP export" would
-     satisfy the poor-man's-undo precedent for now)
-   - Has a done/Apply button
+1. ✅ **Mate/Align UI** -- built and working for single steps.
+   Next: fix purity of motion (see above) so multi-step 3-2-1
+   works correctly.
 
 2. **Dynamic Move** (click-to-translate version) -- a mode where
    clicking in the viewport moves the selected part's center to
    the clicked point. Simple enough to be a 1-day addition once
-   Mate/Align works.
+   Mate/Align purity of motion is fixed.
 
 3. **AIS_Manipulator gizmo** -- the slick drag version. After
    everything else is working.

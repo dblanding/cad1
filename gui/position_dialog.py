@@ -217,40 +217,100 @@ def _fmt(v: Vector) -> str:
 # (per the PTC docs and DESIGN_BACKLOG.md §1)
 # ---------------------------------------------------------------------------
 
+
+
 def compute_mate_move(pick1: PickResult, pick2: PickResult):
     """
-    Mate: moving part's face/edge normal becomes OPPOSED to target's
-    normal (face-to-face contact). Origins coincide (on the same plane).
+    Mate: moving face becomes coplanar with target face, normals OPPOSED.
+
+    Only consumes the 3 DOF relevant to this constraint:
+    - 2 rotational (align normals)
+    - 1 translational (close the gap along the normal)
+
+    Leaves in-plane position and spin completely free.
+    Faces do NOT need to have coincident centers -- only the planes
+    need to be coplanar (confirmed: Doug's explicit requirement).
     """
     if pick1.direction is None or pick2.direction is None:
         print("[position_dialog] Mate requires directed picks (faces or circular edges)")
         return None
+
+    from build123d import Location, Vector
+
+    # Target direction for the moving face after Mate: OPPOSED to target
+    target_z = -pick2.direction
+
+    # Step 1: pure rotation -- same origin for both planes so
+    # compute_move produces rotation only, zero translation.
     from_plane = Plane(origin=pick1.point, z_dir=pick1.direction)
-    # Mate flips the target normal so the two normals point toward each other
-    to_plane = Plane(origin=pick2.point, z_dir=-pick2.direction)
-    return compute_move(from_plane, to_plane)
+    to_plane_rot = Plane(origin=pick1.point, z_dir=target_z)
+    rotation = compute_move(from_plane, to_plane_rot)
+
+    # Step 2: find where pick1.point ends up after the rotation.
+    # The rotation maps from_plane's origin to to_plane_rot's origin
+    # (both are pick1.point) -- so the point itself doesn't move, but
+    # the ORIENTATION of the face at that point changes. We need to
+    # know the gap between the (now-rotated) face plane and the target
+    # plane. Since the face passes through pick1.point and the rotation
+    # is about pick1.point, the face plane after rotation still passes
+    # through pick1.point -- just with a different normal (target_z).
+    # The gap from pick1.point to the target plane (through pick2.point
+    # with normal target_z) is simply:
+    gap = (pick2.point - pick1.point).dot(target_z)
+    translation_vec = target_z * gap
+
+    # Step 3: compose -- rotation first (about pick1.point), then
+    # translate along the normal to close the gap.
+    translation = Location((translation_vec.X,
+                             translation_vec.Y,
+                             translation_vec.Z))
+    return translation * rotation
 
 
 def compute_align_move(pick1: PickResult, pick2: PickResult):
     """
-    Align: moving part's face/edge becomes FLUSH with target's
-    (normals point in the SAME direction, not opposed).
+    Align: moving face becomes coplanar with target face, normals SAME
+    direction (flush, not face-to-face).
+
+    Same purity-of-motion logic as Mate -- only normal rotation +
+    normal-direction gap translation. No in-plane movement.
     """
     if pick1.direction is None or pick2.direction is None:
         print("[position_dialog] Align requires directed picks (faces or circular edges)")
         return None
+
+    from build123d import Location, Vector
+
+    # Target direction: SAME as target face normal (Align = flush)
+    target_z = pick2.direction
+
     from_plane = Plane(origin=pick1.point, z_dir=pick1.direction)
-    to_plane = Plane(origin=pick2.point, z_dir=pick2.direction)
-    return compute_move(from_plane, to_plane)
+    to_plane_rot = Plane(origin=pick1.point, z_dir=target_z)
+    rotation = compute_move(from_plane, to_plane_rot)
+
+    # Same gap logic as Mate -- rotation is about pick1.point so
+    # pick1.point stays in place; just measure gap to target plane.
+    gap = (pick2.point - pick1.point).dot(target_z)
+    translation_vec = target_z * gap
+    translation = Location((translation_vec.X,
+                             translation_vec.Y,
+                             translation_vec.Z))
+    return translation * rotation
 
 
 def compute_align_axis_move(pick1: PickResult, pick2: PickResult):
     """
     Align Axis: two cylindrical/circular axes become coincident.
-    Identical math to Align -- the axes already represent the right
-    direction for both picks (circle_axis points along the cylinder).
+    Uses full compute_move (not the purity-of-motion decomposition)
+    because Align Axis constrains both orientation AND position of the
+    axis -- the axis center point needs to land on the target axis,
+    which is a different constraint geometry than face coplanarity.
     """
-    return compute_align_move(pick1, pick2)
+    if pick1.direction is None or pick2.direction is None:
+        return None
+    from_plane = Plane(origin=pick1.point, z_dir=pick1.direction)
+    to_plane = Plane(origin=pick2.point, z_dir=pick2.direction)
+    return compute_move(from_plane, to_plane)
 
 
 def compute_dynamic_move(pick1: PickResult, pick2: PickResult):
@@ -616,6 +676,50 @@ class PositionDialog(QDockWidget):
     # Move application
     # -----------------------------------------------------------------------
 
+    def _world_move_to_local(self, move):
+        """
+        Convert a world-space Location (as computed from world-space
+        pick coordinates) into the moving node's parent-local frame.
+
+        WHY THIS IS NEEDED:
+        Pick coordinates from OCCT are always in world space. The move
+        computed from two world-space picks is therefore also in world
+        space. But Shape.move() applies the delta in the node's PARENT
+        frame -- which is the world frame only if the parent sits at
+        the origin. For deeply nested nodes (e.g. l-bracket inside
+        l-bracket-assembly inside as1), the parent frame is NOT the
+        world frame, and applying a world-space delta directly produces
+        the wrong result (confirmed: l-bracket moved to wrong position
+        while l-bracket-assembly, whose parent IS at origin, moved
+        correctly with the same code).
+
+        Fix: transform the world-space move into the parent's local
+        frame using the parent's global_location (world position).
+        If P is the parent's world location:
+            local_move = P.inverse() * world_move * P
+        This converts the move from "expressed in world frame" to
+        "expressed in parent's local frame."
+
+        If the node has no parent (top-level) or parent has identity
+        location, this is a no-op and the world-space move is used
+        directly (correct behavior for the simple case).
+        """
+        from build123d import Location
+        parent = getattr(self._moving_node, 'parent', None)
+        if parent is None:
+            return move
+        try:
+            parent_world = parent.global_location
+            # Check if parent is at origin (identity) -- skip transform
+            if parent_world.position == (0, 0, 0):
+                return move
+            # Transform: express world-space move in parent-local frame
+            return parent_world.inverse() * move * parent_world
+        except Exception as e:
+            print(f"[position_dialog] world_move_to_local failed: {e}, "
+                  f"using world-space move directly")
+            return move
+
     def _apply_current_step(self):
         """
         Both picks are in -- compute and apply the move, then return
@@ -641,9 +745,12 @@ class PositionDialog(QDockWidget):
             self._state = PositionState.IDLE
             return
 
+        # Convert world-space move to parent-local frame before applying.
+        local_move = self._world_move_to_local(move)
+
         try:
-            self._moving_node.move(move)
-            self._move_history.append(move)
+            self._moving_node.move(local_move)
+            self._move_history.append(local_move)
             # Remember the picks so Reverse can undo + re-apply flipped.
             self._last_pick1 = self._pick1
             self._last_pick2 = self._pick2
