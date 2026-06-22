@@ -318,6 +318,17 @@ class MainWindow(QWidget):
         self._position_btn.clicked.connect(self._on_position_clicked)
         tree_layout.addWidget(self._position_btn)
 
+        # Export button -- saves the current assembly state to a STEP
+        # file alongside the input file, with _exported suffix.
+        self._export_btn = QPushButton("💾  Export STEP...")
+        self._export_btn.setEnabled(False)
+        self._export_btn.setToolTip(
+            "Export the current assembly (with all positioning\n"
+            "applied) to a STEP file."
+        )
+        self._export_btn.clicked.connect(self._on_export_clicked)
+        tree_layout.addWidget(self._export_btn)
+
         splitter.addWidget(tree_panel)
 
         # --- Right: the 3D viewport ----------------------------------
@@ -347,6 +358,7 @@ class MainWindow(QWidget):
         print(f"Loading {self.step_path} ...")
         self._assembly = self.viewport.load_and_display_assembly(self.step_path)
         self.tree.load_assembly_into_tree(self._assembly)
+        self._export_btn.setEnabled(True)
         print("Loaded into both tree and viewport.")
 
     def _on_part_selected_in_viewport(self, node_info):
@@ -556,6 +568,48 @@ class MainWindow(QWidget):
 
         self.viewport.context.UpdateCurrentViewer()
         self.viewport.update()
+
+    def _on_export_clicked(self):
+        """Export the current assembly to a STEP file."""
+        if self._assembly is None:
+            return
+
+        from pathlib import Path
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+        # Default to a sensible filename alongside the input file.
+        input_path = Path(self.step_path)
+        default_out = str(input_path.with_name(
+            input_path.stem + "_exported" + input_path.suffix
+        ))
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Assembly as STEP",
+            default_out,
+            "STEP Files (*.step *.stp);;All Files (*)"
+        )
+        if not out_path:
+            return  # user cancelled
+
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+            from step_export_fix import export_step
+            export_step(self._assembly, out_path)
+            print(f"Exported to {out_path}")
+            QMessageBox.information(
+                self,
+                "Export complete",
+                f"Assembly exported to:\n{out_path}"
+            )
+        except Exception as e:
+            print(f"Export failed: {e}")
+            QMessageBox.critical(
+                self,
+                "Export failed",
+                f"Could not export assembly:\n{e}"
+            )
 
     def _on_positioning_done(self):
         """Positioning dialog closed -- hide it."""

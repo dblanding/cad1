@@ -94,18 +94,55 @@ assemblies" + "Position a part, assembly, or workplane set").
 
 ### Next things to explore
 
-1. **Align Axis sequences** -- test whether Align Axis alone (4 DOF)
-   followed by one more Align (1 DOF) is a complete 2-step alternative
-   to the 3-step Mate/Align/Align sequence for cylindrical features.
-2. **Dynamic Move** -- implement click-to-translate for rough
+1. **Dynamic Move** -- implement click-to-translate for rough
    positioning before Mate/Align.
-3. **AIS_Manipulator gizmo** -- the slick drag version, after
+2. **AIS_Manipulator gizmo** -- the slick drag version, after
    Dynamic Move click-to-translate is working.
-4. **Active Part concept** (CoCreate terminology) -- make the
+3. **Active Part concept** (CoCreate terminology) -- make the
    currently-selected moving node more visually prominent in the
    dialog and/or viewport so it's always clear what's about to move.
 
 ---
+
+### Confirmed sequencing patterns (from real testing)
+
+Two distinct positioning sequences have been confirmed working, each
+suited to different geometry:
+
+**Pattern A: 3-2-1 (prismatic/flat features)**
+1. Mate two faces → 3 DOF (2 rotational + 1 normal translation)
+2. Align two faces → 2 DOF (in-plane translation)
+3. Align two faces → 1 DOF (remaining in-plane translation)
+
+Confirmed: L-bracket onto plate using all face picks. Each step
+consumed exactly its intended DOF without disturbing previous steps.
+
+**Pattern B: Align Axis + Mate (cylindrical features)**
+1. Align Axis (hole-to-hole or shaft-to-hole) → 4 DOF (2 rotational
+   + 2 translational perpendicular to axis)
+2. Mate (face-to-face along the axis direction) → 1 DOF (translation
+   along axis to close the gap)
+
+Confirmed: second L-bracket-assembly positioned using a hole in the
+bracket aligned to a hole in the plate, followed by Mate of the
+bracket bottom face to the plate top face. More efficient than 3-2-1
+for cylindrical features (2 steps vs 3).
+
+**CRITICAL ORDER DEPENDENCY for Pattern B:**
+Align Axis MUST come before Mate. If Mate is applied first, the
+subsequent Align Axis disturbs the mate (it's consuming overlapping
+DOF in a conflicting way -- Align Axis constrains 2 rotational DOF
+that the Mate also depends on for its plane orientation). Doing Align
+Axis first leaves only 1 translational DOF (along the axis) free,
+which Mate then cleanly consumes as a pure translation. The purity
+of motion property only holds when constraint steps are applied in
+order of decreasing DOF consumed: most-constraining step first.
+
+**General rule:** apply the constraint that consumes the MOST DOF
+first, then work downward. Align Axis (4 DOF) before Mate (consumes
+remaining 1). For prismatic features, Mate (3 DOF) before Align
+(2 DOF) before Align (1 DOF) -- the natural 3-2-1 order already
+respects this.
 
 
 
