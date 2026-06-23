@@ -488,6 +488,19 @@ class MainWindow(QWidget):
         self._position_btn.clicked.connect(self._on_position_clicked)
         tree_layout.addWidget(self._position_btn)
 
+        # Import button -- loads a new STEP file and adds it to the
+        # current assembly at the top level, ready to be re-parented
+        # and positioned.
+        self._import_btn = QPushButton("📂  Import STEP...")
+        self._import_btn.setEnabled(False)
+        self._import_btn.setToolTip(
+            "Import a STEP file and add it to the current\n"
+            "assembly. Drag it in the tree to re-parent it,\n"
+            "then use Position to place it correctly."
+        )
+        self._import_btn.clicked.connect(self._on_import_clicked)
+        tree_layout.addWidget(self._import_btn)
+
         # Export button -- saves the current assembly state to a STEP
         # file alongside the input file, with _exported suffix.
         self._export_btn = QPushButton("💾  Export STEP...")
@@ -529,6 +542,7 @@ class MainWindow(QWidget):
         self._assembly = self.viewport.load_and_display_assembly(self.step_path)
         self.tree.load_assembly_into_tree(self._assembly)
         self._export_btn.setEnabled(True)
+        self._import_btn.setEnabled(True)
         print("Loaded into both tree and viewport.")
 
     def _on_part_selected_in_viewport(self, node_info):
@@ -738,6 +752,57 @@ class MainWindow(QWidget):
 
         self.viewport.context.UpdateCurrentViewer()
         self.viewport.update()
+
+    def _on_import_clicked(self):
+        """Import a STEP file and add it to the current assembly."""
+        if self._assembly is None:
+            return
+
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from pathlib import Path
+
+        in_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import STEP File",
+            str(Path(self.step_path).parent),
+            "STEP Files (*.step *.stp);;All Files (*)"
+        )
+        if not in_path:
+            return  # user cancelled
+
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+            from step_assembly_poc import load_assembly, add_node
+
+            print(f"Importing {in_path} ...")
+            new_node = load_assembly(in_path)
+            print(f"Loaded '{new_node.label}' with "
+                  f"{len(list(new_node.descendants))} descendants.")
+
+            # Add to the existing top-level assembly as a new child.
+            add_node(new_node, self._assembly)
+            print(f"Added '{new_node.label}' to assembly.")
+
+            # Display the new geometry in the viewport.
+            self.viewport.display_subtree(new_node, f"/{new_node.label}")
+
+            # Add to the tree widget under the root.
+            self.tree.add_node_to_tree(new_node, parent_node=self._assembly)
+
+            print(f"Import complete: '{new_node.label}' is now in the tree.")
+            print("Drag it to re-parent, then use Position to place it.")
+
+        except Exception as e:
+            import traceback
+            print(f"Import failed: {e}")
+            traceback.print_exc()
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self,
+                "Import failed",
+                f"Could not import STEP file:\n{e}"
+            )
 
     def _on_export_clicked(self):
         """Export the current assembly to a STEP file."""

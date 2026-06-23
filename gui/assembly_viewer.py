@@ -168,6 +168,35 @@ class OcctViewportWidget(QWidget):
         # documented Qt+OpenGL gotcha, not specific to OCCT).
         self.update()
 
+    def display_subtree(self, node, path_prefix=""):
+        """
+        Walk a node's subtree and display all leaf solids, adding them
+        to the existing viewport without clearing what's already there.
+        Used by the Import STEP workflow to add newly-imported geometry
+        alongside what's already displayed.
+        """
+        leaf_count = 0
+        palette_index = len(self._ais_shapes)  # continue from current count
+
+        def walk(n, path):
+            nonlocal leaf_count, palette_index
+            current_path = f"{path}/{n.label}" if n.label else path
+            if not n.children:
+                if n.wrapped is None:
+                    return
+                self._display_leaf(n, current_path, palette_index)
+                leaf_count += 1
+                palette_index += 1
+            else:
+                for child in n.children:
+                    walk(child, current_path)
+
+        walk(node, path_prefix)
+        self.context.UpdateCurrentViewer()
+        self.update()
+        print(f"Displayed {leaf_count} new leaf solids.")
+        return leaf_count
+
     def load_and_display_assembly(self, step_path):
         """
         Load a STEP assembly via the proven load_assembly() (same

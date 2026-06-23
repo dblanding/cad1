@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QTreeWidget,
     QTreeWidgetItem,
+    QTreeWidgetItemIterator,
     QAbstractItemView,
     QLabel,
 )
@@ -126,7 +127,45 @@ class AssemblyTreeWidget(QTreeWidget):
             parent_item.addChild(child_item)
             self._populate_children(child_item, child_node)
 
-    def dropEvent(self, event):
+    def add_node_to_tree(self, new_node, parent_node=None):
+        """
+        Add a newly-imported node (and its full subtree) to the tree,
+        as a child of parent_node. If parent_node is None, adds to the
+        root assembly's top-level item.
+
+        Used by the Import STEP workflow: load a new STEP file, add
+        its root as a child of the existing top-level assembly, then
+        call this to reflect that in the tree widget.
+        """
+        # Find the parent tree item
+        if parent_node is None:
+            parent_item = self.topLevelItem(0)
+        else:
+            parent_item = None
+            for item_id, node in self._item_to_node.items():
+                if node is parent_node:
+                    # Find the actual QTreeWidgetItem with this id
+                    parent_item = self._find_item_by_id(item_id)
+                    break
+            if parent_item is None:
+                parent_item = self.topLevelItem(0)
+
+        new_item = self._make_item(new_node)
+        parent_item.addChild(new_item)
+        self._populate_children(new_item, new_node)
+        parent_item.setExpanded(True)
+        new_item.setExpanded(True)
+        return new_item
+
+    def _find_item_by_id(self, item_id):
+        """Find a QTreeWidgetItem by its Python id (used in _item_to_node)."""
+        iterator = QTreeWidgetItemIterator(self)
+        while iterator.value():
+            item = iterator.value()
+            if id(item) == item_id:
+                return item
+            iterator += 1
+        return None
         """
         Let Qt perform its default InternalMove reparenting on the
         WIDGET rows first, then sync that change back into the REAL

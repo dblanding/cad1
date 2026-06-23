@@ -196,54 +196,48 @@ version would have been.
 
 ---
 
-### Dynamic positioning: design
+### Dynamic positioning: COMPLETE
 
-**Goal:** get a just-imported part (which may be overlapping existing
-geometry) to somewhere visible and roughly correct before Mate/Align.
-Precision is NOT required here -- that's what Mate/Align is for.
+**`AIS_Manipulator` gizmo implemented and confirmed working.**
+All 6 DOF: 3 arrows for translation, 3 rings for rotation. Integrated
+into the Position dialog as "Dynamic Move" -- select a node in the
+tree, click Position, choose Dynamic Move, click Start Step, drag the
+gizmo in the viewport, click Done.
 
-**Minimal viable approach** (no AIS_Manipulator gizmo needed yet):
-- Select the part to move (already works via tree click or viewport
-  click)
-- Click a destination point in the viewport → the part's center
-  (or a picked point on it) translates to that point
-- This is just `move_location_only()` from `pose.py`, already
-  self-tested, applied to a real part (proven tonight)
-
-**Full CoCreate approach** (worth doing eventually):
-- `AIS_Manipulator` gizmo -- the OCCT built-in tri-ball/CoPilot
-  equivalent, confirmed to exist in OCCT earlier in this project.
-  Directional arrows for translate, rotation handles for rotate.
-  More intuitive but more new API surface to wire up.
-
-**Decision:** start with the click-to-translate minimal version,
-which lets the workflow work end to end. Add `AIS_Manipulator` as
-a polish step once Mate/Align is solid.
-
----
-
-### Build order (suggested)
-
-1. ✅ **Mate/Align UI** -- built and working for single steps.
-   Next: fix purity of motion (see above) so multi-step 3-2-1
-   works correctly.
-
-2. **Dynamic Move** (click-to-translate version) -- a mode where
-   clicking in the viewport moves the selected part's center to
-   the clicked point. Simple enough to be a 1-day addition once
-   Mate/Align purity of motion is fixed.
-
-3. **AIS_Manipulator gizmo** -- the slick drag version. After
-   everything else is working.
+Key implementation notes:
+- `SyncedViewportWidget` overrides `mousePressEvent`/`mouseMoveEvent`/
+  `mouseReleaseEvent` to intercept LMB drag when a manipulator part is
+  detected under the cursor (`HasActiveMode()`), suppressing the normal
+  orbit behavior
+- `DeactivateCurrentMode()` called after `StopTransform()` to reset
+  `HasActiveMode()` to False -- without this, orbit is locked out after
+  the first drag (confirmed real bug, fixed)
+- Slight quirkiness: one extra click away from gizmo sometimes needed
+  to fully hand LMB control back to orbit. Acceptable, trainable.
+- Transform applied to build123d node via `manipulator.Object()
+  .LocalTransformation()` → `Location` → `Shape.move()` with
+  parent-local frame conversion (same `_world_move_to_local()` as
+  Mate/Align)
 
 ---
 
-### The reference UX (screenshots)
+### Build order: ALL COMPLETE
 
-![HP/CoCreate Position dialog](imgs/hp-position-dialog.png)
+1. ✅ **Mate/Align UI** -- full 3-2-1 working with purity of motion
+2. ✅ **Dynamic Move** -- AIS_Manipulator gizmo, all 6 DOF
+3. ✅ **Import STEP** -- load new files mid-session, re-parent, export
 
-![CoCreate Create Copy dialog, with Position embedded](imgs/cocreate-copy-share-with-position.png)
+---
 
+### Next features (from Doug's list)
+
+1. **RMB context menu in viewport** -- quick access to Fit All and
+   other view commands. Simple, high value.
+2. **Workplanes + part creation** -- pick a face, create a workplane,
+   sketch 2D geometry, extrude/cut to make new parts. See §6 below
+   for design notes.
+
+---
 
 
 ---
@@ -484,11 +478,76 @@ full chain was exercised together.
 
 ---
 
+## 6. Workplanes and Part Creation
+
+**Status:** not yet started. Next major feature after RMB menu.
+
+**What a workplane is:** a finite rectangular plane displayed in the
+viewport with its own U/V coordinate system (pink grid lines in
+CoCreate's UI). It defines a 2D sketching surface anchored to 3D
+geometry. See attached screenshot `docs/imgs/new-wp_cg.png` for
+CoCreate's reference UX.
+
+**CoCreate's creation options** (from the Workplane panel):
+- **New** -- default, placed at origin
+- **On Face** -- coincident with a picked face ← PRIMARY USE CASE
+- **On Axis** -- aligned with a cylinder/edge axis
+- **By Pnt & Dir** -- point + direction vector
+- **Project Geo** -- projects existing geometry onto the workplane
+- **Project Constr** -- projects construction geometry
+
+**For our 90% use case** (simple mounting plates and brackets),
+"On Face" is the primary workflow:
+1. Pick an existing face in the viewport
+2. A workplane appears coincident with that face
+3. Sketch 2D geometry on the workplane (lines, circles, rectangles)
+4. Extrude or cut to create a new 3D part
+5. The new part appears in the tree as a new node, ready to position
+
+**build123d connection:** build123d has first-class workplane support
+via `Workplane` / `BuildSketch` / `BuildPart` context managers.
+The face-picking infrastructure built for Mate/Align (face normal,
+face center, face plane) is directly reusable for workplane creation:
+pick a face → `PointRef(kind="face_center")` + `DirectionRef(kind=
+"face_normal")` → `Plane(origin, z_dir)` → build123d `Workplane`.
+
+**Display:** workplane rendered in the OCCT viewport as a transparent
+colored rectangle with U/V axis lines. `AIS_Plane` or a custom
+`AIS_Shape` built from a flat rectangular face.
+
+**Sketch UI:** the hardest part. Options:
+- Minimal: keyboard-driven entry of dimensions (extrude a rectangle
+  of width W, height H -- no freehand drawing needed for simple
+  mounting plates)
+- Full: 2D sketch editor with line/circle/rectangle tools
+Start minimal, add sketch tools if needed.
+
+**Scope decision (deferred):** decide at session start whether to
+implement minimal (dimension-driven extrusion only) or full sketch
+UI. Minimal is likely sufficient for the 90% use case and much
+faster to build.
+
+---
+
+## 7. RMB Context Menu in Viewport
+
+**Status:** not yet started. Quick win, do before workplanes.
+
+**What's needed:** right-click in the viewport opens a context menu
+with common view commands. At minimum:
+- **Fit All** -- zoom to fit all visible geometry
+- **Fit Selected** -- zoom to selected part (if something is selected)
+- **Reset View** -- return to default isometric orientation
+
+**Implementation:** `QMenu` in `mouseReleaseEvent` on RMB, populated
+with actions that call the existing `view.FitAll()` / `view.FitAll()`
+etc. methods already used in `assembly_viewer.py`. One afternoon's
+work at most.
+
+**CoCreate context menu also included:** Part operations (hide, show,
+delete), assembly operations (expand/collapse), and workplane
+operations. We can add these incrementally as features are built.
+
+---
 
 
-When picking a backlog item up: read its section here first, then
-check whether anything in the wider conversation history /
-`archive_diagnostics/` is relevant before starting fresh. Move
-resolved items into the appropriate permanent doc (`STEP_NOTES.md`,
-`VIEWPORT_NOTES.md`, or a new one) once they're actually built, rather
-than leaving stale "status: open" text here.
