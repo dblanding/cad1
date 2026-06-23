@@ -138,7 +138,18 @@ which Mate then cleanly consumes as a pure translation. The purity
 of motion property only holds when constraint steps are applied in
 order of decreasing DOF consumed: most-constraining step first.
 
-**General rule:** apply the constraint that consumes the MOST DOF
+**Bug found and fixed: unwanted 90-degree spin on Mate/Align.**
+Root cause: `Plane(origin=p, z_dir=v)` auto-computes an x_dir based
+on v's relationship to world axes. When from_z and target_z differ,
+their auto-computed x_dirs differ, and `compute_move` adds a spin to
+align them. Surfaced with a real STEP file (raspibot.step) where the
+spin was a full 90 degrees, spoiling hole pattern alignment. Fixed via
+`_make_rotation_plane()` which explicitly projects from_plane's x_dir
+onto the target normal's perpendicular plane, preserving in-plane
+orientation. Only visible with certain face orientations -- as1-oc-214
+happened to not trigger it.
+
+
 first, then work downward. Align Axis (4 DOF) before Mate (consumes
 remaining 1). For prismatic features, Mate (3 DOF) before Align
 (2 DOF) before Align (1 DOF) -- the natural 3-2-1 order already

@@ -220,17 +220,43 @@ def _fmt(v: Vector) -> str:
 
 
 
+def _make_rotation_plane(pick1_point, from_z, to_z):
+    """
+    Build a to_plane for compute_move that aligns from_z to to_z WITHOUT
+    adding any spin around the normal axis.
+
+    ROOT CAUSE of the 90-degree spin bug: Plane(origin=p, z_dir=v)
+    auto-computes an x_dir that depends on v's orientation relative to
+    world axes. If two planes have different z_dirs, their auto-computed
+    x_dirs differ, and compute_move includes a spin around the normal to
+    align them -- unwanted rotation that spoils hole pattern alignment.
+    Confirmed real bug: 90-degree spin on Mate with certain STEP files.
+
+    THE FIX: explicitly set to_plane's x_dir by projecting from_plane's
+    auto-computed x_dir onto the target normal's perpendicular plane.
+    This preserves the original in-plane orientation and only rotates
+    what's necessary to align the normals.
+    """
+    from_plane = Plane(origin=pick1_point, z_dir=from_z)
+    from_x = from_plane.x_dir  # build123d's auto-computed x_dir for from_z
+
+    # Project from_x onto the plane perpendicular to to_z.
+    from_x_dot_to_z = from_x.dot(to_z)
+    projected = from_x - to_z * from_x_dot_to_z
+
+    # Degenerate case: from_x is nearly parallel to to_z (faces at 90
+    # degrees to each other). Fall back to auto-computed x_dir.
+    if projected.length < 1e-6:
+        return Plane(origin=pick1_point, z_dir=to_z)
+
+    return Plane(origin=pick1_point, x_dir=projected.normalized(), z_dir=to_z)
+
+
 def compute_mate_move(pick1: PickResult, pick2: PickResult):
     """
     Mate: moving face becomes coplanar with target face, normals OPPOSED.
-
-    Only consumes the 3 DOF relevant to this constraint:
-    - 2 rotational (align normals)
-    - 1 translational (close the gap along the normal)
-
-    Leaves in-plane position and spin completely free.
-    Faces do NOT need to have coincident centers -- only the planes
-    need to be coplanar (confirmed: Doug's explicit requirement).
+    Only consumes 3 DOF: 2 rotational (align normals) + 1 translational
+    (close gap along normal). No in-plane movement, no spin.
     """
     if pick1.direction is None or pick2.direction is None:
         print("[position_dialog] Mate requires directed picks (faces or circular edges)")
@@ -238,43 +264,23 @@ def compute_mate_move(pick1: PickResult, pick2: PickResult):
 
     from build123d import Location, Vector
 
-    # Target direction for the moving face after Mate: OPPOSED to target
-    target_z = -pick2.direction
+    target_z = -pick2.direction  # OPPOSED for Mate
 
-    # Step 1: pure rotation -- same origin for both planes so
-    # compute_move produces rotation only, zero translation.
     from_plane = Plane(origin=pick1.point, z_dir=pick1.direction)
-    to_plane_rot = Plane(origin=pick1.point, z_dir=target_z)
+    to_plane_rot = _make_rotation_plane(pick1.point, pick1.direction, target_z)
     rotation = compute_move(from_plane, to_plane_rot)
 
-    # Step 2: find where pick1.point ends up after the rotation.
-    # The rotation maps from_plane's origin to to_plane_rot's origin
-    # (both are pick1.point) -- so the point itself doesn't move, but
-    # the ORIENTATION of the face at that point changes. We need to
-    # know the gap between the (now-rotated) face plane and the target
-    # plane. Since the face passes through pick1.point and the rotation
-    # is about pick1.point, the face plane after rotation still passes
-    # through pick1.point -- just with a different normal (target_z).
-    # The gap from pick1.point to the target plane (through pick2.point
-    # with normal target_z) is simply:
     gap = (pick2.point - pick1.point).dot(target_z)
     translation_vec = target_z * gap
-
-    # Step 3: compose -- rotation first (about pick1.point), then
-    # translate along the normal to close the gap.
-    translation = Location((translation_vec.X,
-                             translation_vec.Y,
-                             translation_vec.Z))
+    translation = Location((translation_vec.X, translation_vec.Y, translation_vec.Z))
     return translation * rotation
 
 
 def compute_align_move(pick1: PickResult, pick2: PickResult):
     """
     Align: moving face becomes coplanar with target face, normals SAME
-    direction (flush, not face-to-face).
-
-    Same purity-of-motion logic as Mate -- only normal rotation +
-    normal-direction gap translation. No in-plane movement.
+    direction. Only consumes 3 DOF: 2 rotational + 1 translational.
+    No in-plane movement, no spin.
     """
     if pick1.direction is None or pick2.direction is None:
         print("[position_dialog] Align requires directed picks (faces or circular edges)")
@@ -282,20 +288,15 @@ def compute_align_move(pick1: PickResult, pick2: PickResult):
 
     from build123d import Location, Vector
 
-    # Target direction: SAME as target face normal (Align = flush)
-    target_z = pick2.direction
+    target_z = pick2.direction  # SAME for Align
 
     from_plane = Plane(origin=pick1.point, z_dir=pick1.direction)
-    to_plane_rot = Plane(origin=pick1.point, z_dir=target_z)
+    to_plane_rot = _make_rotation_plane(pick1.point, pick1.direction, target_z)
     rotation = compute_move(from_plane, to_plane_rot)
 
-    # Same gap logic as Mate -- rotation is about pick1.point so
-    # pick1.point stays in place; just measure gap to target plane.
     gap = (pick2.point - pick1.point).dot(target_z)
     translation_vec = target_z * gap
-    translation = Location((translation_vec.X,
-                             translation_vec.Y,
-                             translation_vec.Z))
+    translation = Location((translation_vec.X, translation_vec.Y, translation_vec.Z))
     return translation * rotation
 
 
