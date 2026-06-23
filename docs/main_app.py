@@ -186,32 +186,21 @@ class SyncedViewportWidget(OcctViewportWidget):
 
     def get_manipulator_transform(self):
         """
-        Return the accumulated transform from the manipulator.
-        AIS_Manipulator applies transforms directly to its attached
-        AIS_Shape -- so the transform is already live in the shape's
-        location. We return None here and instead rely on the fact
-        that the shape (and therefore the build123d node's world
-        geometry) has already been updated by the drag operations.
-        The caller just needs to sync the build123d node's location
-        to match what OCCT now shows.
+        Return the accumulated transform from the manipulator as a
+        build123d Location, or None if no manipulator is active.
+        Used by the position dialog to apply the move to the node
+        after the user clicks Done.
         """
-        # The manipulator applies transforms to the attached AIS_Shape
-        # directly via its own internal mechanism during drag. After
-        # Done is clicked, we need to read the shape's new location
-        # from OCCT and apply it to the build123d node.
         if self._manipulator is None:
             return None
         try:
-            # Get the attached object's current transformation
             from OCP.gp import gp_Trsf
             from build123d import Location
-            obj = self._manipulator.Object()
-            if obj is not None:
-                trsf = obj.LocalTransformation()
-                return Location(trsf)
+            trsf = self._manipulator.Transform()
+            return Location(trsf)
         except Exception as e:
-            print(f"[manipulator] get transform failed: {e}")
-        return None
+            print(f"[manipulator] get_manipulator_transform failed: {e}")
+            return None
 
     def mousePressEvent(self, event):
         """Intercept LMB press to route to manipulator if cursor is over it."""
@@ -262,13 +251,8 @@ class SyncedViewportWidget(OcctViewportWidget):
                 and self._manipulator is not None):
             try:
                 self._manipulator.StopTransform()
-                # CRITICAL: deactivate the current mode so HasActiveMode()
-                # returns False when cursor moves away -- without this,
-                # HasActiveMode() stays True and all subsequent LMB clicks
-                # are intercepted as manipulator drags, locking out orbit.
-                self._manipulator.DeactivateCurrentMode()
             except Exception as e:
-                print(f"[manipulator] StopTransform/Deactivate failed: {e}")
+                print(f"[manipulator] StopTransform failed: {e}")
             self._manip_dragging = False
             self.update()
             return  # suppress selection
