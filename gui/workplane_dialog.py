@@ -50,6 +50,10 @@ from OCP.TopAbs import TopAbs_FACE
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from workplane import WorkPlane  # noqa: E402
 
+# Import sketch toolbar (same directory as this file)
+sys.path.insert(0, os.path.dirname(__file__))
+from sketch_toolbar import SketchToolBar  # noqa: E402
+
 
 # CoCreate-inspired green for the workplane border display
 _WP_COLOR = Quantity_Color(0.3, 0.75, 0.4, Quantity_TypeOfColor.Quantity_TOC_RGB)
@@ -110,27 +114,19 @@ class WorkplaneDialog(QDockWidget):
 
         layout.addWidget(step1)
 
-        # ---- Step 2: sketch dimensions -------------------------------
-        step2 = QGroupBox("Step 2 — Rectangle sketch")
+        # ---- Step 2: sketch toolbar ----------------------------------
+        step2 = QGroupBox("Step 2 — Sketch")
         s2_layout = QVBoxLayout(step2)
 
-        row_w = QHBoxLayout()
-        row_w.addWidget(QLabel("Width:"))
-        self._width_edit = QLineEdit("50")
-        self._width_edit.setMaximumWidth(80)
-        row_w.addWidget(self._width_edit)
-        row_w.addWidget(QLabel("mm"))
-        row_w.addStretch()
-        s2_layout.addLayout(row_w)
+        self._sketch_toolbar = SketchToolBar(self)
+        self._sketch_toolbar.setEnabled(False)
+        s2_layout.addWidget(self._sketch_toolbar)
 
-        row_h = QHBoxLayout()
-        row_h.addWidget(QLabel("Height:"))
-        self._height_edit = QLineEdit("50")
-        self._height_edit.setMaximumWidth(80)
-        row_h.addWidget(self._height_edit)
-        row_h.addWidget(QLabel("mm"))
-        row_h.addStretch()
-        s2_layout.addLayout(row_h)
+        layout.addWidget(step2)
+
+        # ---- Step 3: extrude depth + name + create -------------------
+        step3 = QGroupBox("Step 3 — Extrude")
+        s3_layout = QVBoxLayout(step3)
 
         row_d = QHBoxLayout()
         row_d.addWidget(QLabel("Depth:"))
@@ -139,13 +135,7 @@ class WorkplaneDialog(QDockWidget):
         row_d.addWidget(self._depth_edit)
         row_d.addWidget(QLabel("mm"))
         row_d.addStretch()
-        s2_layout.addLayout(row_d)
-
-        layout.addWidget(step2)
-
-        # ---- Step 3: name + create -----------------------------------
-        step3 = QGroupBox("Step 3 — Create part")
-        s3_layout = QVBoxLayout(step3)
+        s3_layout.addLayout(row_d)
 
         row_n = QHBoxLayout()
         row_n.addWidget(QLabel("Name:"))
@@ -171,8 +161,9 @@ class WorkplaneDialog(QDockWidget):
 
     def _set_sketch_enabled(self, enabled):
         """Enable/disable step 2+3 controls depending on whether we have a WP."""
-        for w in [self._width_edit, self._height_edit, self._depth_edit,
-                  self._name_edit, self._create_btn]:
+        self._sketch_toolbar.setEnabled(enabled)
+        for w in [self._depth_edit, self._name_edit, self._create_btn]:
+
             w.setEnabled(enabled)
 
     # ------------------------------------------------------------------
@@ -238,6 +229,8 @@ class WorkplaneDialog(QDockWidget):
         self._display_workplane()
         self._set_sketch_enabled(True)
         self._create_btn.setEnabled(True)
+        # Activate sketch toolbar with the new workplane
+        self._sketch_toolbar.set_workplane(self._workplane, self._viewport)
 
     # ------------------------------------------------------------------
     # Workplane display
@@ -326,25 +319,20 @@ class WorkplaneDialog(QDockWidget):
             QMessageBox.warning(self, "No workplane", "Please pick a face first.")
             return
 
-        # Parse inputs
         try:
-            w = float(self._width_edit.text())
-            h = float(self._height_edit.text())
             d = float(self._depth_edit.text())
         except ValueError:
-            QMessageBox.warning(self, "Invalid input",
-                                "Width, height, and depth must be numbers.")
+            QMessageBox.warning(self, "Invalid input", "Depth must be a number.")
             return
 
         name = self._name_edit.text().strip() or "new_part"
 
-        if w <= 0 or h <= 0 or d <= 0:
-            QMessageBox.warning(self, "Invalid input",
-                                "Width, height, and depth must be positive.")
+        if d <= 0:
+            QMessageBox.warning(self, "Invalid input", "Depth must be positive.")
             return
 
         try:
-            node = self._extrude(w, h, d, name)
+            node = self._extrude(d, name)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -352,7 +340,8 @@ class WorkplaneDialog(QDockWidget):
                                  f"Could not create part:\n{e}")
             return
 
-        # Clean up workplane display
+        # Clean up sketch and workplane display
+        self._sketch_toolbar.deactivate()
         self._erase_workplane()
         self._workplane = None
         self._set_sketch_enabled(False)
@@ -363,29 +352,34 @@ class WorkplaneDialog(QDockWidget):
         # Tell main_app about the new node
         self.part_created.emit(node)
 
-    def _extrude(self, width, height, depth, name):
+    def _extrude(self, depth, name):
         """
-        Add a rectangle to the workplane, make a wire, extrude it, and
-        return a build123d Solid node ready to join the assembly tree.
+        Extrude the current sketch profile along the workplane normal.
+        Uses whatever profile has been sketched via the toolbar.
+        If no profile elements have been added, raises RuntimeError.
+        Returns a build123d Solid node ready to join the assembly tree.
         """
         from build123d import Solid
-
-        wp = self._workplane
-
-        # Clear any previous sketch geometry on this workplane
-        wp.edgeList = []
-        wp.wire = None
-
-        # Centre the rectangle on the workplane origin
-        hw, hh = width / 2.0, height / 2.0
-        wp.rect((-hw, -hh), (hw, hh))
-
-        if not wp.makeWire():
-            raise RuntimeError("makeWire() failed -- profile may not be closed.")
-
         from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
         from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
         from OCP.gp import gp_Vec
+
+        wp = self._workplane
+
+        if not wp.edgeList:
+            raise RuntimeError(
+                "No sketch profile found.\n\n"
+                "Use the sketch toolbar (Step 2) to draw a rectangle, "
+                "circle, or other profile before creating a part."
+            )
+
+        if not wp.makeWire():
+            raise RuntimeError(
+                "makeWire() failed -- the profile may not be closed.\n\n"
+                "Tip: a rectangle (Rect tool) or circle (Circle tool) "
+                "always forms a closed profile. Lines must form a "
+                "closed loop."
+            )
 
         face_bldr = BRepBuilderAPI_MakeFace(wp.wire)
         if not face_bldr.IsDone():
@@ -394,13 +388,11 @@ class WorkplaneDialog(QDockWidget):
         extrude_vec = gp_Vec(wp.wDir) * depth
         solid_shape = BRepPrimAPI_MakePrism(face_bldr.Shape(), extrude_vec).Shape()
 
-        # Return the Solid directly -- no need to wrap in a Compound.
-        # A Solid IS a Shape (satisfies build123d's _pre_attach_children
-        # validator) and shows up as a single leaf in the tree, which
-        # is the right representation for a simple extruded part.
         b3d_solid = Solid(solid_shape)
         b3d_solid.label = name
         return b3d_solid
+
+
 
     # ------------------------------------------------------------------
     # Cancel / close
@@ -408,6 +400,7 @@ class WorkplaneDialog(QDockWidget):
 
     def _on_cancel(self):
         self._cancel_pick_mode()
+        self._sketch_toolbar.deactivate()
         self._erase_workplane()
         self._workplane = None
         self._set_sketch_enabled(False)
@@ -416,6 +409,7 @@ class WorkplaneDialog(QDockWidget):
 
     def closeEvent(self, event):
         self._cancel_pick_mode()
+        self._sketch_toolbar.deactivate()
         self._erase_workplane()
         super().closeEvent(event)
 
