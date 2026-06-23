@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from assembly_viewer import OcctViewportWidget  # noqa: E402
 from assembly_tree_widget import AssemblyTreeWidget  # noqa: E402
 from position_dialog import PositionDialog  # noqa: E402
+from workplane_dialog import WorkplaneDialog  # noqa: E402
 
 
 class SyncedViewportWidget(OcctViewportWidget):
@@ -488,6 +489,17 @@ class MainWindow(QWidget):
         self._position_btn.clicked.connect(self._on_position_clicked)
         tree_layout.addWidget(self._position_btn)
 
+        # Create Part button -- opens the Workplane → Sketch → Extrude
+        # dialog to create a new solid and add it to the assembly.
+        self._create_part_btn = QPushButton("✏  Create Part...")
+        self._create_part_btn.setEnabled(False)
+        self._create_part_btn.setToolTip(
+            "Pick a face to define a workplane, sketch a rectangle,\n"
+            "and extrude it to create a new part."
+        )
+        self._create_part_btn.clicked.connect(self._on_create_part_clicked)
+        tree_layout.addWidget(self._create_part_btn)
+
         # Import button -- loads a new STEP file and adds it to the
         # current assembly at the top level, ready to be re-parented
         # and positioned.
@@ -526,6 +538,11 @@ class MainWindow(QWidget):
         self._position_dialog.request_redisplay.connect(self._on_redisplay_after_move)
         self._position_dialog.positioning_done.connect(self._on_positioning_done)
 
+        # --- Workplane / Create Part dialog (floating dock) ----------
+        self._workplane_dialog = WorkplaneDialog(self, viewport=self.viewport)
+        self._workplane_dialog.hide()
+        self._workplane_dialog.part_created.connect(self._on_part_created)
+
         # --- Wire the standard sync signals --------------------------
         self.viewport.part_selected.connect(self._on_part_selected_in_viewport)
         self.viewport.geometry_picked.connect(self._on_geometry_picked)
@@ -543,6 +560,7 @@ class MainWindow(QWidget):
         self.tree.load_assembly_into_tree(self._assembly)
         self._export_btn.setEnabled(True)
         self._import_btn.setEnabled(True)
+        self._create_part_btn.setEnabled(True)
         print("Loaded into both tree and viewport.")
 
     def _on_part_selected_in_viewport(self, node_info):
@@ -677,13 +695,50 @@ class MainWindow(QWidget):
 
     def _on_geometry_picked(self, raw_shape, shape_type):
         """
-        Route a viewport pick to the position dialog when in positioning
-        mode. Normal tree-sync behavior (part_selected signal) still
-        fires regardless -- this is additive, not a replacement.
+        Route a viewport pick to whichever dialog is currently active.
+        The workplane dialog takes priority when in face-pick mode;
+        otherwise the position dialog gets the pick.
         """
-        if self._position_dialog.isVisible() and \
+        if self._workplane_dialog.isVisible() and \
+                self._workplane_dialog.is_in_pick_mode():
+            self._workplane_dialog.receive_pick(raw_shape, shape_type)
+        elif self._position_dialog.isVisible() and \
                 self._position_dialog.is_in_positioning_mode():
             self._position_dialog.receive_pick(raw_shape, shape_type)
+
+    def _on_create_part_clicked(self):
+        """Open the Workplane/Create Part dialog."""
+        if self._assembly is None:
+            return
+        self._workplane_dialog.setFloating(True)
+        self._workplane_dialog.show()
+        self._workplane_dialog.raise_()
+        # Auto-enter pick mode so user can click a face immediately
+        self._workplane_dialog.enter_pick_mode()
+
+    def _on_part_created(self, new_node):
+        """
+        A new solid was extruded -- add it to the assembly tree and display
+        it in the viewport.
+        """
+        if self._assembly is None:
+            return
+
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+        from step_assembly_poc import add_node
+
+        # Add the new node to the top-level assembly
+        add_node(new_node, self._assembly)
+        print(f"New part '{new_node.label}' added to assembly.")
+
+        # Display in the 3D viewport
+        self.viewport.display_subtree(new_node, f"/{new_node.label}")
+
+        # Add to the tree widget
+        self.tree.add_node_to_tree(new_node, parent_node=self._assembly)
+
+        print(f"Part '{new_node.label}' created and displayed.")
 
     def _on_redisplay_after_move(self, moved_node):
         """

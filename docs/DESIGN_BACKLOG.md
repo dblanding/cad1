@@ -491,52 +491,62 @@ full chain was exercised together.
 
 ## 6. Workplanes and Part Creation
 
-**Status:** not yet started. Next major feature after RMB menu.
+**Status: MINIMUM VIABLE IMPLEMENTATION COMPLETE.** "On Face"
+workplane creation + dimension-driven rectangle extrusion working
+end-to-end, confirmed on `as1-oc-214.stp`.
 
-**What a workplane is:** a finite rectangular plane displayed in the
-viewport with its own U/V coordinate system (pink grid lines in
-CoCreate's UI). It defines a 2D sketching surface anchored to 3D
-geometry. See attached screenshot `docs/imgs/new-wp_cg.png` for
-CoCreate's reference UX.
+**What's working (confirmed via real testing):**
+- `src/workplane.py` -- fully ported from kodacad to OCP bindings.
+  All 3 creation modes (default XY, on face, by gp_Ax3), construction
+  geometry (H/V clines, circles), profile geometry (rect, line, arc),
+  and `makeWire()` all working. Smoke test passes.
+- `gui/workplane_dialog.py` -- floating `QDockWidget` driving the
+  3-step workflow: pick face → display workplane → enter dimensions →
+  extrude new part.
+- `gui/main_app.py` -- "✏ Create Part..." button added to tree panel,
+  wired to `WorkplaneDialog`. Pick routing in `_on_geometry_picked`
+  gives workplane dialog priority when in pick mode, then falls through
+  to position dialog.
 
-**CoCreate's creation options** (from the Workplane panel):
-- **New** -- default, placed at origin
-- **On Face** -- coincident with a picked face ← PRIMARY USE CASE
-- **On Axis** -- aligned with a cylinder/edge axis
-- **By Pnt & Dir** -- point + direction vector
-- **Project Geo** -- projects existing geometry onto the workplane
-- **Project Constr** -- projects construction geometry
+**Workflow (as implemented):**
+1. Click "✏ Create Part..." → dialog opens and immediately enters
+   face-pick mode (no extra button click needed).
+2. Click any face in the viewport → workplane appears as a
+   semi-transparent blue rectangle coincident with the face.
+3. Enter width, height, depth (mm) and a part name.
+4. Click "✚ Create Part" → rectangle profile extruded along the face
+   normal, new part added to assembly tree and displayed in viewport.
 
-**For our 90% use case** (simple mounting plates and brackets),
-"On Face" is the primary workflow:
-1. Pick an existing face in the viewport
-2. A workplane appears coincident with that face
-3. Sketch 2D geometry on the workplane (lines, circles, rectangles)
-4. Extrude or cut to create a new 3D part
-5. The new part appears in the tree as a new node, ready to position
+**OCP-specific bugs found and fixed during implementation:**
+- `brepgprop_SurfaceProperties` (old pythonOCC free-function style)
+  → `BRepGProp.SurfaceProperties_s(face, props)` (OCP static method).
+- `topods.Face(shape)` (old pythonOCC) → `TopoDS.Face_s(shape)` (OCP).
+- Raw face pick from `geometry_picked` arrives as `TopoDS_Shape`, not
+  `TopoDS_Face` -- must downcast before passing to `UVBounds_s` or
+  `BRepGProp`. Fixed in `WorkPlane.__init__` with `isinstance` check +
+  `TopoDS.Face_s()`.
+- New part must be `build123d.Compound(label=name, children=[solid])`
+  -- plain `anytree.Node` is rejected by build123d's
+  `_pre_attach_children` validator (`"Each child must be of type Shape"`).
 
-**build123d connection:** build123d has first-class workplane support
-via `Workplane` / `BuildSketch` / `BuildPart` context managers.
-The face-picking infrastructure built for Mate/Align (face normal,
-face center, face plane) is directly reusable for workplane creation:
-pick a face → `PointRef(kind="face_center")` + `DirectionRef(kind=
-"face_normal")` → `Plane(origin, z_dir)` → build123d `Workplane`.
+**Scope delivered (minimal, as planned):**
+- "On Face" mode only (the 90% use case).
+- Dimension-driven rectangle only (no freehand 2D sketch tools yet).
+- Extrude only (no cut/mill yet).
 
-**Display:** workplane rendered in the OCCT viewport as a transparent
-colored rectangle with U/V axis lines. `AIS_Plane` or a custom
-`AIS_Shape` built from a flat rectangular face.
-
-**Sketch UI:** the hardest part. Options:
-- Minimal: keyboard-driven entry of dimensions (extrude a rectangle
-  of width W, height H -- no freehand drawing needed for simple
-  mounting plates)
-- Full: 2D sketch editor with line/circle/rectangle tools
-Start minimal, add sketch tools if needed.
-
-**Scope decision (deferred):** decide at session start whether to
-implement minimal (dimension-driven extrusion only) or full sketch
-UI. Minimal is likely sufficient for the 90% use case and much
-faster to build.
+**Next things to explore:**
+1. **Cut/Mill** -- use the same workplane + profile to subtract from
+   an existing part (`BRepAlgoAPI_Cut`) instead of creating a new one.
+   Requires selecting an "active part" to cut into.
+2. **Revolve** -- extrude profile around an axis instead of along
+   the normal; useful for turned parts.
+3. **Additional sketch elements** -- circle, line, arc profiles
+   (the `WorkPlane` class already supports all of these; only the
+   dialog UI needs extending).
+4. **Workplane at origin** -- "New" mode (default XY plane), not
+   tied to an existing face. Useful when starting from scratch.
+5. **Persistent workplane** -- keep the workplane displayed and
+   allow multiple extrusions from the same plane before dismissing.
 
 ---
 
