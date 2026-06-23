@@ -531,23 +531,31 @@ faster to build.
 
 ## 7. RMB Context Menu in Viewport
 
-**Status:** not yet started. Quick win, do before workplanes.
+**Status: COMPLETE** (with one known issue noted below).
 
-**What's needed:** right-click in the viewport opens a context menu
-with common view commands. At minimum:
-- **Fit All** -- zoom to fit all visible geometry
-- **Fit Selected** -- zoom to selected part (if something is selected)
-- **Reset View** -- return to default isometric orientation
+RMB in the viewport opens a menu with: Fit All, Fit Selected,
+Reset View (isometric), View Top, View Front, View Right.
 
-**Implementation:** `QMenu` in `mouseReleaseEvent` on RMB, populated
-with actions that call the existing `view.FitAll()` / `view.FitAll()`
-etc. methods already used in `assembly_viewer.py`. One afternoon's
-work at most.
+**AIS_ViewCube also added** -- orientation cube in the bottom-right
+corner (same as CAD Assistant). Clicking edges (12) and corners (8)
+works correctly, animating the camera to the corresponding view.
 
-**CoCreate context menu also included:** Part operations (hide, show,
-delete), assembly operations (expand/collapse), and workplane
-operations. We can add these incrementally as features are built.
+**Known issue: face clicks on the view cube cause a crash.**
+Clicking one of the 6 face labels (TOP, FRONT, RIGHT, etc.) produces
+a white viewport and then a C++ segfault -- nothing printed to
+terminal, not catchable by Python try/except. Root cause is inside
+OCCT's own animation or camera-setting code when triggered by a face
+owner. Edges and corners use a different code path and work fine.
 
----
+**Workaround:** use the RMB menu's View Top/Front/Right items for
+standard orthographic views. Avoid clicking the view cube's flat
+faces. This is acceptable behavior -- edges and corners cover the
+isometric views that are most useful during 3D work anyway.
+
+**TODO (low priority):** investigate whether disabling the face
+sensitive zones entirely (`vc.SetDrawVertices(False)` equivalent for
+faces) prevents the crash while keeping edge/corner clicks working.
+Or wait for a newer OCP build where this may be fixed upstream.
+
 
 

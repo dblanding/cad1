@@ -27,7 +27,7 @@ import os
 from PySide6.QtWidgets import QApplication, QWidget
 from PySide6.QtCore import Qt
 
-from OCP.Aspect import Aspect_DisplayConnection
+from OCP.Aspect import Aspect_DisplayConnection, Aspect_TypeOfTriedronPosition
 from OCP.OpenGl import OpenGl_GraphicDriver
 from OCP.V3d import V3d_Viewer
 from OCP.AIS import AIS_InteractiveContext, AIS_Shape, AIS_DisplayMode
@@ -112,6 +112,7 @@ class OcctViewportWidget(QWidget):
         # path) it corresponds to -- not just which face.
         self._ais_shapes = []                # all displayed AIS_Shape objects
         self._ais_shape_to_node = {}          # id(AIS_Shape) -> tree node + label info
+        self._view_cube = None               # AIS_ViewCube, set in _init_native_window
 
         # Click-vs-drag tracking: LMB is used for BOTH rotation (drag)
         # and picking (click-no-drag). We distinguish them by how far
@@ -151,9 +152,38 @@ class OcctViewportWidget(QWidget):
         background = Quantity_Color(0.5, 0.5, 0.5, Quantity_TypeOfColor.Quantity_TOC_RGB)
         self.view.SetBackgroundColor(background)
         self.view.MustBeResized()
-        self.view.TriedronDisplay()  # small axis indicator, like the
-                                       # one visible in your CAD
-                                       # Assistant screenshot
+
+        # Replace the useless center trihedron with an AIS_ViewCube
+        # in the corner -- same as CAD Assistant uses. Clickable faces
+        # (6), edges (12), and corners (8) animate the camera to the
+        # corresponding standard view.
+        self._view_cube = None
+        try:
+            from OCP.AIS import AIS_ViewCube
+            vc = AIS_ViewCube()
+            # Place in bottom-right corner with a reasonable size.
+            vc.SetSize(80)
+            vc.SetBoxFacetExtension(8)
+            vc.SetAxesPadding(5)
+            vc.SetFontHeight(12)
+            # Use transform persistence to keep it fixed in the corner.
+            from OCP.Graphic3d import (
+                Graphic3d_TransformPers,
+                Graphic3d_TransModeFlags,
+            )
+            from OCP.Graphic3d import Graphic3d_Vec2i
+            trsf_pers = Graphic3d_TransformPers(
+                Graphic3d_TransModeFlags.Graphic3d_TMF_TriedronPers,
+                Aspect_TypeOfTriedronPosition.Aspect_TOTP_RIGHT_LOWER,
+                Graphic3d_Vec2i(100, 100)
+            )
+            vc.SetTransformPersistence(trsf_pers)
+            self.context.Display(vc, False)
+            self._view_cube = vc
+            print("AIS_ViewCube added to corner.")
+        except Exception as e:
+            print(f"(AIS_ViewCube not available: {e} -- falling back to trihedron)")
+            self.view.TriedronDisplay()
 
         # CRITICAL: OCCT's View does NOT redraw itself on any kind of
         # automatic schedule. Setting WA_PaintOnScreen above tells Qt
@@ -358,13 +388,72 @@ class OcctViewportWidget(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self._press_pos = event.position()
             self._drag_distance = 0.0
-            self.view.StartRotation(int(event.position().x()), int(event.position().y()))
+            x, y = int(event.position().x()), int(event.position().y())
+            # Check if the view cube is under the cursor -- if so,
+            # let it handle the click for camera animation.
+            if self._view_cube is not None:
+                self.context.MoveTo(x, y, self.view, True)
+                try:
+                    detected = self.context.DetectedInteractive()
+                    if detected is not None and detected == self._view_cube:
+                        owner = self.context.DetectedOwner()
+                        if owner is not None:
+                            # Use HandleViewCubeClick instead of
+                            # StartAnimation/animation loop, which was
+                            # causing crashes. Directly set the view
+                            # orientation from the owner's orientation.
+                            try:
+                                from OCP.AIS import AIS_ViewCubeOwner
+                                vc_owner = AIS_ViewCubeOwner.DownCast(owner)
+                                if not vc_owner.IsNull():
+                                    orientation = vc_owner.MainOrientation()
+                                    self.view.SetProj(orientation)
+                                    self.view.FitAll()
+                                    self.view.ZFitAll()
+                                    self._press_pos = None
+                                    self._drag_distance = 0.0
+                                    self.update()
+                                    return
+                            except Exception:
+                                # Fall back to animation if direct set fails
+                                self._view_cube.StartAnimation(owner)
+                                self._animate_view_cube()
+                                return
+                except Exception:
+                    pass
+            try:
+                self.view.StartRotation(x, y)
+            except Exception as e:
+                print(f"(StartRotation failed: {e})")
+
+    def _animate_view_cube(self):
+        """Run the view cube camera animation to completion."""
+        if self._view_cube is None:
+            return
+        try:
+            from PySide6.QtCore import QCoreApplication
+            while self._view_cube.HasAnimation():
+                self._view_cube.UpdateAnimation(False)
+                self.context.UpdateCurrentViewer()
+                QCoreApplication.processEvents()
+            # FitAll after animation to ensure correct camera distance
+            # and clipping planes -- face clicks end too close otherwise.
+            self.view.FitAll()
+            self.view.ZFitAll()
+        except Exception as e:
+            print(f"(view cube animation: {e})")
+        self._press_pos = None  # prevent StartRotation state confusion
+        self._drag_distance = 0.0
+        self.update()
 
     def mouseMoveEvent(self, event):
         pos = event.position()
 
         if event.buttons() & Qt.MouseButton.LeftButton:
-            self.view.Rotation(int(pos.x()), int(pos.y()))
+            try:
+                self.view.Rotation(int(pos.x()), int(pos.y()))
+            except Exception:
+                pass
             if self._press_pos is not None:
                 dx = pos.x() - self._press_pos.x()
                 dy = pos.y() - self._press_pos.y()
@@ -385,18 +474,81 @@ class OcctViewportWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
             if self._drag_distance < self._click_drag_threshold_px:
-                # Treated as a CLICK, not a drag/rotate -- attempt an
-                # actual selection of whatever was last highlighted by
-                # MoveTo(). Using the plain Select() form here (rather
-                # than newer scheme-based variants like SelectDetected/
-                # AIS_SelectionScheme_*) since OCCT's own forums show
-                # those newer names aren't present in every installed
-                # version -- Select() with no scheme argument is the
-                # older, more broadly-available form.
                 self.context.Select(True)
                 self._report_selection()
             self._press_pos = None
             self._drag_distance = 0.0
+
+        elif event.button() == Qt.MouseButton.RightButton:
+            self._show_context_menu(event.globalPosition().toPoint())
+
+        self.update()
+
+    def _show_context_menu(self, global_pos):
+        """RMB context menu with common view commands."""
+        from PySide6.QtWidgets import QMenu
+        from PySide6.QtGui import QAction
+
+        menu = QMenu(self)
+
+        fit_all = QAction("Fit All", self)
+        fit_all.triggered.connect(self._fit_all)
+        menu.addAction(fit_all)
+
+        fit_selected = QAction("Fit Selected", self)
+        fit_selected.triggered.connect(self._fit_selected)
+        menu.addAction(fit_selected)
+
+        reset_view = QAction("Reset View (isometric)", self)
+        reset_view.triggered.connect(self._reset_view)
+        menu.addAction(reset_view)
+
+        menu.addSeparator()
+
+        view_top = QAction("View Top", self)
+        view_top.triggered.connect(lambda: self._set_view_direction(0, 0, -1, 0, 1, 0))
+        menu.addAction(view_top)
+
+        view_front = QAction("View Front", self)
+        view_front.triggered.connect(lambda: self._set_view_direction(0, -1, 0, 0, 0, 1))
+        menu.addAction(view_front)
+
+        view_right = QAction("View Right", self)
+        view_right.triggered.connect(lambda: self._set_view_direction(1, 0, 0, 0, 0, 1))
+        menu.addAction(view_right)
+
+        menu.exec(global_pos)
+
+    def _fit_all(self):
+        self.view.FitAll()
+        self.update()
+
+    def _fit_selected(self):
+        try:
+            self.context.InitSelected()
+            if self.context.MoreSelected():
+                self.view.FitAll()
+        except Exception:
+            self.view.FitAll()
+        self.update()
+
+    def _reset_view(self):
+        try:
+            from OCP.V3d import V3d_TypeOfOrientation
+            self.view.SetProj(V3d_TypeOfOrientation.V3d_XposYnegZpos)
+            self.view.FitAll()
+        except Exception as e:
+            print(f"(reset view: {e})")
+            self.view.FitAll()
+        self.update()
+
+    def _set_view_direction(self, vx, vy, vz, ux, uy, uz):
+        try:
+            self.view.SetProj(vx, vy, vz)
+            self.view.SetUp(ux, uy, uz)
+            self.view.FitAll()
+        except Exception as e:
+            print(f"(set view direction: {e})")
         self.update()
 
     def _report_selection(self):
