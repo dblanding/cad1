@@ -491,62 +491,94 @@ full chain was exercised together.
 
 ## 6. Workplanes and Part Creation
 
-**Status: MINIMUM VIABLE IMPLEMENTATION COMPLETE.** "On Face"
-workplane creation + dimension-driven rectangle extrusion working
-end-to-end, confirmed on `as1-oc-214.stp`.
+**Status: PHASE 1-4 COMPLETE.** Full workflow working end-to-end,
+confirmed on `as1-oc-214.stp`.
 
 **What's working (confirmed via real testing):**
-- `src/workplane.py` -- fully ported from kodacad to OCP bindings.
-  All 3 creation modes (default XY, on face, by gp_Ax3), construction
-  geometry (H/V clines, circles), profile geometry (rect, line, arc),
-  and `makeWire()` all working. Smoke test passes.
-- `gui/workplane_dialog.py` -- floating `QDockWidget` driving the
-  3-step workflow: pick face → display workplane → enter dimensions →
-  extrude new part.
-- `gui/main_app.py` -- "✏ Create Part..." button added to tree panel,
-  wired to `WorkplaneDialog`. Pick routing in `_on_geometry_picked`
-  gives workplane dialog priority when in pick mode, then falls through
-  to position dialog.
 
-**Workflow (as implemented):**
-1. Click "✏ Create Part..." → dialog opens and immediately enters
-   face-pick mode (no extra button click needed).
-2. Click any face in the viewport → workplane appears as a
-   semi-transparent blue rectangle coincident with the face.
-3. Enter width, height, depth (mm) and a part name.
-4. Click "✚ Create Part" → rectangle profile extruded along the face
-   normal, new part added to assembly tree and displayed in viewport.
+### Phase 1 — Active Assembly
+- RMB on any tree node → "► Set Active Assembly" makes it the target
+  for new parts and imports.
+- Active node shown in **bold** with ► prefix in the tree.
+- "✕ Clear Active" (appears on RMB when node is already active)
+  reverts to root as implicit target.
+- `tree.get_target_node()` returns active node, or root if none set.
+- Both "Create Part" and "Import STEP" now use `get_target_node()`
+  instead of always targeting the root assembly.
+
+### Phase 2 — Persistent Workplane Display
+- `src/workplane.py` -- fully ported from kodacad to OCP bindings.
+  Smoke test passes.
+- `gui/workplane_dialog.py` -- floating QDockWidget: pick face →
+  show workplane → enter dimensions → extrude new part.
+- Workplane displayed as semi-transparent **green** face (CoCreate
+  color) with **pink/magenta U/V crosshair lines** through origin.
+- All three AIS objects (border + 2 axis lines) tracked and erased
+  cleanly after extrusion or cancel.
+
+### Phase 3 — Create/Delete Sub-Assembly
+- RMB → "📁 New Sub-Assembly..." prompts for name, creates empty
+  `Compound` under the clicked node, adds it to tree.
+- RMB → "🗑 Delete" (disabled on root): confirms, then erases all
+  leaf AIS_Shapes from viewport, removes node from assembly data
+  structure (`remove_node()`), removes row from tree widget.
+  Handles both leaf parts and assembly containers (recursively erases
+  all descendants).
+- Delete also clears active status if the deleted node was active.
+
+### Phase 4 — Workplane Display Polish
+- Green translucent border (CoCreate-inspired).
+- Pink/magenta U/V crosshair lines along workplane U and V axes.
+- Workplane erased cleanly on part creation or cancel.
 
 **OCP-specific bugs found and fixed during implementation:**
-- `brepgprop_SurfaceProperties` (old pythonOCC free-function style)
-  → `BRepGProp.SurfaceProperties_s(face, props)` (OCP static method).
-- `topods.Face(shape)` (old pythonOCC) → `TopoDS.Face_s(shape)` (OCP).
-- Raw face pick from `geometry_picked` arrives as `TopoDS_Shape`, not
-  `TopoDS_Face` -- must downcast before passing to `UVBounds_s` or
-  `BRepGProp`. Fixed in `WorkPlane.__init__` with `isinstance` check +
-  `TopoDS.Face_s()`.
-- New part must be `build123d.Compound(label=name, children=[solid])`
-  -- plain `anytree.Node` is rejected by build123d's
-  `_pre_attach_children` validator (`"Each child must be of type Shape"`).
+- `brepgprop_SurfaceProperties` → `BRepGProp.SurfaceProperties_s()`
+- `topods.Face()` → `TopoDS.Face_s()`
+- Raw face pick arrives as `TopoDS_Shape`, must downcast to
+  `TopoDS_Face` before `UVBounds_s` / `BRepGProp`.
+- New part must be a build123d `Shape` subclass (`Solid`, not plain
+  `anytree.Node`) to satisfy `_pre_attach_children` validator.
+- `QTreeWidgetItem` active-style label bug: `id(item)` in
+  `_item_to_node` can return a DIFFERENT node by the time
+  `_set_item_active_style` runs (Python reuses memory addresses after
+  GC). Fix: read `item.text(0)` directly at the top of the method
+  rather than reconstructing the label from the data model.
+  See item 8 in this backlog for the full failure chain.
 
-**Scope delivered (minimal, as planned):**
-- "On Face" mode only (the 90% use case).
-- Dimension-driven rectangle only (no freehand 2D sketch tools yet).
-- Extrude only (no cut/mill yet).
+**Files changed:**
+- `src/workplane.py` -- OCP port + downcast fix
+- `gui/workplane_dialog.py` -- green WP display, U/V crosshairs,
+  extrusion returning `Solid` directly
+- `gui/assembly_tree_widget.py` -- active assembly, RMB menu,
+  delete, new sub-assembly, `remove_node_from_tree()`
+- `gui/main_app.py` -- wires all new signals, active-aware
+  part creation and import, delete handler
+
+**Workflow (as built):**
+1. Load a STEP file → assembly appears in tree and viewport.
+2. RMB on a sub-assembly → "► Set Active Assembly" (bold + ►).
+3. Click "✏ Create Part..." → dialog opens in face-pick mode.
+4. Click a face → green workplane with pink crosshairs appears.
+5. Enter width / height / depth / name → "✚ Create Part".
+6. New solid added under the active assembly in tree + viewport.
+7. RMB on any node → "🗑 Delete" to remove it.
+8. RMB on any node → "📁 New Sub-Assembly..." to add a container.
 
 **Next things to explore:**
-1. **Cut/Mill** -- use the same workplane + profile to subtract from
-   an existing part (`BRepAlgoAPI_Cut`) instead of creating a new one.
-   Requires selecting an "active part" to cut into.
-2. **Revolve** -- extrude profile around an axis instead of along
-   the normal; useful for turned parts.
-3. **Additional sketch elements** -- circle, line, arc profiles
-   (the `WorkPlane` class already supports all of these; only the
-   dialog UI needs extending).
-4. **Workplane at origin** -- "New" mode (default XY plane), not
-   tied to an existing face. Useful when starting from scratch.
-5. **Persistent workplane** -- keep the workplane displayed and
-   allow multiple extrusions from the same plane before dismissing.
+1. **Cut/Mill** -- subtract a profile from an existing part using
+   the same workplane + `BRepAlgoAPI_Cut`. Requires an "active part"
+   concept (select which solid to cut into).
+2. **Revolve** -- profile around an axis instead of extruding along
+   the normal.
+3. **Workplane as persistent tree node** -- give the workplane its
+   own row in the tree (like CoCreate's `/w1`) so it can be
+   selected, repositioned, or deleted independently of any extrusion.
+4. **Additional sketch profiles** -- circle, arc, polygon in the
+   dialog (WorkPlane class already supports all of these).
+5. **Workplane label in viewport** -- render `/w1` text at the
+   corner of the plane (requires AIS_TextLabel or similar).
+6. **Undo** -- see item 3 in this backlog for the open question
+   about whether OCAF transactions cover build123d-level mutations.
 
 ---
 
@@ -577,6 +609,60 @@ isometric views that are most useful during 3D work anyway.
 sensitive zones entirely (`vc.SetDrawVertices(False)` equivalent for
 faces) prevents the crash while keeping edge/corner clicks working.
 Or wait for a newer OCP build where this may be fixed upstream.
+
+---
+
+## 8. Lessons Learned: Qt QTreeWidgetItem Text Modification
+
+**Context:** Setting the active assembly bold + ► prefix in the tree
+took many debugging iterations before the correct fix was found.
+Documenting the full failure chain so future sessions don't repeat it.
+
+**The symptom:** `item.setText(0, "► assembly")` was being called
+correctly (confirmed by debug prints) but the tree displayed
+`<unnamed>` instead.
+
+**The failure chain investigated (all dead ends):**
+- `id(item)` reuse: suspected a stale id() in `_item_to_node` was
+  returning the wrong node. Real -- Python reuses memory addresses
+  after GC -- but not the root cause here.
+- `itemChanged` signal firing after `setText`: suspected
+  `_on_tree_item_changed` in main_app was resetting the text.
+  Confirmed `itemChanged` fires but only BEFORE `set_active_node`
+  runs (from `setCheckState` during item creation), not after.
+- `blockSignals(True)` around `setText`: tried suppressing
+  `itemChanged`. Worked (no second signal fired) but text still
+  showed wrong. Reason: `blockSignals` also suppresses the internal
+  Qt repaint notification, leaving the display stale.
+- `viewport().update()` after `blockSignals(False)`: forced repaint
+  but still showed wrong text.
+- Looking up node label via `_item_to_node.get(id(item))`: this was
+  the actual bug source. By the time `_set_item_active_style` ran,
+  `id(item)` had been reused by a DIFFERENT item in `_item_to_node`,
+  so the lookup returned a node with `label=None` → `<unnamed>`.
+
+**The fix (one line):**
+Read `item.text(0)` at the very top of `_set_item_active_style`,
+before any other operation, and use that as the base label:
+
+```python
+def _set_item_active_style(self, item, active: bool):
+    current_text = item.text(0)
+    base_label = current_text[2:] if current_text.startswith("► ") \
+        else current_text
+    font = item.font(0)
+    font.setBold(active)
+    item.setFont(0, font)
+    item.setText(0, f"► {base_label}" if active else base_label)
+```
+
+**The lesson:**
+When modifying a `QTreeWidgetItem`'s display text, do NOT look up
+the underlying data model to reconstruct the label -- the `id(item)`
+key in any Python dict may have been reused by the time the method
+runs. Instead, read the item's current text directly from the widget
+itself (`item.text(0)`) before any modifications. The widget always
+has the right text; the dict lookup may not.
 
 
 

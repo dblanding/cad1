@@ -548,8 +548,10 @@ class MainWindow(QWidget):
         self.viewport.geometry_picked.connect(self._on_geometry_picked)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         self.tree.itemChanged.connect(self._on_tree_item_changed)
-        # Enable Position button when a tree row is selected.
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
+        self.tree.active_assembly_changed.connect(self._on_active_assembly_changed)
+        self.tree.node_delete_requested.connect(self._on_node_delete_requested)
+        self.tree.sub_assembly_created.connect(self._on_sub_assembly_created)
 
         self.step_path = step_path
         self._assembly = None  # set by load()
@@ -718,8 +720,8 @@ class MainWindow(QWidget):
 
     def _on_part_created(self, new_node):
         """
-        A new solid was extruded -- add it to the assembly tree and display
-        it in the viewport.
+        A new solid was extruded -- add it under the active assembly
+        (or top-level assembly if none is set) and display it.
         """
         if self._assembly is None:
             return
@@ -728,16 +730,12 @@ class MainWindow(QWidget):
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
         from step_assembly_poc import add_node
 
-        # Add the new node to the top-level assembly
-        add_node(new_node, self._assembly)
-        print(f"New part '{new_node.label}' added to assembly.")
+        target = self.tree.get_target_node()
+        add_node(new_node, target)
+        print(f"New part '{new_node.label}' added under '{target.label}'.")
 
-        # Display in the 3D viewport
         self.viewport.display_subtree(new_node, f"/{new_node.label}")
-
-        # Add to the tree widget
-        self.tree.add_node_to_tree(new_node, parent_node=self._assembly)
-
+        self.tree.add_node_to_tree(new_node, parent_node=target)
         print(f"Part '{new_node.label}' created and displayed.")
 
     def _on_redisplay_after_move(self, moved_node):
@@ -835,15 +833,16 @@ class MainWindow(QWidget):
             print(f"Loaded '{new_node.label}' with "
                   f"{len(list(new_node.descendants))} descendants.")
 
-            # Add to the existing top-level assembly as a new child.
-            add_node(new_node, self._assembly)
-            print(f"Added '{new_node.label}' to assembly.")
+            # Add under the active assembly (or root if none set).
+            target = self.tree.get_target_node()
+            add_node(new_node, target)
+            print(f"Added '{new_node.label}' under '{target.label}'.")
 
             # Display the new geometry in the viewport.
             self.viewport.display_subtree(new_node, f"/{new_node.label}")
 
-            # Add to the tree widget under the root.
-            self.tree.add_node_to_tree(new_node, parent_node=self._assembly)
+            # Add to the tree widget under the target node.
+            self.tree.add_node_to_tree(new_node, parent_node=target)
 
             print(f"Import complete: '{new_node.label}' is now in the tree.")
             print("Drag it to re-parent, then use Position to place it.")
@@ -904,6 +903,64 @@ class MainWindow(QWidget):
     def _on_positioning_done(self):
         """Positioning dialog closed -- hide it."""
         self._position_dialog.hide()
+
+    def _on_active_assembly_changed(self, node):
+        """Active assembly was changed via RMB menu -- update status bar hint."""
+        if node is not None:
+            print(f"Active assembly: '{node.label}' "
+                  f"-- new parts/imports will land here.")
+        else:
+            print("Active assembly cleared -- new parts/imports go to root.")
+
+    def _on_node_delete_requested(self, node):
+        """
+        Delete a node: erase its geometry from the viewport, remove it
+        from the assembly data structure, then remove its row from the tree.
+        Handles both leaf parts (have AIS_Shapes) and assembly containers
+        (whose leaves must each be erased individually).
+        """
+        if self._assembly is None:
+            return
+
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+        from step_assembly_poc import remove_node
+
+        # Erase all leaf AIS_Shapes under this node from the viewport
+        leaves = [node] if not node.children else \
+            [n for n in node.descendants if not n.children]
+        for leaf in leaves:
+            ais = self.viewport._node_id_to_ais_shape.get(id(leaf))
+            if ais is not None:
+                self.viewport.context.Erase(ais, False)
+                self.viewport._ais_shapes = [
+                    s for s in self.viewport._ais_shapes if s is not ais
+                ]
+                self.viewport._ais_shape_to_node.pop(id(ais), None)
+                self.viewport._node_id_to_ais_shape.pop(id(leaf), None)
+
+        self.viewport.context.UpdateCurrentViewer()
+        self.viewport.update()
+
+        # Remove from assembly data structure
+        removed = remove_node(node)
+        if not removed:
+            print(f"WARNING: remove_node('{node.label}') returned False -- "
+                  f"may already be detached.")
+
+        # Remove from tree widget (also clears active if needed)
+        self.tree.remove_node_from_tree(node)
+        print(f"Deleted '{node.label}' from assembly.")
+
+    def _on_sub_assembly_created(self, new_assy, parent_node):
+        """
+        A new empty sub-assembly was created via the tree RMB menu.
+        Nothing to display in the viewport (it has no geometry yet),
+        but we log it for clarity.
+        """
+        print(f"Sub-assembly '{new_assy.label}' created under "
+              f"'{parent_node.label}'. Add parts to it via "
+              f"'Set Active Assembly' then Create Part or Import STEP.")
 
 
 def main():

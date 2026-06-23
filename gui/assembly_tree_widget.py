@@ -1,45 +1,24 @@
 """
 assembly_tree_widget.py
 
-The assembly tree widget, built and tested STANDALONE first -- no
-viewport, no picking, no 3D at all -- same "isolate one variable"
-discipline as every other piece of this project. Once this works
-correctly on its own (populates from a real STEP file, checkboxes
-toggle, drag-and-drop reparents intuitively), it gets wired into
-assembly_viewer.py as a dock alongside the 3D view.
+The assembly tree widget. Displays a build123d Compound assembly
+hierarchy with one row per node, checkboxes for show/hide, drag-and-
+drop reparenting, and a right-click context menu.
 
-WHAT THIS PROVES, ON ITS OWN:
-    1. The tree populates correctly from load_assembly()'s Compound
-       hierarchy (reusing the same tree-walk pattern as print_tree()
-       in step_assembly_poc.py -- no new traversal logic).
-    2. Each row has a checkbox for show/hide (not yet wired to
-       anything -- that wiring happens once this merges with the
-       viewport, since AIS_Shape display/erase needs a live OCCT
-       context that doesn't exist in this standalone test).
-    3. Drag-and-drop reparenting works the way Doug described:
-       "strictly a hierarchical thing, no relation to physical
-       position" -- dropping an item ONTO another makes it a child of
-       that item, full stop. No re-posing, no geometric side effects.
-       Qt's QTreeWidget does this by default with
-       setDragDropMode(InternalMove) -- confirmed via Qt's own docs/
-       forums: "By default, QTreeWidget reparents items whenever you
-       drag them: the dragged item becomes a child of the item on
-       which it was dropped." We are NOT fighting that default or
-       customizing it to do sibling-reordering instead -- the default
-       behavior IS the desired behavior here.
-    4. After a drop, the tree's NEW structure gets synced back into
-       the actual assembly data using remove_node()/add_node() --
-       the IDENTITY-based primitives (operate on the exact Python
-       object dragged, not a label match) -- so dragging one specific
-       "nut" out of six identically-labeled siblings moves exactly
-       that one, never a different occurrence that happens to share
-       its name. (An earlier version of this file used the label-
-       based remove_part()/add_part(), which is ambiguous on files
-       like as1-oc-214.stp that have multiple parts sharing a label --
-       fixed before this was exercised against that ambiguity in
-       practice.)
+CONTEXT MENU ACTIONS (RMB on any row):
+  - Set Active Assembly  -- makes this node the target for new parts/imports.
+                            Active node shown in bold with a ► prefix.
+  - New Sub-Assembly     -- adds an empty Compound child under this node.
+  - Delete               -- removes this node from the tree and assembly.
 
-Usage:
+ACTIVE ASSEMBLY CONCEPT:
+  main_app tracks _active_node. New parts (extrude) and imported STEP
+  files are added as children of _active_node. If no active node is
+  set, they go under the root assembly. The active node is shown bold
+  with a ► prefix in the tree. Setting a new active node clears the
+  previous one.
+
+Usage (standalone):
     uv run gui/assembly_tree_widget.py step/as1-oc-214.stp
 """
 
@@ -55,8 +34,12 @@ from PySide6.QtWidgets import (
     QTreeWidgetItemIterator,
     QAbstractItemView,
     QLabel,
+    QMenu,
+    QInputDialog,
+    QMessageBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont, QAction
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from step_assembly_poc import load_assembly, remove_node, add_node  # noqa: E402
@@ -65,42 +48,113 @@ from step_assembly_poc import load_assembly, remove_node, add_node  # noqa: E402
 class AssemblyTreeWidget(QTreeWidget):
     """
     Displays a build123d Compound assembly hierarchy, one row per
-    node (both sub-assemblies and leaf parts), with a checkbox per
-    row for show/hide and built-in drag-and-drop reparenting.
+    node (both sub-assemblies and leaf parts), with:
+      - Checkbox per row for show/hide
+      - Drag-and-drop reparenting
+      - RMB context menu: Set Active Assembly, New Sub-Assembly, Delete
     """
+
+    # Emitted when the user sets a new active assembly via RMB menu.
+    # Carries the node that was just made active (or None if cleared).
+    active_assembly_changed = Signal(object)
+
+    # Emitted when the user requests deletion of a node via RMB menu.
+    # main_app handles the viewport erase; tree widget handles tree removal.
+    node_delete_requested = Signal(object)  # the node to delete
+
+    # Emitted when the user creates a new sub-assembly via RMB menu.
+    # Carries (new_compound_node, parent_node).
+    sub_assembly_created = Signal(object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setHeaderLabels(["Part / Assembly"])
         self.setColumnCount(1)
 
-        # Drag-and-drop reparenting, Qt's default InternalMove
-        # behavior: dropping an item ONTO another makes it that
-        # item's child. This matches the design decision directly --
-        # purely hierarchical, no geometric side effects.
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
 
-        # Map from QTreeWidgetItem -> the build123d tree node it
-        # represents, so a drop event (which only knows about widget
-        # ROWS) can be translated into an actual remove_part()/
-        # add_part() pair on the REAL assembly data structure.
+        # RMB context menu
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+        # id(QTreeWidgetItem) -> build123d node
         self._item_to_node = {}
-        self._root_assembly = None  # set by load_assembly_into_tree()
+        self._root_assembly = None
+
+        # Currently active assembly node (None = root is implicit target)
+        self._active_node = None
+        self._active_item = None  # the QTreeWidgetItem shown in bold
+
+    # ------------------------------------------------------------------
+    # Public API: active assembly
+    # ------------------------------------------------------------------
+
+    @property
+    def active_node(self):
+        """The currently active assembly node, or None (= use root)."""
+        return self._active_node
+
+    def set_active_node(self, node, item=None):
+        """
+        Make `node` the active assembly. If `item` is provided, uses it
+        directly instead of searching -- avoids stale id() lookup issues
+        when the item was just created.
+        Pass None to clear the active assembly.
+        """
+        # Clear previous
+        if self._active_item is not None:
+            self._set_item_active_style(self._active_item, False)
+            self._active_item = None
+        self._active_node = node
+
+        if node is not None:
+            if item is None:
+                # Search for the item by node identity
+                for item_id, n in self._item_to_node.items():
+                    if n is node:
+                        item = self._find_item_by_id(item_id)
+                        break
+            if item is not None:
+                self._set_item_active_style(item, True)
+                self._active_item = item
+
+        self.active_assembly_changed.emit(node)
+
+    def _set_item_active_style(self, item, active: bool):
+        """Bold + ► prefix when active; restore normal when cleared."""
+        # Capture the current label FIRST before any signal or style
+        # change can interfere. Strip any existing ► prefix so
+        # re-activating the same item doesn't accumulate arrows.
+        current_text = item.text(0)
+        base_label = current_text[2:] if current_text.startswith("► ") \
+            else current_text
+
+        font = item.font(0)
+        font.setBold(active)
+        item.setFont(0, font)
+        item.setText(0, f"► {base_label}" if active else base_label)
+
+    def get_target_node(self):
+        """
+        Return the node new parts/imports should be added under.
+        Returns _active_node if set, otherwise the root assembly.
+        """
+        return self._active_node if self._active_node is not None \
+            else self._root_assembly
+
+    # ------------------------------------------------------------------
+    # Tree population
+    # ------------------------------------------------------------------
 
     def load_assembly_into_tree(self, assembly):
-        """
-        Populate the tree from a build123d Compound assembly (the
-        SAME object load_assembly() returns -- no new parsing, no new
-        traversal logic, just a new consumer of the existing tree
-        structure that's already been validated extensively against
-        real STEP files in step_assembly_poc.py and assembly_viewer.py).
-        """
         self.clear()
         self._item_to_node.clear()
+        self._active_node = None
+        self._active_item = None
         self._root_assembly = assembly
 
         root_item = self._make_item(assembly)
@@ -129,22 +183,16 @@ class AssemblyTreeWidget(QTreeWidget):
 
     def add_node_to_tree(self, new_node, parent_node=None):
         """
-        Add a newly-imported node (and its full subtree) to the tree,
-        as a child of parent_node. If parent_node is None, adds to the
-        root assembly's top-level item.
-
-        Used by the Import STEP workflow: load a new STEP file, add
-        its root as a child of the existing top-level assembly, then
-        call this to reflect that in the tree widget.
+        Add a node (and its subtree) to the tree widget under parent_node.
+        If parent_node is None, adds under the root item.
+        Returns the new QTreeWidgetItem.
         """
-        # Find the parent tree item
         if parent_node is None:
             parent_item = self.topLevelItem(0)
         else:
             parent_item = None
             for item_id, node in self._item_to_node.items():
                 if node is parent_node:
-                    # Find the actual QTreeWidgetItem with this id
                     parent_item = self._find_item_by_id(item_id)
                     break
             if parent_item is None:
@@ -157,8 +205,37 @@ class AssemblyTreeWidget(QTreeWidget):
         new_item.setExpanded(True)
         return new_item
 
+    def remove_node_from_tree(self, node):
+        """
+        Remove a node's row from the tree widget (does NOT touch the
+        assembly data structure -- caller must call remove_node() first).
+        Also clears active status if the removed node was active.
+        """
+        if node is self._active_node:
+            self.set_active_node(None)
+
+        for item_id, n in list(self._item_to_node.items()):
+            if n is node:
+                item = self._find_item_by_id(item_id)
+                if item is not None:
+                    parent = item.parent()
+                    if parent is not None:
+                        parent.removeChild(item)
+                    else:
+                        idx = self.indexOfTopLevelItem(item)
+                        if idx >= 0:
+                            self.takeTopLevelItem(idx)
+                    # Clean up all descendants from _item_to_node
+                    self._remove_item_from_map(item)
+                break
+
+    def _remove_item_from_map(self, item):
+        """Recursively remove item and all its children from _item_to_node."""
+        self._item_to_node.pop(id(item), None)
+        for i in range(item.childCount()):
+            self._remove_item_from_map(item.child(i))
+
     def _find_item_by_id(self, item_id):
-        """Find a QTreeWidgetItem by its Python id (used in _item_to_node)."""
         iterator = QTreeWidgetItemIterator(self)
         while iterator.value():
             item = iterator.value()
@@ -166,55 +243,139 @@ class AssemblyTreeWidget(QTreeWidget):
                 return item
             iterator += 1
         return None
-        """
-        Let Qt perform its default InternalMove reparenting on the
-        WIDGET rows first, then sync that change back into the REAL
-        assembly data structure using remove_node()/add_node() -- the
-        IDENTITY-based primitives, which operate on the exact node
-        object dragged rather than matching by label. This matters
-        concretely on files like as1-oc-214.stp, which has 6 parts
-        named "nut" and 3 named "bolt": label-based matching would
-        risk moving the WRONG occurrence (the first one found,
-        depth-first) even when the tree widget visually shows the
-        correct one being dragged. Identity-based matching has no
-        such ambiguity -- it always acts on the literal node you
-        dragged, never a same-named sibling.
-        """
-        # Identify what's being dragged and where, BEFORE Qt's
-        # default handling moves the widget rows around -- we need
-        # the pre-drop state to know the dragged node's CURRENT
-        # parent in our own node map.
+
+    # ------------------------------------------------------------------
+    # RMB context menu
+    # ------------------------------------------------------------------
+
+    def _show_context_menu(self, pos):
+        item = self.itemAt(pos)
+        if item is None:
+            return
+        node = self._item_to_node.get(id(item))
+        if node is None:
+            return
+
+        # Determine if this node is an assembly (has children or is root)
+        # vs a leaf part. Leaf parts get a restricted menu.
+        from build123d import Compound
+        is_assembly = isinstance(node, Compound)
+        is_root = (node is self._root_assembly)
+
+        menu = QMenu(self)
+
+        if is_assembly:
+            # Set Active Assembly
+            act_set_active = QAction("► Set Active Assembly", self)
+            act_set_active.triggered.connect(
+                lambda: self._on_set_active(node, item))
+            menu.addAction(act_set_active)
+
+            # Clear active -- only when this node is currently active
+            if node is self._active_node:
+                act_clear = QAction("✕ Clear Active", self)
+                act_clear.triggered.connect(lambda: self.set_active_node(None))
+                menu.addAction(act_clear)
+
+            menu.addSeparator()
+
+            # New Sub-Assembly
+            act_new_assy = QAction("📁 New Sub-Assembly...", self)
+            act_new_assy.triggered.connect(
+                lambda: self._on_new_sub_assembly(node, item))
+            menu.addAction(act_new_assy)
+
+            menu.addSeparator()
+
+        # Delete -- not available on root
+        act_delete = QAction("🗑 Delete", self)
+        act_delete.setEnabled(not is_root)
+        act_delete.triggered.connect(lambda: self._on_delete(node))
+        menu.addAction(act_delete)
+
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+    def _on_set_active(self, node, item):
+        self.set_active_node(node, item=item)
+        print(f"Active assembly set to: {node.label!r}")
+
+    def _on_new_sub_assembly(self, parent_node, parent_item):
+        """Create a new empty Compound sub-assembly under parent_node."""
+        from build123d import Compound
+        from OCP.TopoDS import TopoDS_Compound
+        from OCP.BRep import BRep_Builder
+
+        name, ok = QInputDialog.getText(
+            self, "New Sub-Assembly", "Assembly name:", text="assembly"
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # build123d requires every Compound to have a valid OCC shape.
+        # An empty TopoDS_Compound (built via BRep_Builder) is the
+        # smallest valid shell -- no geometry, but _wrapped is not None.
+        builder = BRep_Builder()
+        occ_compound = TopoDS_Compound()
+        builder.MakeCompound(occ_compound)
+
+        new_assy = Compound(label=name)
+        new_assy._wrapped = occ_compound
+        new_assy.label = name  # set explicitly -- Compound() may not store it
+
+        add_node(new_assy, parent_node)
+
+        new_item = self._make_item(new_assy)
+        parent_item.addChild(new_item)
+        parent_item.setExpanded(True)
+
+        print(f"Created sub-assembly '{name}' under '{parent_node.label}'")
+        self.sub_assembly_created.emit(new_assy, parent_node)
+
+    def _on_delete(self, node):
+        """Delete a node from tree + assembly data after confirmation."""
+        name = node.label or "<unnamed>"
+        n_desc = len(list(node.descendants)) if node.children else 0
+        msg = f"Delete '{name}'"
+        if n_desc:
+            msg += f" and its {n_desc} descendant(s)"
+        msg += "?\n\nThis cannot be undone."
+
+        reply = QMessageBox.question(
+            self, "Confirm Delete", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Signal main_app to erase from viewport first
+        self.node_delete_requested.emit(node)
+
+    # ------------------------------------------------------------------
+    # Drag-and-drop reparenting
+    # ------------------------------------------------------------------
+
+    def dropEvent(self, event):
         dragged_item = self.currentItem()
         dragged_node = self._item_to_node.get(id(dragged_item)) if dragged_item else None
-
         target_item = self.itemAt(event.position().toPoint())
         target_node = self._item_to_node.get(id(target_item)) if target_item else None
 
-        super().dropEvent(event)  # let Qt move the widget rows
+        super().dropEvent(event)
 
         if dragged_node is None or target_node is None or dragged_node is target_node:
-            return  # nothing meaningful to sync (e.g. dropped on empty space)
-
+            return
         if dragged_node is self._root_assembly:
             print("Refusing to reparent the assembly root itself.")
             return
 
-        # Sync the REAL data: remove the dragged node from its old
-        # parent, add it under the new one -- by OBJECT IDENTITY, not
-        # label, so this is correct even when dragged_node shares its
-        # label with other siblings elsewhere in the tree.
         removed = remove_node(dragged_node)
         if not removed:
-            print(f"WARNING: could not remove {dragged_node.label!r} "
-                  f"(path-unknown) from its old parent -- it may already "
-                  f"be detached, or have no parent (e.g. it's the tree "
-                  f"root). Tree widget and assembly data may now be out "
-                  f"of sync.")
+            print(f"WARNING: could not remove {dragged_node.label!r} from its parent.")
             return
 
         add_node(dragged_node, target_node)
-        print(f"Reparented {dragged_node.label!r} under {target_node.label!r} "
-              f"(by object identity -- unambiguous even with repeated labels).")
+        print(f"Reparented '{dragged_node.label}' under '{target_node.label}'")
 
 
 def main():
@@ -223,31 +384,18 @@ def main():
         sys.exit(1)
 
     step_path = sys.argv[1]
-
     app = QApplication(sys.argv)
-
     window = QWidget()
     window.setWindowTitle(f"Assembly tree -- {step_path}")
     window.resize(400, 600)
-
     layout = QVBoxLayout(window)
-
-    hint = QLabel(
-        "Drag a part/assembly onto another row to reparent it.\n"
-        "Checkboxes are NOT wired to anything yet (standalone test --\n"
-        "show/hide requires the live viewport, added in a later step)."
-    )
+    hint = QLabel("RMB on any row for context menu.")
     hint.setWordWrap(True)
     layout.addWidget(hint)
-
     tree = AssemblyTreeWidget(window)
     layout.addWidget(tree)
-
-    print(f"Loading {step_path} ...")
     assembly = load_assembly(step_path)
     tree.load_assembly_into_tree(assembly)
-    print("Loaded. Try dragging rows to reparent them.")
-
     window.show()
     sys.exit(app.exec())
 

@@ -51,8 +51,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from workplane import WorkPlane  # noqa: E402
 
 
-# Semi-transparent blue for the workplane border display
-_WP_COLOR = Quantity_Color(0.3, 0.5, 0.9, Quantity_TypeOfColor.Quantity_TOC_RGB)
+# CoCreate-inspired green for the workplane border display
+_WP_COLOR = Quantity_Color(0.3, 0.75, 0.4, Quantity_TypeOfColor.Quantity_TOC_RGB)
+# Magenta/pink for the U/V construction line crosshairs (CoCreate uses pink)
+_WP_AXIS_COLOR = Quantity_Color(0.85, 0.2, 0.55, Quantity_TypeOfColor.Quantity_TOC_RGB)
 # Solid steel-blue for new parts
 _PART_COLOR = Quantity_Color(0.25, 0.45, 0.75, Quantity_TypeOfColor.Quantity_TOC_RGB)
 
@@ -242,36 +244,76 @@ class WorkplaneDialog(QDockWidget):
     # ------------------------------------------------------------------
 
     def _display_workplane(self):
-        """Show the workplane border as a semi-transparent blue face."""
+        """
+        Show the workplane as:
+          1. A semi-transparent green border face (CoCreate style).
+          2. Two pink/magenta crosshair lines along the U and V axes
+             through the workplane origin -- the construction lines
+             CoCreate draws in pink to show the U/V coordinate system.
+        """
         if self._viewport is None or self._workplane is None:
             return
 
-        # Remove old workplane display if re-picking
         self._erase_workplane()
 
         border = self._workplane.border
         if border is None:
             return
 
-        ais = AIS_Shape(border)
-        ais.SetColor(_WP_COLOR)
-        ais.SetDisplayMode(AIS_DisplayMode.AIS_Shaded)
-        # Make it translucent (0=opaque, 1=fully transparent)
-        ais.SetTransparency(0.6)
-
         ctx = self._viewport.context
-        ctx.Display(ais, True)
-        # Don't make the workplane itself selectable
-        ctx.Deactivate(ais)
+
+        # --- Border face ---
+        ais_border = AIS_Shape(border)
+        ais_border.SetColor(_WP_COLOR)
+        ais_border.SetDisplayMode(AIS_DisplayMode.AIS_Shaded)
+        ais_border.SetTransparency(0.5)
+        ctx.Display(ais_border, False)
+        ctx.Deactivate(ais_border)
+
+        # --- U/V crosshair lines ---
+        # Build two line segments along U and V axes, length = wp size
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.GC import GC_MakeSegment
+        from OCP.gp import gp_Pnt
+        from OCP.Prs3d import Prs3d_LineAspect
+        from OCP.Aspect import Aspect_TOL_SOLID
+
+        size = self._workplane.size
+        wp = self._workplane
+
+        def make_axis_line(p1_2d, p2_2d):
+            """Make an AIS_Shape edge along the workplane U or V axis."""
+            p1 = gp_Pnt(p1_2d[0], p1_2d[1], 0).Transformed(wp.Trsf)
+            p2 = gp_Pnt(p2_2d[0], p2_2d[1], 0).Transformed(wp.Trsf)
+            edge = BRepBuilderAPI_MakeEdge(
+                GC_MakeSegment(p1, p2).Value()
+            ).Edge()
+            ais = AIS_Shape(edge)
+            ais.SetColor(_WP_AXIS_COLOR)
+            ais.SetWidth(1.5)
+            return ais
+
+        ais_u = make_axis_line((-size, 0), (size, 0))   # U axis (horizontal)
+        ais_v = make_axis_line((0, -size), (0, size))   # V axis (vertical)
+
+        for ais_line in (ais_u, ais_v):
+            ctx.Display(ais_line, False)
+            ctx.Deactivate(ais_line)
+
         ctx.UpdateCurrentViewer()
         self._viewport.update()
 
-        self._wp_ais = ais
+        # Store all three AIS objects so _erase_workplane can clean them up
+        self._wp_ais = [ais_border, ais_u, ais_v]
 
     def _erase_workplane(self):
-        """Remove the displayed workplane border from the viewport."""
+        """Remove the workplane display (border + crosshairs) from the viewport."""
         if self._wp_ais is not None and self._viewport is not None:
-            self._viewport.context.Erase(self._wp_ais, True)
+            ais_list = self._wp_ais if isinstance(self._wp_ais, list) \
+                else [self._wp_ais]
+            for ais in ais_list:
+                self._viewport.context.Erase(ais, False)
+            self._viewport.context.UpdateCurrentViewer()
             self._viewport.update()
             self._wp_ais = None
 
@@ -324,9 +366,9 @@ class WorkplaneDialog(QDockWidget):
     def _extrude(self, width, height, depth, name):
         """
         Add a rectangle to the workplane, make a wire, extrude it, and
-        return a build123d Compound node ready to join the assembly tree.
+        return a build123d Solid node ready to join the assembly tree.
         """
-        from build123d import Compound, Solid
+        from build123d import Solid
 
         wp = self._workplane
 
@@ -352,12 +394,13 @@ class WorkplaneDialog(QDockWidget):
         extrude_vec = gp_Vec(wp.wDir) * depth
         solid_shape = BRepPrimAPI_MakePrism(face_bldr.Shape(), extrude_vec).Shape()
 
-        # Wrap in a build123d Solid, then a Compound — same type the
-        # assembly tree expects (plain anytree.Node is rejected).
+        # Return the Solid directly -- no need to wrap in a Compound.
+        # A Solid IS a Shape (satisfies build123d's _pre_attach_children
+        # validator) and shows up as a single leaf in the tree, which
+        # is the right representation for a simple extruded part.
         b3d_solid = Solid(solid_shape)
-        new_node = Compound(label=name, children=[b3d_solid])
-
-        return new_node
+        b3d_solid.label = name
+        return b3d_solid
 
     # ------------------------------------------------------------------
     # Cancel / close
