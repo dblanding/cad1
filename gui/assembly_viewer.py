@@ -389,38 +389,6 @@ class OcctViewportWidget(QWidget):
             self._press_pos = event.position()
             self._drag_distance = 0.0
             x, y = int(event.position().x()), int(event.position().y())
-            # Check if the view cube is under the cursor -- if so,
-            # let it handle the click for camera animation.
-            if self._view_cube is not None:
-                self.context.MoveTo(x, y, self.view, True)
-                try:
-                    detected = self.context.DetectedInteractive()
-                    if detected is not None and detected == self._view_cube:
-                        owner = self.context.DetectedOwner()
-                        if owner is not None:
-                            # Use HandleViewCubeClick instead of
-                            # StartAnimation/animation loop, which was
-                            # causing crashes. Directly set the view
-                            # orientation from the owner's orientation.
-                            try:
-                                from OCP.AIS import AIS_ViewCubeOwner
-                                vc_owner = AIS_ViewCubeOwner.DownCast(owner)
-                                if not vc_owner.IsNull():
-                                    orientation = vc_owner.MainOrientation()
-                                    self.view.SetProj(orientation)
-                                    self.view.FitAll()
-                                    self.view.ZFitAll()
-                                    self._press_pos = None
-                                    self._drag_distance = 0.0
-                                    self.update()
-                                    return
-                            except Exception:
-                                # Fall back to animation if direct set fails
-                                self._view_cube.StartAnimation(owner)
-                                self._animate_view_cube()
-                                return
-                except Exception:
-                    pass
             try:
                 self.view.StartRotation(x, y)
             except Exception as e:
@@ -474,6 +442,33 @@ class OcctViewportWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
             if self._drag_distance < self._click_drag_threshold_px:
+                # It's a click -- check if it landed on the view cube.
+                # MoveTo in mouseMoveEvent already updated DetectedInteractive
+                # during hover, so we can read it here without calling
+                # MoveTo again (which would conflict with StartRotation state).
+                if self._view_cube is not None:
+                    try:
+                        detected = self.context.DetectedInteractive()
+                        if detected is not None and detected == self._view_cube:
+                            owner = self.context.DetectedOwner()
+                            if owner is not None:
+                                try:
+                                    from OCP.AIS import AIS_ViewCubeOwner
+                                    vc_owner = AIS_ViewCubeOwner.DownCast(owner)
+                                    if not vc_owner.IsNull():
+                                        orientation = vc_owner.MainOrientation()
+                                        self.view.SetProj(orientation)
+                                        self.view.FitAll()
+                                        self.view.ZFitAll()
+                                        self._press_pos = None
+                                        self._drag_distance = 0.0
+                                        self.update()
+                                        return
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                # Normal click -- select whatever is highlighted.
                 self.context.Select(True)
                 self._report_selection()
             self._press_pos = None
