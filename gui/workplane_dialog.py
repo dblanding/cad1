@@ -164,6 +164,12 @@ class WorkplaneDialog(QDockWidget):
         self._cut_btn.clicked.connect(self._on_cut_clicked)
         s3_layout.addWidget(self._cut_btn)
 
+        self._pull_btn = QPushButton("⊕  Add To Active Part")
+        self._pull_btn.setEnabled(False)
+        self._pull_btn.setToolTip("Extrude profile in +wDir and fuse onto active part (Pull/Boss)")
+        self._pull_btn.clicked.connect(self._on_pull_clicked)
+        s3_layout.addWidget(self._pull_btn)
+
         layout.addWidget(step3)
 
         layout.addStretch()
@@ -180,8 +186,10 @@ class WorkplaneDialog(QDockWidget):
         self._sketch_toolbar.setEnabled(enabled)
         for w in [self._depth_edit, self._name_edit, self._create_btn]:
             w.setEnabled(enabled)
-        # Cut button only enabled if there's also an active part
-        self._cut_btn.setEnabled(enabled and self._active_part is not None)
+        # Cut and Pull buttons only enabled if there's also an active part
+        has_part = self._active_part is not None
+        self._cut_btn.setEnabled(enabled and has_part)
+        self._pull_btn.setEnabled(enabled and has_part)
 
     def set_active_part(self, node):
         """Called by main_app when the active part changes."""
@@ -196,6 +204,7 @@ class WorkplaneDialog(QDockWidget):
         # Update cut button state
         has_wp = self._workplane is not None
         self._cut_btn.setEnabled(has_wp and node is not None)
+        self._pull_btn.setEnabled(has_wp and node is not None)
 
     # ------------------------------------------------------------------
     # Pick mode
@@ -496,6 +505,7 @@ class WorkplaneDialog(QDockWidget):
         self._set_sketch_enabled(False)
         self._create_btn.setEnabled(False)
         self._cut_btn.setEnabled(False)
+        self._pull_btn.setEnabled(False)
         self._pick_status.setText("Cut complete!  Pick another face to continue.")
         self._pick_btn.setText("Click face in viewport…")
 
@@ -541,6 +551,87 @@ class WorkplaneDialog(QDockWidget):
         result = BRepAlgoAPI_Cut(work_shape, tool)
         if not result.IsDone():
             raise RuntimeError("BRepAlgoAPI_Cut failed.")
+
+        return result.Shape()
+
+    def _on_pull_clicked(self):
+        """Fuse the sketched profile onto the active part (Pull/Boss)."""
+        if self._workplane is None:
+            QMessageBox.warning(self, "No workplane", "Please pick a face first.")
+            return
+        if self._active_part is None:
+            QMessageBox.warning(self, "No active part",
+                                "RMB on a part in the tree and choose "
+                                "'⚙ Set Active Part' first.")
+            return
+
+        try:
+            d = float(self._depth_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid input", "Depth must be a number.")
+            return
+
+        if d <= 0:
+            QMessageBox.warning(self, "Invalid input", "Depth must be positive.")
+            return
+
+        try:
+            new_shape = self._pull(d)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Pull failed", f"Could not add material:\n{e}")
+            return
+
+        # Clean up sketch and workplane display
+        self._sketch_toolbar.deactivate()
+        self._erase_workplane()
+        self._workplane = None
+        self._set_sketch_enabled(False)
+        self._create_btn.setEnabled(False)
+        self._cut_btn.setEnabled(False)
+        self._pull_btn.setEnabled(False)
+        self._pick_status.setText("Pull complete!  Pick another face to continue.")
+        self._pick_btn.setText("Click face in viewport…")
+
+        # Reuse part_cut signal -- same replace-in-place pattern
+        self.part_cut.emit(self._active_part, new_shape)
+
+    def _pull(self, depth):
+        """
+        Extrude the sketch profile in +wDir and fuse it onto the active
+        part using BRepAlgoAPI_Fuse (add material / Pull / Boss).
+        Returns the new TopoDS_Shape.
+        """
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+        from OCP.gp import gp_Vec
+
+        wp = self._workplane
+
+        if not wp.edgeList:
+            raise RuntimeError(
+                "No sketch profile found.\n\n"
+                "Use the sketch toolbar to draw the profile to add."
+            )
+
+        if not wp.makeWire():
+            raise RuntimeError("makeWire() failed -- profile may not be closed.")
+
+        face_bldr = BRepBuilderAPI_MakeFace(wp.wire)
+        if not face_bldr.IsDone():
+            raise RuntimeError("MakeFace failed.")
+
+        # Pull tool goes in +wDir (out of the face, adding material)
+        pull_vec = gp_Vec(wp.wDir) * depth
+        tool = BRepPrimAPI_MakePrism(face_bldr.Shape(), pull_vec).Shape()
+
+        work_shape = self._active_part.wrapped
+
+        result = BRepAlgoAPI_Fuse(work_shape, tool)
+        if not result.IsDone():
+            raise RuntimeError("BRepAlgoAPI_Fuse failed.")
 
         return result.Shape()
         """

@@ -1090,3 +1090,95 @@ feature that picks sub-shapes and then passes them to OCCT modelers.**
 - `gui/main_app.py` -- Fillet button, dialog instantiation, edge
   routing in `_on_geometry_picked`, `_on_fillet_clicked`,
   `_on_fillet_done`, fillet dialog sync in `_on_active_part_changed`
+
+---
+
+## 14. Pull / Boss Operation (Add Material to Active Part)
+
+**Status: COMPLETE.**
+
+**What was built:**
+- "⊕ Add To Active Part" button added to workplane dialog Step 3,
+  alongside the existing "✂ Cut Into Active Part" button.
+- `_on_pull_clicked()` and `_pull()` methods in `workplane_dialog.py`.
+- Uses `BRepAlgoAPI_Fuse(work_shape, tool)` where tool is the profile
+  extruded in **+wDir** (out of the face, adding material).
+- Reuses the `part_cut` signal for the replace-in-place redisplay --
+  the pattern is identical to Cut/Mill.
+
+**Difference from Cut/Mill:**
+- Cut: extrudes in `-wDir`, uses `BRepAlgoAPI_Cut`
+- Pull: extrudes in `+wDir`, uses `BRepAlgoAPI_Fuse`
+- Create Part: extrudes in `+wDir`, adds a NEW node to the assembly
+
+**Used in bottle tutorial:** to add the cylindrical neck (circle profile
+r=7.5, depth=7mm) to the top face of the filleted bottle body.
+
+---
+
+## 15. Shell Operation (Hollow Out Active Part)
+
+**Status: COMPLETE.**
+
+**What was built:**
+- `gui/shell_dialog.py` -- floating QDockWidget: select open face(s) →
+  enter wall thickness → apply shell.
+- "⬡ Shell..." button added to tree panel.
+- `BRepOffsetAPI_MakeThickSolid.MakeThickSolidByJoin()` with negative
+  thickness (shells inward).
+- Same face-center-of-mass matching approach as fillet's midpoint
+  matching -- required because STEP round-trip creates new C++ TopoDS
+  objects (see item 13, Bug 2).
+- Same replace-in-place redisplay pattern as Cut/Mill and Fillet.
+
+**OCP API note:** the old pythonOCC API called
+`BRepOffsetAPI_MakeThickSolid(shape, faces, thickness, tolerance)`
+as a constructor. In OCP the constructor takes no arguments; instead
+call `mk.MakeThickSolidByJoin(shape, faces, -thickness, 1e-3)` then
+`mk.Build()`.
+
+**Used in bottle tutorial:** to hollow out the completed bottle body
+(after fillet and neck pull) with 1mm wall thickness, open at the top
+circular face.
+
+---
+
+## 16. Milestone: OCC Bottle Tutorial Completed
+
+**Date: June 24, 2026.**
+
+The classic OpenCASCADE "bottle" tutorial has been completed entirely
+within our DIY CAD application and exported to STEP, verified in
+CAD Assistant. This validates the full modeling workflow.
+
+**Operations used in order:**
+1. Load base assembly (as1-oc-214.stp)
+2. New sub-assembly under as1 → set active
+3. ⊞ Workplane on top face of plate
+4. 6 horizontal clines (Y = 30, 15, 7.5, -7.5, -15, -30)
+5. 2 straight profile lines (clicking + snap points)
+6. 2 arc profile segments (clicking + snap points, 3-point arc)
+7. ✚ Create Part (depth=70, name="bottle") → bottle body extruded
+8. ⌀ Fillet all 12 edges (r=3mm) → blended body
+9. ⊕ Add To Active Part: circle (r=7.5) on top face, depth=7 → neck added
+10. ⬡ Shell: select top face, thickness=1mm → bottle hollowed out
+11. 💾 Export STEP → verified in CAD Assistant
+
+**Operations implemented to support the tutorial:**
+- Workplane + sketch toolbar (items 6, 11)
+- Intersection point snap queue (item 11)
+- Extrude new part (item 6)
+- Cut/Mill (item 6)
+- Pull/Boss / Add to Active Part (item 14)
+- Fillet/Blend (item 13)
+- Shell (item 15)
+- STEP export with freshly created parts (item 10)
+
+**What the bottle tutorial does NOT test (future work):**
+- Undo/redo
+- Workplane at global origin (no face pick required)
+- Persistent workplane as tree node
+- Revolve operation
+- Chamfer (similar to fillet but with distance instead of radius)
+- Part positioning / Mate-Align on newly created parts
+- Saving session state (currently relying on STEP as "poor man's save")
