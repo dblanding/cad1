@@ -701,13 +701,22 @@ class MainWindow(QWidget):
 
     def _on_geometry_picked(self, raw_shape, shape_type):
         """
-        Route a viewport pick to whichever dialog is currently active.
-        The workplane dialog takes priority when in face-pick mode;
-        otherwise the position dialog gets the pick.
+        Route a viewport pick to whichever dialog/toolbar is active.
+        Priority:
+          1. Workplane dialog face-pick mode
+          2. Sketch toolbar vertex pick (intersection point snap)
+          3. Position dialog positioning mode
         """
+        from OCP.TopAbs import TopAbs_VERTEX
+
         if self._workplane_dialog.isVisible() and \
                 self._workplane_dialog.is_in_pick_mode():
             self._workplane_dialog.receive_pick(raw_shape, shape_type)
+        elif (self._workplane_dialog.isVisible() and
+              shape_type == TopAbs_VERTEX):
+            toolbar = self._workplane_dialog._sketch_toolbar
+            if toolbar.isEnabled():
+                toolbar.receive_vertex_pick(raw_shape)
         elif self._position_dialog.isVisible() and \
                 self._position_dialog.is_in_positioning_mode():
             self._position_dialog.receive_pick(raw_shape, shape_type)

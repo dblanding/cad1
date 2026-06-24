@@ -894,3 +894,95 @@ appear correctly in the exported STEP file, verified in CAD Assistant.
   remains a one-line fix for the spurious root parent bug.
 - `gui/workplane_dialog.py` -- restored `_extrude()` method (was
   accidentally dropped during Cut/Mill refactor).
+
+---
+
+## 11. Intersection Point Snap for Sketch Tools
+
+**Status: COMPLETE.** Confirmed working for the bottle tutorial workflow.
+
+**What was built:**
+- After each cline or ccirc is added to the workplane, `_display_intersections()`
+  computes all intersection points via `wp.intersectPts()` and displays
+  yellow `+` markers as `AIS_Shape` vertex objects in the viewport.
+- Markers are activated for OCCT vertex selection so they show a cyan
+  hover highlight when the cursor passes over them.
+- Clicking a marker fires `geometry_picked` with `TopAbs_VERTEX`, which
+  `main_app._on_geometry_picked` routes to
+  `sketch_toolbar.receive_vertex_pick()`.
+- `receive_vertex_pick` finds the nearest stored intersection point (within
+  1mm tolerance) and appends its `(u, v)` to `_pending_uvs` queue.
+- `_get_point()` in each tool method pops from `_pending_uvs` first; if
+  the queue is empty it falls back to `QInputDialog`.
+
+**The snap queue workflow (click points BEFORE clicking tool button):**
+- 1-point tools (circle center, cline through point):
+    click 1 marker → click tool button
+- 2-point tools (line, rect):
+    click start marker → click end marker → click tool button
+- 3-point tools (arc3p):
+    click pt1 → click pt2 → click pt3 → click tool button
+- Mixed: snap some points, type others -- any combination works.
+  Snapped points are consumed FIFO; unsnapped points show a dialog.
+
+**Crashes fixed during development:**
+- `ctx.Erase()` on vertex AIS causes segfault -- must use `ctx.Remove()`.
+- Must call `ctx.ClearSelected(False)` BEFORE `ctx.Remove()` on markers,
+  otherwise removing a "selected" AIS crashes OCCT.
+- Do NOT activate intersection markers while face-pick mode is active
+  (workplane creation step) -- only activate after the workplane is set.
+
+**Files changed:**
+- `gui/sketch_toolbar.py` -- `_display_intersections()`, `_erase_isect_ais()`,
+  `receive_vertex_pick()`, `pop_pending_uv()`, `_pending_uvs` queue.
+- `gui/main_app.py` -- `_on_geometry_picked()` routes `TopAbs_VERTEX` picks
+  to sketch toolbar when workplane dialog is visible and toolbar is enabled.
+
+---
+
+## 12. Confirmed Working Workflow: Bottle Tutorial (partial)
+
+The following workflow has been confirmed working end-to-end, verified
+by successfully extruding the classic OCC bottle body profile and
+exporting the result to STEP (verified in CAD Assistant):
+
+```
+1.  Load base STEP file (as1-oc-214.stp)
+2.  RMB on as1 → New Sub-Assembly (e.g. "assembly")
+3.  RMB on "assembly" → Set Active Assembly
+4.  Click "⊞ Workplane..." button
+5.  Click the top face of the plate → green workplane + pink crosshairs appear
+6.  Hide everything except the workplane (uncheck plate etc. in tree)
+7.  Add 6 horizontal clines: H cline at Y = 30, 15, 7.5, -7.5, -15, -30
+    → yellow + markers appear at all intersections with the V cline
+8.  For each straight line segment:
+        click start + marker → click end + marker → click Line tool
+9.  For each arc:
+        click pt1 + marker → click pt2 + marker → click pt3 + marker
+        → click Arc 3Pts tool
+10. Profile is now a closed loop
+11. Enter depth, name → click "✚ Create Part"
+    → workplane erased, new solid appears in tree and viewport
+12. Export STEP → new part included in exported file ✓
+```
+
+**Key UX notes from testing:**
+- All parts must be hidden (only workplane visible) before trying to
+  click intersection markers -- otherwise OCCT picks the part faces
+  instead of the vertex markers.
+- The snap workflow is click-THEN-tool (not tool-then-click). Queue up
+  all the points for a tool operation, then click the tool button.
+- The workplane always starts with H+V clines through the origin
+  (hvcl((0,0)) in WorkPlane.__init__), so a yellow + marker at (0,0)
+  appears as soon as the face is picked.
+
+**What's NOT yet implemented (next steps for bottle tutorial):**
+- **Fillet/Blend** -- `BRepFilletAPI_MakeFillet` on selected edges.
+  Required for the next step of the bottle tutorial (blending the 12
+  edges of the extruded body). This is the next major feature to add.
+- **Pull (Fuse)** -- `BRepAlgoAPI_Fuse` to add material (complement
+  to the existing Cut/Mill).
+- **Shell** -- `BRepOffsetAPI_MakeThickSolid` to hollow out a solid.
+- **"At Origin" workplane** -- workplane not tied to a face pick, just
+  placed at the global XY/XZ/YZ plane. Useful for starting from scratch
+  without any existing geometry to pick from.

@@ -96,6 +96,9 @@ class SketchToolBar(QToolBar):
         self._workplane = None   # WorkPlane instance
         self._viewport = None    # OcctViewportWidget (for AIS display)
         self._sketch_ais = []    # All AIS objects added during this sketch
+        self._isect_ais = []     # AIS objects for intersection point markers
+        self._isect_pts = {}     # id(AIS_Shape) -> (u, v) workplane coords
+        self._pending_uvs = []   # queue of snapped (u,v) points
 
         self._build_toolbar()
         self.setEnabled(False)   # disabled until a workplane is set
@@ -113,6 +116,8 @@ class SketchToolBar(QToolBar):
     def clear_sketch(self):
         """Erase all sketch AIS objects and reset the WorkPlane geometry."""
         self._erase_sketch_ais()
+        self._erase_isect_ais()
+        self._pending_uvs = []
         if self._workplane is not None:
             self._workplane.edgeList = []
             self._workplane.wire = None
@@ -120,9 +125,59 @@ class SketchToolBar(QToolBar):
     def deactivate(self):
         """Called when the workplane dialog is closed or reset."""
         self._erase_sketch_ais()
+        self._erase_isect_ais()
         self._workplane = None
         self._viewport = None
+        self._pending_uvs = []
         self.setEnabled(False)
+
+    def receive_vertex_pick(self, raw_shape):
+        """
+        Called by main_app when geometry_picked fires with TopAbs_VERTEX
+        while the sketch toolbar is active. Checks if the picked vertex
+        is one of the intersection markers and queues its (u,v) if so.
+        Returns True if consumed.
+        """
+        from OCP.BRep import BRep_Tool
+        from OCP.TopoDS import TopoDS
+        try:
+            vertex = TopoDS.Vertex_s(raw_shape)
+            pnt = BRep_Tool.Pnt_s(vertex)
+        except Exception:
+            return False
+
+        # Find the nearest stored intersection point in 3D
+        wp = self._workplane
+        if wp is None:
+            return False
+
+        best_uv = None
+        best_dist = 1.0  # mm tolerance
+
+        for uv in self._isect_pts.values():
+            from OCP.gp import gp_Pnt
+            p3d = gp_Pnt(uv[0], uv[1], 0).Transformed(wp.Trsf)
+            dist = pnt.Distance(p3d)
+            if dist < best_dist:
+                best_dist = dist
+                best_uv = uv
+
+        if best_uv is not None:
+            self._pending_uvs.append(best_uv)
+            print(f"[SketchToolBar] Snapped: U={best_uv[0]:.3f}, "
+                  f"V={best_uv[1]:.3f}  ({len(self._pending_uvs)} queued)")
+            return True
+        return False
+
+    def check_intersection_snap(self, screen_x, screen_y, view):
+        """Legacy screen-space snap -- not used when OCCT vertex picking works."""
+        return False
+
+    def pop_pending_uv(self):
+        """Pop the next snapped (u, v) from the queue, or None if empty."""
+        if self._pending_uvs:
+            return self._pending_uvs.pop(0)
+        return None
 
     # ------------------------------------------------------------------
     # Toolbar construction
@@ -158,7 +213,27 @@ class SketchToolBar(QToolBar):
         return val, ok
 
     def _get_point(self, title):
-        """Prompt for X, Y coordinates. Returns ((x, y), ok)."""
+        """
+        Get a 2D point for a sketch tool. Pops from the snap queue first;
+        falls back to QInputDialog if queue is empty.
+
+        SNAP WORKFLOW (click points BEFORE clicking the tool button):
+          - 1-point tools (circle center, cline):
+              click 1 marker → click tool button
+          - 2-point tools (line, rect):
+              click start marker → click end marker → click tool button
+          - 3-point tools (arc3p):
+              click pt1 → click pt2 → click pt3 → click tool button
+
+        Any mix works: snapped points are consumed in order; unsnapped
+        points fall through to the normal input dialog.
+        """
+        uv = self.pop_pending_uv()
+        if uv is not None:
+            print(f"[SketchToolBar] Using snapped point: "
+                  f"U={uv[0]:.3f}, V={uv[1]:.3f}")
+            return uv, True
+
         x, ok = QInputDialog.getDouble(self, title, "X:", 0.0, decimals=3)
         if not ok:
             return None, False
@@ -253,7 +328,14 @@ class SketchToolBar(QToolBar):
     # ------------------------------------------------------------------
 
     def _do_line(self):
-        """Profile line from (X1, Y1) to (X2, Y2)."""
+        """
+        Profile line from (X1, Y1) to (X2, Y2).
+        Snap workflow: click start + marker, click end + marker, then
+        click Line button. Or click Line button and type coordinates.
+        For sequential snapping of 2 points, the pending_uv holds the
+        LAST snapped point -- so snap end first if you want both snapped,
+        or use the dialog for whichever point isn't snapped.
+        """
         if not self._guard():
             return
         p1, ok = self._get_point("Line — start point")
@@ -396,6 +478,113 @@ class SketchToolBar(QToolBar):
 
         ctx.UpdateCurrentViewer()
         self._viewport.update()
+
+        # Recompute and display intersection point markers
+        self._display_intersections()
+
+    def _display_intersections(self):
+        """
+        Compute all intersection points, store them for snap picking,
+        and display them as yellow vertex markers using AIS.
+
+        The markers are displayed AND activated for OCCT selection so
+        they show a cyan hover highlight. Clicking them fires
+        geometry_picked with TopAbs_VERTEX, which main_app routes to
+        check_intersection_snap().
+        """
+        self._erase_isect_ais()
+        wp = self._workplane
+        if wp is None:
+            return
+
+        pts = wp.intersectPts()
+        if not pts:
+            return
+
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+        from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
+        from OCP.TopAbs import TopAbs_VERTEX
+
+        ctx = self._viewport.context
+        yellow = Quantity_Color(1.0, 1.0, 0.0,
+                                Quantity_TypeOfColor.Quantity_TOC_RGB)
+
+        for pnt in pts:
+            # Compute (u, v) by inverse-transforming back to workplane coords
+            inv_trsf = wp.Trsf.Inverted()
+            local_pnt = pnt.Transformed(inv_trsf)
+            uv = (local_pnt.X(), local_pnt.Y())
+
+            # Build a TopoDS_Vertex at the intersection 3D point
+            vertex_shape = BRepBuilderAPI_MakeVertex(pnt).Vertex()
+            ais = AIS_Shape(vertex_shape)
+            ais.SetColor(yellow)
+            ais.SetWidth(8.0)
+
+            ctx.Display(ais, False)
+            # Activate for vertex selection -- gives hover highlight and
+            # fires geometry_picked on click.
+            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_VERTEX))
+
+            self._isect_ais.append(ais)
+            self._isect_pts[id(ais)] = uv
+
+        ctx.UpdateCurrentViewer()
+        self._viewport.update()
+
+    def find_nearest_intersection_uv(self, screen_x, screen_y, view,
+                                     snap_radius_px=15):
+        """
+        Find the intersection point nearest to (screen_x, screen_y) within
+        snap_radius_px pixels. Returns (u, v) if found, None otherwise.
+        Uses screen-space projection rather than OCCT selection so it
+        doesn't interfere with the viewport's normal navigation.
+        """
+        if not self._isect_pts or self._workplane is None:
+            return None
+
+        from OCP.gp import gp_Pnt
+        best_uv = None
+        best_dist_sq = snap_radius_px ** 2
+
+        for pnt_uv in self._isect_pts.values():
+            pnt3d, uv = pnt_uv
+            # Project 3D point to screen coordinates
+            try:
+                sx, sy, sz = view.Project(pnt3d.X(), pnt3d.Y(), pnt3d.Z())
+                # view.Project returns normalized device coords [-1,1],
+                # need to convert to pixel coords
+                vx, vy, vw, vh = view.Window().Size() if hasattr(view.Window(), 'Size') else (0, 0, 800, 600)
+                # Use Convert instead
+                px, py = view.Convert(pnt3d.X(), pnt3d.Y(), pnt3d.Z())
+                dist_sq = (px - screen_x) ** 2 + (py - screen_y) ** 2
+                if dist_sq < best_dist_sq:
+                    best_dist_sq = dist_sq
+                    best_uv = uv
+            except Exception:
+                pass
+
+        return best_uv
+
+    def _erase_isect_ais(self):
+        """Remove all intersection point markers from the viewport context."""
+        if not self._isect_ais or self._viewport is None:
+            self._isect_ais = []
+            self._isect_pts = {}
+            return
+        ctx = self._viewport.context
+        # Use Remove() not Erase() -- fully deregisters from selection
+        # structures so the context doesn't crash when shapes are gone.
+        ctx.ClearSelected(False)
+        for ais in self._isect_ais:
+            try:
+                ctx.Remove(ais, False)
+            except Exception:
+                pass
+        ctx.UpdateCurrentViewer()
+        self._viewport.update()
+        self._isect_ais = []
+        self._isect_pts = {}
 
     def _display_profile(self, n_new=1):
         """
