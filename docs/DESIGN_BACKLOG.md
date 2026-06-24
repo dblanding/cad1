@@ -986,3 +986,107 @@ exporting the result to STEP (verified in CAD Assistant):
 - **"At Origin" workplane** -- workplane not tied to a face pick, just
   placed at the global XY/XZ/YZ plane. Useful for starting from scratch
   without any existing geometry to pick from.
+
+---
+
+## 13. Fillet / Blend Operation
+
+**Status: COMPLETE.** Confirmed working including STEP export, verified
+in CAD Assistant. Used to fillet all 12 edges of the bottle body (r=3mm).
+
+**What was built:**
+- `gui/fillet_dialog.py` -- floating QDockWidget with 3-step workflow:
+  1. Shows active part name (synced from `_on_active_part_changed`)
+  2. User clicks edges one by one -- each appears as "Edge N" in a list
+  3. User enters radius and clicks "⌀ Apply Fillet"
+- "⌀ Fillet..." button added to tree panel (enabled on file load)
+- `main_app._on_geometry_picked` routes `TopAbs_EDGE` picks to fillet
+  dialog when it's visible
+- `_on_fillet_done` reuses the exact same replace-and-redisplay pattern
+  as `_on_part_cut`: color preservation, `_rebuild_ancestors()`, orange
+  overlay re-applied via `_on_active_part_changed(node)`
+
+**Bugs found and fixed during development:**
+
+### Bug 1: Missing `_on_create_part_clicked` method (AttributeError on startup)
+
+When inserting `_on_fillet_clicked` and `_on_fillet_done` before
+`_on_create_part_clicked`, the str_replace ate the `def` line of
+`_on_create_part_clicked`, leaving its body as a bare docstring floating
+inside `_on_fillet_done`. Result: `AttributeError: 'MainWindow' object
+has no attribute '_on_create_part_clicked'` on startup.
+
+**Fix:** restore the `def _on_create_part_clicked(self):` line.
+**Lesson:** when using str_replace with a method name as the split point,
+always verify the target method still exists afterward with `grep -n`.
+
+### Bug 2: `IsSame()` fails on STEP round-tripped edges (no suitable edges)
+
+The fillet dialog originally validated picked edges with:
+```python
+explorer = TopExp_Explorer(active_part.wrapped, TopAbs_EDGE)
+while explorer.More():
+    if explorer.Current().IsSame(edge):   # always False after round-trip
+        found = True
+```
+And `_apply_fillet` passed the picked edges directly to `MakeFillet.Add()`.
+
+Both failed with the same root cause: **after a STEP export/import
+round-trip, the edge objects in `node.wrapped` are new C++ TopoDS objects,
+even though they represent geometrically identical topology.** OCCT's
+`IsSame()` checks C++ object identity (internal TShape pointer), not
+geometric equality. `MakeFillet.Add(r, edge)` also requires the edge to
+be the exact C++ object that exists inside the shape being filleted.
+
+**The symptom:** `IsSame()` always returned False → "That edge is not in
+the active part". After removing that check, `MakeFillet` still failed
+with "There are no suitable edges for chamfer or fillet."
+
+**The fix:** match picked edges to `node.wrapped` edges by **midpoint
+coordinates** rather than object identity:
+
+```python
+# Build midpoint lookup for all edges in node.wrapped
+shape_edges = []
+explorer = TopExp_Explorer(work_shape, TopAbs_EDGE)
+while explorer.More():
+    edge = TopoDS.Edge_s(explorer.Current())
+    curve = BRepAdaptor_Curve(edge)
+    mid_param = (curve.FirstParameter() + curve.LastParameter()) / 2.0
+    mid_pt = curve.Value(mid_param)
+    shape_edges.append((edge, mid_pt))
+    explorer.Next()
+
+# For each picked edge, find the nearest edge in shape_edges
+for picked_edge in self._edges:
+    curve = BRepAdaptor_Curve(picked_edge)
+    mid_param = (curve.FirstParameter() + curve.LastParameter()) / 2.0
+    picked_mid = curve.Value(mid_param)
+
+    best_edge = min(shape_edges,
+                    key=lambda e: picked_mid.Distance(e[1]),
+                    default=None)
+    if best_edge and picked_mid.Distance(best_edge[1]) < 1.0:  # mm
+        mk.Add(radius, best_edge[0])  # pass the WRAPPED edge
+```
+
+The edge midpoint is a reliable geometric fingerprint: two edges at
+the same midpoint location in 3D space represent the same edge
+regardless of which C++ TopoDS_Edge object they came from.
+
+**General lesson:** ANY OCCT operation that requires an edge/face/vertex
+to be "inside" a specific shape (MakeFillet, MakeChamfer, BRepAlgoAPI_Cut
+with specific sub-shapes, etc.) will fail if you pass objects from the
+AIS display or from a different import session. Always re-find the
+sub-shape by geometric fingerprint (midpoint, center, normal) rather
+than storing and reusing TopoDS pointers across STEP round-trips.
+
+**This is the same root cause as the IsSame failure in the fillet
+ownership check, and the same pattern that would affect any future
+feature that picks sub-shapes and then passes them to OCCT modelers.**
+
+**Files changed:**
+- `gui/fillet_dialog.py` -- new file
+- `gui/main_app.py` -- Fillet button, dialog instantiation, edge
+  routing in `_on_geometry_picked`, `_on_fillet_clicked`,
+  `_on_fillet_done`, fillet dialog sync in `_on_active_part_changed`

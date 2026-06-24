@@ -47,6 +47,7 @@ from assembly_viewer import OcctViewportWidget  # noqa: E402
 from assembly_tree_widget import AssemblyTreeWidget  # noqa: E402
 from position_dialog import PositionDialog  # noqa: E402
 from workplane_dialog import WorkplaneDialog  # noqa: E402
+from fillet_dialog import FilletDialog  # noqa: E402
 
 
 class SyncedViewportWidget(OcctViewportWidget):
@@ -500,6 +501,14 @@ class MainWindow(QWidget):
         self._create_part_btn.clicked.connect(self._on_create_part_clicked)
         tree_layout.addWidget(self._create_part_btn)
 
+        self._fillet_btn = QPushButton("⌀  Fillet...")
+        self._fillet_btn.setEnabled(False)
+        self._fillet_btn.setToolTip(
+            "Select edges on the active part and apply a fillet (blend)."
+        )
+        self._fillet_btn.clicked.connect(self._on_fillet_clicked)
+        tree_layout.addWidget(self._fillet_btn)
+
         # Import button -- loads a new STEP file and adds it to the
         # current assembly at the top level, ready to be re-parented
         # and positioned.
@@ -546,6 +555,10 @@ class MainWindow(QWidget):
         self._active_part_tree_item = None   # tree item with orange background
         self._active_part_overlay_ais = None  # wireframe overlay AIS
 
+        self._fillet_dialog = FilletDialog(self, viewport=self.viewport)
+        self._fillet_dialog.hide()
+        self._fillet_dialog.fillet_done.connect(self._on_fillet_done)
+
         # --- Wire the standard sync signals --------------------------
         self.viewport.part_selected.connect(self._on_part_selected_in_viewport)
         self.viewport.geometry_picked.connect(self._on_geometry_picked)
@@ -567,6 +580,7 @@ class MainWindow(QWidget):
         self._export_btn.setEnabled(True)
         self._import_btn.setEnabled(True)
         self._create_part_btn.setEnabled(True)
+        self._fillet_btn.setEnabled(True)
         print("Loaded into both tree and viewport.")
 
     def _on_part_selected_in_viewport(self, node_info):
@@ -717,9 +731,70 @@ class MainWindow(QWidget):
             toolbar = self._workplane_dialog._sketch_toolbar
             if toolbar.isEnabled():
                 toolbar.receive_vertex_pick(raw_shape)
+        elif (self._fillet_dialog.isVisible() and
+              shape_type == TopAbs_EDGE):
+            self._fillet_dialog.receive_edge_pick(raw_shape, shape_type)
         elif self._position_dialog.isVisible() and \
                 self._position_dialog.is_in_positioning_mode():
             self._position_dialog.receive_pick(raw_shape, shape_type)
+
+    def _on_fillet_clicked(self):
+        """Open the Fillet dialog."""
+        if self._assembly is None:
+            return
+        active = self.tree.get_active_part()
+        if active is None:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self, "No active part",
+                "RMB on a part in the tree and choose '⚙ Set Active Part' first."
+            )
+            return
+        self._fillet_dialog.set_active_part(active)
+        self._fillet_dialog.setFloating(True)
+        self._fillet_dialog.show()
+        self._fillet_dialog.raise_()
+
+    def _on_fillet_done(self, node, new_shape):
+        """
+        Fillet complete -- replace the part's geometry, same pattern as
+        _on_part_cut: preserve color, rebuild ancestors for export.
+        """
+        node._wrapped = new_shape
+        self._rebuild_ancestors(node)
+
+        self.viewport.context.ClearSelected(True)
+        old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
+        original_color_rgb = None
+        if old_ais is not None:
+            info = self.viewport._ais_shape_to_node.get(id(old_ais))
+            if info:
+                original_color_rgb = info.get("color_rgb")
+            self.viewport.context.Remove(old_ais, False)
+            self.viewport._ais_shapes = [
+                s for s in self.viewport._ais_shapes if s is not old_ais
+            ]
+            self.viewport._ais_shape_to_node.pop(id(old_ais), None)
+            del self.viewport._node_id_to_ais_shape[id(node)]
+
+        self.viewport.display_subtree(node, f"/{node.label or 'part'}")
+
+        if original_color_rgb is not None:
+            new_ais = self.viewport._node_id_to_ais_shape.get(id(node))
+            if new_ais is not None:
+                from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
+                r, g, b = original_color_rgb
+                new_ais.SetColor(Quantity_Color(
+                    r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB))
+                self.viewport.context.Redisplay(new_ais, False)
+                info = self.viewport._ais_shape_to_node.get(id(new_ais))
+                if info:
+                    info["color_rgb"] = original_color_rgb
+
+        self.viewport.context.UpdateCurrentViewer()
+        self.viewport.update()
+        self._on_active_part_changed(node)
+        print(f"Fillet complete: '{node.label}' updated.")
 
     def _on_create_part_clicked(self):
         """Open the Workplane/Create Part dialog."""
@@ -1032,6 +1107,10 @@ class MainWindow(QWidget):
         # Notify the workplane dialog
         if hasattr(self, '_workplane_dialog'):
             self._workplane_dialog.set_active_part(node)
+
+        # Notify the fillet dialog
+        if hasattr(self, '_fillet_dialog') and self._fillet_dialog.isVisible():
+            self._fillet_dialog.set_active_part(node)
 
 
     def _on_part_cut(self, node, new_shape):
