@@ -334,6 +334,24 @@ class OcctViewportWidget(QWidget):
         ais_shape.SetColor(color)
         ais_shape.SetDisplayMode(AIS_DisplayMode.AIS_Shaded)
 
+        # Draw crisp black edges over the shaded face -- gives the model
+        # a clean, technical illustration look. We configure the shape's
+        # own Prs3d_Drawer rather than using a separate wireframe AIS
+        # (which would require managing a second AIS per shape).
+        from OCP.Prs3d import Prs3d_Drawer
+        from OCP.Quantity import Quantity_NOC_BLACK
+        from OCP.Aspect import Aspect_TOL_SOLID
+
+        drawer = ais_shape.Attributes()
+        drawer.SetFaceBoundaryDraw(True)
+        drawer.SetFaceBoundaryAspect(
+            drawer.FaceBoundaryAspect()
+        )
+        drawer.FaceBoundaryAspect().SetColor(
+            Quantity_Color(Quantity_NOC_BLACK))
+        drawer.FaceBoundaryAspect().SetWidth(1.0)
+        drawer.FaceBoundaryAspect().SetTypeOfLine(Aspect_TOL_SOLID)
+
         self.context.Display(ais_shape, True)
         # FIX: AIS_Shape's selection-mode integers are NOT guaranteed
         # to be numerically identical to TopAbs_ShapeEnum's own values
