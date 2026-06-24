@@ -867,10 +867,29 @@ can then successfully register all child nodes under it.
    sufficient for the new part itself -- the problem was always in the
    parent Compound, not the Solid.
 
+### Cut/Mill also fixed in same session
+
+After fixing part creation export, the Cut/Mill operation stopped
+working visually -- the part appeared unchanged after a cut.
+
+**Root cause:** `_on_part_cut()` in `main_app.py` was using
+`Shape.cast(new_shape)` to wrap the `BRepAlgoAPI_Cut` result before
+assigning to `node._wrapped`. But `Shape.cast()` returns `None` for
+raw OCCT shapes (proven earlier when it returned None for
+`TopAbs_SOLID`). So `cast_shape.wrapped` crashed silently, `node._wrapped`
+was never updated, and the viewport showed the old uncut shape.
+
+**Fix:** assign `node._wrapped = new_shape` directly (the raw
+`TopoDS_Shape` from `BRepAlgoAPI_Cut`) and call `_rebuild_ancestors(node)`
+so the modified part also exports correctly to STEP.
+
+**Confirmed working:** both the new extruded part AND the cut plate
+appear correctly in the exported STEP file, verified in CAD Assistant.
+
 ### Files changed
-- `gui/main_app.py` -- added `_rebuild_ancestors()` called from
-  `_on_part_created()`; also `_on_part_cut()` should call it after
-  cut to keep exported geometry up to date.
+- `gui/main_app.py` -- added `_rebuild_ancestors()` called from both
+  `_on_part_created()` and `_on_part_cut()`; removed broken
+  `Shape.cast()` from `_on_part_cut()`.
 - `src/step_export_fix.py` -- cleaned up (all diagnostics removed);
   remains a one-line fix for the spurious root parent bug.
 - `gui/workplane_dialog.py` -- restored `_extrude()` method (was

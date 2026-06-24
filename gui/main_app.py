@@ -1030,12 +1030,13 @@ class MainWindow(QWidget):
         Cut/Mill completed -- replace the part's geometry in the viewport,
         preserving the original display color.
         """
-        from build123d import Shape as B3dShape
+        # Update node's wrapped shape directly -- Shape.cast() returns None
+        # for raw OCCT shapes, so assign _wrapped directly.
+        node._wrapped = new_shape
 
-        # Use Shape.cast() so the updated node goes through build123d's
-        # proper initialisation path and remains export_step() compatible.
-        cast_shape = B3dShape.cast(new_shape)
-        node._wrapped = cast_shape.wrapped
+        # Rebuild ancestor compounds so export_step can register them
+        # (same reason as _rebuild_ancestors in _on_part_created).
+        self._rebuild_ancestors(node)
 
         # Erase overlay FIRST -- it refs the old shape, must go before Remove()
         overlay = getattr(self, '_active_part_overlay_ais', None)
