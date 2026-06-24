@@ -71,10 +71,14 @@ class WorkplaneDialog(QDockWidget):
 
     # Emitted when a new part node has been created and should be added
     # to the assembly tree + displayed in the viewport.
-    part_created = Signal(object)  # build123d Compound node
+    part_created = Signal(object)
+
+    # Emitted when an existing part's geometry was replaced by a Cut op.
+    # Carries (node, new_TopoDS_Shape).
+    part_cut = Signal(object, object)
 
     def __init__(self, parent=None, viewport=None):
-        super().__init__("Create Part", parent)
+        super().__init__("Workplane / Sketch / Extrude", parent)
         self.setAllowedAreas(Qt.DockWidgetArea.NoDockWidgetArea)
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetFloatable |
@@ -85,6 +89,7 @@ class WorkplaneDialog(QDockWidget):
         self._workplane = None          # WorkPlane instance, set after face pick
         self._wp_ais = None             # AIS_Shape for the workplane border
         self._picking_face = False      # True while waiting for a face click
+        self._active_part = None        # Part node to cut into (set by main_app)
 
         self._build_ui()
 
@@ -125,7 +130,7 @@ class WorkplaneDialog(QDockWidget):
         layout.addWidget(step2)
 
         # ---- Step 3: extrude depth + name + create -------------------
-        step3 = QGroupBox("Step 3 — Extrude")
+        step3 = QGroupBox("Step 3 — Extrude / Cut")
         s3_layout = QVBoxLayout(step3)
 
         row_d = QHBoxLayout()
@@ -148,6 +153,17 @@ class WorkplaneDialog(QDockWidget):
         self._create_btn.clicked.connect(self._on_create_clicked)
         s3_layout.addWidget(self._create_btn)
 
+        # Active part label -- shows which part will be cut into
+        self._active_part_label = QLabel("Active part: (none)")
+        self._active_part_label.setWordWrap(True)
+        self._active_part_label.setStyleSheet("color: gray; font-style: italic;")
+        s3_layout.addWidget(self._active_part_label)
+
+        self._cut_btn = QPushButton("✂  Cut Into Active Part")
+        self._cut_btn.setEnabled(False)
+        self._cut_btn.clicked.connect(self._on_cut_clicked)
+        s3_layout.addWidget(self._cut_btn)
+
         layout.addWidget(step3)
 
         layout.addStretch()
@@ -163,8 +179,23 @@ class WorkplaneDialog(QDockWidget):
         """Enable/disable step 2+3 controls depending on whether we have a WP."""
         self._sketch_toolbar.setEnabled(enabled)
         for w in [self._depth_edit, self._name_edit, self._create_btn]:
-
             w.setEnabled(enabled)
+        # Cut button only enabled if there's also an active part
+        self._cut_btn.setEnabled(enabled and self._active_part is not None)
+
+    def set_active_part(self, node):
+        """Called by main_app when the active part changes."""
+        self._active_part = node
+        if node is not None:
+            name = node.label or "<unnamed>"
+            self._active_part_label.setText(f"Active part: {name}")
+            self._active_part_label.setStyleSheet("color: orange; font-weight: bold;")
+        else:
+            self._active_part_label.setText("Active part: (none)")
+            self._active_part_label.setStyleSheet("color: gray; font-style: italic;")
+        # Update cut button state
+        has_wp = self._workplane is not None
+        self._cut_btn.setEnabled(has_wp and node is not None)
 
     # ------------------------------------------------------------------
     # Pick mode
@@ -352,7 +383,89 @@ class WorkplaneDialog(QDockWidget):
         # Tell main_app about the new node
         self.part_created.emit(node)
 
-    def _extrude(self, depth, name):
+    def _on_cut_clicked(self):
+        """Cut the sketched profile into the active part."""
+        if self._workplane is None:
+            QMessageBox.warning(self, "No workplane", "Please pick a face first.")
+            return
+        if self._active_part is None:
+            QMessageBox.warning(self, "No active part",
+                                "RMB on a part in the tree and choose "
+                                "'⚙ Set Active Part' first.")
+            return
+
+        try:
+            d = float(self._depth_edit.text())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid input", "Depth must be a number.")
+            return
+
+        if d <= 0:
+            QMessageBox.warning(self, "Invalid input", "Depth must be positive.")
+            return
+
+        try:
+            new_shape = self._cut(d)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Cut failed", f"Could not cut part:\n{e}")
+            return
+
+        # Clean up sketch and workplane display
+        self._sketch_toolbar.deactivate()
+        self._erase_workplane()
+        self._workplane = None
+        self._set_sketch_enabled(False)
+        self._create_btn.setEnabled(False)
+        self._cut_btn.setEnabled(False)
+        self._pick_status.setText("Cut complete!  Pick another face to continue.")
+        self._pick_btn.setText("Click face in viewport…")
+
+        # Tell main_app to replace the part's geometry
+        self.part_cut.emit(self._active_part, new_shape)
+
+    def _cut(self, depth):
+        """
+        Extrude the sketch profile in the -wDir direction and subtract it
+        from the active part's wrapped shape using BRepAlgoAPI_Cut.
+        Returns the new TopoDS_Shape (not yet assigned to the node --
+        main_app does that in _on_part_cut).
+        """
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+        from OCP.gp import gp_Vec
+
+        wp = self._workplane
+
+        if not wp.edgeList:
+            raise RuntimeError(
+                "No sketch profile found.\n\n"
+                "Use the sketch toolbar to draw the profile to cut."
+            )
+
+        if not wp.makeWire():
+            raise RuntimeError(
+                "makeWire() failed -- profile may not be closed."
+            )
+
+        face_bldr = BRepBuilderAPI_MakeFace(wp.wire)
+        if not face_bldr.IsDone():
+            raise RuntimeError("MakeFace failed.")
+
+        # Cut tool goes in -wDir (into the material)
+        cut_vec = gp_Vec(wp.wDir) * -depth
+        tool = BRepPrimAPI_MakePrism(face_bldr.Shape(), cut_vec).Shape()
+
+        # Get the current wrapped shape of the active part
+        work_shape = self._active_part.wrapped
+
+        result = BRepAlgoAPI_Cut(work_shape, tool)
+        if not result.IsDone():
+            raise RuntimeError("BRepAlgoAPI_Cut failed.")
+
+        return result.Shape()
         """
         Extrude the current sketch profile along the workplane normal.
         Uses whatever profile has been sketched via the toolbar.

@@ -489,96 +489,93 @@ full chain was exercised together.
 
 ---
 
-## 6. Workplanes and Part Creation
+## 6. Workplanes, Sketch, Part Creation and Cut/Mill
 
-**Status: PHASE 1-4 COMPLETE.** Full workflow working end-to-end,
-confirmed on `as1-oc-214.stp`.
+**Status: COMPLETE.** Full create-and-cut workflow confirmed working
+end-to-end on `as1-oc-214.stp`.
 
 **What's working (confirmed via real testing):**
 
-### Phase 1 — Active Assembly
-- RMB on any tree node → "► Set Active Assembly" makes it the target
-  for new parts and imports.
-- Active node shown in **bold** with ► prefix in the tree.
-- "✕ Clear Active" (appears on RMB when node is already active)
-  reverts to root as implicit target.
+### Phase 1 -- Active Assembly
+- RMB on any Compound node -> "► Set Active Assembly" makes it the
+  target for new parts and imports.
+- Active node shown in bold with ► prefix in the tree.
+- "✕ Clear Active Assembly" reverts to root as implicit target.
 - `tree.get_target_node()` returns active node, or root if none set.
-- Both "Create Part" and "Import STEP" now use `get_target_node()`
-  instead of always targeting the root assembly.
+- Both "Workplane..." and "Import STEP" use `get_target_node()`.
 
-### Phase 2 — Persistent Workplane Display
+### Phase 2 -- Workplane Display
 - `src/workplane.py` -- fully ported from kodacad to OCP bindings.
   Smoke test passes.
-- `gui/workplane_dialog.py` -- floating QDockWidget: pick face →
-  show workplane → enter dimensions → extrude new part.
-- Workplane displayed as semi-transparent **green** face (CoCreate
-  color) with **pink/magenta U/V crosshair lines** through origin.
-- All three AIS objects (border + 2 axis lines) tracked and erased
-  cleanly after extrusion or cancel.
+- `gui/workplane_dialog.py` -- floating QDockWidget: pick face ->
+  show workplane -> sketch -> extrude or cut.
+- Workplane displayed as semi-transparent green face with pink/magenta
+  U/V crosshair lines through origin.
+- All AIS objects tracked and erased cleanly after operation or cancel.
 
-### Phase 3 — Create/Delete Sub-Assembly
-- RMB → "📁 New Sub-Assembly..." prompts for name, creates empty
-  `Compound` under the clicked node, adds it to tree.
-- RMB → "🗑 Delete" (disabled on root): confirms, then erases all
-  leaf AIS_Shapes from viewport, removes node from assembly data
-  structure (`remove_node()`), removes row from tree widget.
-  Handles both leaf parts and assembly containers (recursively erases
-  all descendants).
-- Delete also clears active status if the deleted node was active.
+### Phase 3 -- Create/Delete Sub-Assembly
+- RMB -> "📁 New Sub-Assembly..." creates empty Compound under clicked
+  node. Uses `BRep_Builder.MakeCompound()` for a valid empty OCC shape
+  (plain `Compound(children=[])` has no `_wrapped` and causes
+  `AssertionError` in build123d's `_post_attach`).
+- RMB -> "🗑 Delete" confirms then removes all leaf AIS from viewport
+  using `context.Remove()` (not `Erase()` -- see item 9), removes
+  from assembly data, removes from tree.
 
-### Phase 4 — Workplane Display Polish
-- Green translucent border (CoCreate-inspired).
-- Pink/magenta U/V crosshair lines along workplane U and V axes.
-- Workplane erased cleanly on part creation or cancel.
+### Phase 4 -- Interactive Sketch Toolbar
+- `gui/sketch_toolbar.py` -- vertical QToolBar with kodacad icons
+  (converted from GIF to PNG with transparent background and color).
+- Construction lines: H cline, V cline, H+V, Angled, Linear Bisector
+- Construction circles: ccirc
+- Profile geometry: Line, Rect (4 edges), Circle, Arc Ctr-2Pts, Arc 3Pts
+- Delete Last, Clear All
+- Each tool pops a QInputDialog for coordinate input -- coordinate-driven,
+  no freehand mouse picking needed (same approach as kodacad).
+- `rect()` adds 4 edges; `_display_profile(n_new=4)` shows all four.
+- `ccircs` stores `((cx,cy), r)` -- unpack as `(cx, cy), r = cc`.
 
-**OCP-specific bugs found and fixed during implementation:**
-- `brepgprop_SurfaceProperties` → `BRepGProp.SurfaceProperties_s()`
-- `topods.Face()` → `TopoDS.Face_s()`
-- Raw face pick arrives as `TopoDS_Shape`, must downcast to
-  `TopoDS_Face` before `UVBounds_s` / `BRepGProp`.
-- New part must be a build123d `Shape` subclass (`Solid`, not plain
-  `anytree.Node`) to satisfy `_pre_attach_children` validator.
-- `QTreeWidgetItem` active-style label bug: `id(item)` in
-  `_item_to_node` can return a DIFFERENT node by the time
-  `_set_item_active_style` runs (Python reuses memory addresses after
-  GC). Fix: read `item.text(0)` directly at the top of the method
-  rather than reconstructing the label from the data model.
-  See item 8 in this backlog for the full failure chain.
+### Phase 5 -- Active Part + Cut/Mill
+- RMB on any Solid (leaf) node -> "⚙ Set Active Part" marks it for
+  Cut/Mill.
+- Active part shown bold with ★ prefix + orange background on tree row.
+- Orange wireframe overlay in viewport using `BRepBuilderAPI_Copy` of
+  the shape (must be independent copy -- see item 9).
+- Overlay uses `context.Remove()` not `context.Erase()`.
+- Workplane dialog Step 3 shows active part name; "✂ Cut Into Active
+  Part" button enabled when both workplane and active part are set.
+- Cut uses `BRepAlgoAPI_Cut(work_shape, tool)` where tool is the profile
+  extruded in -wDir direction (into the material).
+- After cut: original color read from `_ais_shape_to_node["color_rgb"]`
+  before old AIS removed, restored on new AIS after redisplay.
+- "⊞ Workplane..." button (renamed from "Create Part...") opens dialog.
 
-**Files changed:**
-- `src/workplane.py` -- OCP port + downcast fix
-- `gui/workplane_dialog.py` -- green WP display, U/V crosshairs,
-  extrusion returning `Solid` directly
-- `gui/assembly_tree_widget.py` -- active assembly, RMB menu,
-  delete, new sub-assembly, `remove_node_from_tree()`
-- `gui/main_app.py` -- wires all new signals, active-aware
-  part creation and import, delete handler
+**Files changed this session:**
+- `src/workplane.py` -- OCP port + `TopoDS.Face_s()` downcast fix
+- `gui/workplane_dialog.py` -- full sketch workflow, cut, active part label
+- `gui/sketch_toolbar.py` -- new file, full sketch toolbar
+- `gui/icons_png/` -- new folder, 36 PNG icons from kodacad GIFs
+- `gui/assembly_tree_widget.py` -- active assembly + active part, RMB menu
+- `gui/assembly_viewer.py` -- `context.Remove()`, `MoveTo(-1,-1)` on RMB
+- `gui/main_app.py` -- all signal wiring, color preservation, overlay
 
 **Workflow (as built):**
-1. Load a STEP file → assembly appears in tree and viewport.
-2. RMB on a sub-assembly → "► Set Active Assembly" (bold + ►).
-3. Click "✏ Create Part..." → dialog opens in face-pick mode.
-4. Click a face → green workplane with pink crosshairs appears.
-5. Enter width / height / depth / name → "✚ Create Part".
-6. New solid added under the active assembly in tree + viewport.
-7. RMB on any node → "🗑 Delete" to remove it.
-8. RMB on any node → "📁 New Sub-Assembly..." to add a container.
+1. Load STEP file -> assembly in tree and viewport.
+2. RMB on sub-assembly -> "► Set Active Assembly".
+3. RMB on a solid -> "⚙ Set Active Part" (orange tree row + wireframe).
+4. Click "⊞ Workplane..." -> dialog opens in face-pick mode.
+5. Click a face -> green workplane + pink crosshairs appears.
+6. Use sketch toolbar to draw profile (rect, circle, clines, etc).
+7a. Enter depth + name -> "✚ Create Part" -> new solid in tree.
+7b. Enter depth -> "✂ Cut Into Active Part" -> hole/pocket cut.
+8. Part retains its original color after cut.
 
 **Next things to explore:**
-1. **Cut/Mill** -- subtract a profile from an existing part using
-   the same workplane + `BRepAlgoAPI_Cut`. Requires an "active part"
-   concept (select which solid to cut into).
-2. **Revolve** -- profile around an axis instead of extruding along
-   the normal.
-3. **Workplane as persistent tree node** -- give the workplane its
-   own row in the tree (like CoCreate's `/w1`) so it can be
-   selected, repositioned, or deleted independently of any extrusion.
-4. **Additional sketch profiles** -- circle, arc, polygon in the
-   dialog (WorkPlane class already supports all of these).
-5. **Workplane label in viewport** -- render `/w1` text at the
-   corner of the plane (requires AIS_TextLabel or similar).
-6. **Undo** -- see item 3 in this backlog for the open question
-   about whether OCAF transactions cover build123d-level mutations.
+1. **Revolve** -- profile around an axis via `BRepPrimAPI_MakeRevol`.
+2. **Clickable cline intersections** -- `WorkPlane.intersectPts()`
+   already computes them; display as vertex AIS objects for snapping.
+3. **Workplane as persistent tree node** -- like CoCreate's /w1.
+4. **Save/export** -- STEP export including created and cut parts.
+5. **Undo** -- open question whether OCAF covers build123d mutations.
 
 ---
 
@@ -590,79 +587,123 @@ RMB in the viewport opens a menu with: Fit All, Fit Selected,
 Reset View (isometric), View Top, View Front, View Right.
 
 **AIS_ViewCube also added** -- orientation cube in the bottom-right
-corner (same as CAD Assistant). Clicking edges (12) and corners (8)
-works correctly, animating the camera to the corresponding view.
+corner. Clicking edges (12) and corners (8) works correctly, animating
+the camera to the corresponding view.
 
 **Known issue: face clicks on the view cube cause a crash.**
-Clicking one of the 6 face labels (TOP, FRONT, RIGHT, etc.) produces
-a white viewport and then a C++ segfault -- nothing printed to
-terminal, not catchable by Python try/except. Root cause is inside
-OCCT's own animation or camera-setting code when triggered by a face
-owner. Edges and corners use a different code path and work fine.
+Clicking one of the 6 face labels (TOP, FRONT, RIGHT, etc.) causes a
+C++ segfault -- not catchable by Python. Root cause is inside OCCT's
+animation or camera-setting code when triggered by a face owner.
 
-**Workaround:** use the RMB menu's View Top/Front/Right items for
-standard orthographic views. Avoid clicking the view cube's flat
-faces. This is acceptable behavior -- edges and corners cover the
-isometric views that are most useful during 3D work anyway.
+**Workaround:** use the RMB menu's View Top/Front/Right items.
+Avoid clicking the view cube's flat faces.
 
-**TODO (low priority):** investigate whether disabling the face
-sensitive zones entirely (`vc.SetDrawVertices(False)` equivalent for
-faces) prevents the crash while keeping edge/corner clicks working.
-Or wait for a newer OCP build where this may be fixed upstream.
+**TODO (low priority):** investigate disabling face sensitive zones,
+or wait for a newer OCP build where this may be fixed upstream.
 
 ---
 
 ## 8. Lessons Learned: Qt QTreeWidgetItem Text Modification
 
 **Context:** Setting the active assembly bold + ► prefix in the tree
-took many debugging iterations before the correct fix was found.
-Documenting the full failure chain so future sessions don't repeat it.
+took many debugging iterations. Documented to avoid repeating.
 
-**The symptom:** `item.setText(0, "► assembly")` was being called
-correctly (confirmed by debug prints) but the tree displayed
-`<unnamed>` instead.
+**The symptom:** `item.setText(0, "► assembly")` was called correctly
+(confirmed by debug prints) but the tree displayed `<unnamed>`.
 
-**The failure chain investigated (all dead ends):**
-- `id(item)` reuse: suspected a stale id() in `_item_to_node` was
-  returning the wrong node. Real -- Python reuses memory addresses
-  after GC -- but not the root cause here.
-- `itemChanged` signal firing after `setText`: suspected
-  `_on_tree_item_changed` in main_app was resetting the text.
-  Confirmed `itemChanged` fires but only BEFORE `set_active_node`
-  runs (from `setCheckState` during item creation), not after.
-- `blockSignals(True)` around `setText`: tried suppressing
-  `itemChanged`. Worked (no second signal fired) but text still
-  showed wrong. Reason: `blockSignals` also suppresses the internal
-  Qt repaint notification, leaving the display stale.
-- `viewport().update()` after `blockSignals(False)`: forced repaint
-  but still showed wrong text.
-- Looking up node label via `_item_to_node.get(id(item))`: this was
-  the actual bug source. By the time `_set_item_active_style` ran,
-  `id(item)` had been reused by a DIFFERENT item in `_item_to_node`,
-  so the lookup returned a node with `label=None` → `<unnamed>`.
+**Root cause:** `_item_to_node.get(id(item))` returned the WRONG node
+because Python had reused the memory address of a previously GC'd item.
+The lookup found a different node whose `label=None`, giving `<unnamed>`.
 
-**The fix (one line):**
-Read `item.text(0)` at the very top of `_set_item_active_style`,
-before any other operation, and use that as the base label:
+**The fix:** Read `item.text(0)` at the very start of
+`_set_item_active_style`, before any other operation:
 
 ```python
-def _set_item_active_style(self, item, active: bool):
+def _set_item_active_style(self, item, active: bool, prefix: str):
     current_text = item.text(0)
-    base_label = current_text[2:] if current_text.startswith("► ") \
-        else current_text
+    for p in ("► ", "★ "):
+        if current_text.startswith(p):
+            current_text = current_text[2:]
+            break
+    base_label = current_text
     font = item.font(0)
     font.setBold(active)
     item.setFont(0, font)
-    item.setText(0, f"► {base_label}" if active else base_label)
+    item.setText(0, f"{prefix}{base_label}" if active else base_label)
 ```
 
-**The lesson:**
-When modifying a `QTreeWidgetItem`'s display text, do NOT look up
-the underlying data model to reconstruct the label -- the `id(item)`
-key in any Python dict may have been reused by the time the method
-runs. Instead, read the item's current text directly from the widget
-itself (`item.text(0)`) before any modifications. The widget always
-has the right text; the dict lookup may not.
+**The lesson:** Read `item.text(0)` directly from the widget -- never
+reconstruct the label from a dict keyed on `id(item)`. The widget
+always has the right text; the dict lookup may not after GC.
 
+---
 
+## 9. Lessons Learned: OCCT AIS Shape Management
 
+**Context:** The active-part highlight and Cut/Mill redisplay required
+deep understanding of OCCT AIS management. Several subtle bugs found
+and fixed -- documented here for future reference.
+
+### Erase vs Remove
+
+`context.Erase(ais, update)` hides the shape visually but leaves it
+registered in OCCT's selection index. After `Erase`, `MoveTo()` can
+still detect the shape, and erasing a "selected" shape can segfault.
+
+`context.Remove(ais, update)` fully deregisters from ALL OCCT internal
+structures. Use `Remove` when permanently replacing or deleting a shape.
+Use `Erase` only for temporary hide/show toggling.
+
+**Rule: always use `context.Remove()` when permanently replacing or
+deleting an AIS shape.**
+
+### Color bleed between AIS objects sharing a TopoDS_Shape
+
+When two `AIS_Shape` objects are built from the SAME `TopoDS_Shape`
+instance, `SetColor()` on one bleeds to the other -- OCCT stores color
+in the shape's presentation layer, shared between all AIS objects
+referencing the same topology.
+
+**Fix:** use `BRepBuilderAPI_Copy(shape).Shape()` to create an
+independent copy for overlay AIS objects:
+
+```python
+from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+shape_copy = BRepBuilderAPI_Copy(ais.Shape()).Shape()
+overlay = AIS_Shape(shape_copy)
+overlay.SetColor(orange)  # does NOT affect original shaded AIS
+```
+
+### OCCT dynamic hover highlight freezing on RMB
+
+OCCT has two separate highlight systems:
+- **Dynamic highlight** (hover): applied by `MoveTo()`. Yellow/orange
+  in default OCCT style. Cleared when cursor moves to a new shape.
+- **Selection highlight**: applied by `context.Select()` on click.
+  Stays until `context.ClearSelected()` is called.
+
+When a RMB context menu opens, mouse movement stops and the dynamic
+highlight stays frozen on the shape under the cursor. `ClearDetected()`
+does not exist in this OCP version.
+
+**Fix:** call `context.MoveTo(-1, -1, view, True)` before showing the
+RMB menu. This moves detection to an off-screen pixel, clearing the
+dynamic highlight.
+
+### Color preservation across Cut/Mill redisplay
+
+When `BRepAlgoAPI_Cut` replaces a shape, `display_subtree()` assigns
+a new palette color by position which may differ from the original.
+
+The original color is stored in `_ais_shape_to_node[id(ais)]["color_rgb"]`
+as an `(r, g, b)` tuple. Read it BEFORE removing the old AIS, then
+restore it on the new AIS after redisplay.
+
+### Overlay lifetime management
+
+An AIS overlay built from a copied shape must be erased BEFORE the
+original AIS is removed. The copied shape still shares internal OCCT
+topology with the original -- if the original is removed first, the
+overlay's topology becomes invalid and accessing it segfaults.
+
+**Rule: always remove overlays BEFORE removing the source AIS.**

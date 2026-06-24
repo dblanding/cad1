@@ -475,6 +475,14 @@ class OcctViewportWidget(QWidget):
             self._drag_distance = 0.0
 
         elif event.button() == Qt.MouseButton.RightButton:
+            # Move OCCT's detection point off-screen to clear the dynamic
+            # hover highlight before the menu opens -- otherwise the shape
+            # under the cursor stays orange while the menu is visible.
+            try:
+                self.context.MoveTo(-1, -1, self.view, True)
+            except Exception:
+                pass
+            self.context.ClearSelected(True)
             self._show_context_menu(event.globalPosition().toPoint())
 
         self.update()

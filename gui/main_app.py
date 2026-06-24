@@ -491,11 +491,11 @@ class MainWindow(QWidget):
 
         # Create Part button -- opens the Workplane → Sketch → Extrude
         # dialog to create a new solid and add it to the assembly.
-        self._create_part_btn = QPushButton("✏  Create Part...")
+        self._create_part_btn = QPushButton("⊞  Workplane...")
         self._create_part_btn.setEnabled(False)
         self._create_part_btn.setToolTip(
-            "Pick a face to define a workplane, sketch a rectangle,\n"
-            "and extrude it to create a new part."
+            "Pick a face to place a workplane, sketch a profile,\n"
+            "then extrude to create a new part or cut into an existing one."
         )
         self._create_part_btn.clicked.connect(self._on_create_part_clicked)
         tree_layout.addWidget(self._create_part_btn)
@@ -542,6 +542,9 @@ class MainWindow(QWidget):
         self._workplane_dialog = WorkplaneDialog(self, viewport=self.viewport)
         self._workplane_dialog.hide()
         self._workplane_dialog.part_created.connect(self._on_part_created)
+        self._workplane_dialog.part_cut.connect(self._on_part_cut)
+        self._active_part_tree_item = None   # tree item with orange background
+        self._active_part_overlay_ais = None  # wireframe overlay AIS
 
         # --- Wire the standard sync signals --------------------------
         self.viewport.part_selected.connect(self._on_part_selected_in_viewport)
@@ -552,6 +555,7 @@ class MainWindow(QWidget):
         self.tree.active_assembly_changed.connect(self._on_active_assembly_changed)
         self.tree.node_delete_requested.connect(self._on_node_delete_requested)
         self.tree.sub_assembly_created.connect(self._on_sub_assembly_created)
+        self.tree.active_part_changed.connect(self._on_active_part_changed)
 
         self.step_path = step_path
         self._assembly = None  # set by load()
@@ -715,6 +719,8 @@ class MainWindow(QWidget):
         self._workplane_dialog.setFloating(True)
         self._workplane_dialog.show()
         self._workplane_dialog.raise_()
+        # Sync the current active part in case it was set before dialog opened
+        self._workplane_dialog.set_active_part(self.tree.get_active_part())
         # Auto-enter pick mode so user can click a face immediately
         self._workplane_dialog.enter_pick_mode()
 
@@ -912,6 +918,135 @@ class MainWindow(QWidget):
         else:
             print("Active assembly cleared -- new parts/imports go to root.")
 
+    def _on_active_part_changed(self, node):
+        """
+        Active part changed:
+          - Orange background on the tree item (Qt only, no OCCT risk)
+          - Orange wireframe overlay in the viewport using a COPIED shape
+            so the overlay has no shared state with the shaded AIS.
+          - Overlay is erased cleanly before the old AIS is ever touched.
+        """
+        from PySide6.QtGui import QColor, QBrush
+        from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
+        from OCP.AIS import AIS_Shape, AIS_DisplayMode
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+
+        orange = Quantity_Color(1.0, 0.55, 0.0,
+                                Quantity_TypeOfColor.Quantity_TOC_RGB)
+
+        # --- Clear previous overlay and tree highlight ---
+        prev_overlay = getattr(self, '_active_part_overlay_ais', None)
+        if prev_overlay is not None:
+            try:
+                self.viewport.context.Remove(prev_overlay, True)
+            except Exception:
+                pass
+            self._active_part_overlay_ais = None
+
+        prev_item = getattr(self, '_active_part_tree_item', None)
+        if prev_item is not None:
+            prev_item.setBackground(0, QBrush())
+            self._active_part_tree_item = None
+
+        if node is not None:
+            # --- Tree highlight ---
+            for item_id, n in self.tree._item_to_node.items():
+                if n is node:
+                    item = self.tree._find_item_by_id(item_id)
+                    if item is not None:
+                        item.setBackground(
+                            0, QBrush(QColor(255, 140, 0, 120)))
+                        self._active_part_tree_item = item
+                    break
+
+            # --- Viewport wireframe overlay ---
+            ais = self.viewport._node_id_to_ais_shape.get(id(node))
+            if ais is not None:
+                try:
+                    # Copy the shape -- independent TopoDS_Shape means
+                    # SetColor on the overlay cannot bleed to the shaded AIS
+                    shape_copy = BRepBuilderAPI_Copy(ais.Shape()).Shape()
+                    overlay = AIS_Shape(shape_copy)
+                    overlay.SetDisplayMode(AIS_DisplayMode.AIS_WireFrame)
+                    overlay.SetColor(orange)
+                    overlay.SetWidth(2.0)
+                    self.viewport.context.Display(overlay, False)
+                    self.viewport.context.Deactivate(overlay)
+                    self.viewport.context.UpdateCurrentViewer()
+                    self.viewport.update()
+                    self._active_part_overlay_ais = overlay
+                    print(f"Active part: '{node.label}' -- orange edges shown.")
+                except Exception as e:
+                    print(f"Active part overlay failed: {e}")
+                    self._active_part_overlay_ais = None
+            else:
+                self._active_part_overlay_ais = None
+                print(f"Active part: '{node.label}' (no AIS shape found).")
+
+        # Notify the workplane dialog
+        if hasattr(self, '_workplane_dialog'):
+            self._workplane_dialog.set_active_part(node)
+
+
+    def _on_part_cut(self, node, new_shape):
+        """
+        Cut/Mill completed -- replace the part's geometry in the viewport,
+        preserving the original display color.
+        """
+        # Update wrapped shape
+        node._wrapped = new_shape
+
+        # Erase overlay FIRST -- it refs the old shape, must go before Remove()
+        overlay = getattr(self, '_active_part_overlay_ais', None)
+        if overlay is not None:
+            try:
+                self.viewport.context.Remove(overlay, False)
+            except Exception:
+                pass
+            self._active_part_overlay_ais = None
+
+        # Clear OCCT selection before removing
+        self.viewport.context.ClearSelected(True)
+
+        # Save original color before removing old AIS
+        old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
+        original_color_rgb = None
+        if old_ais is not None:
+            info = self.viewport._ais_shape_to_node.get(id(old_ais))
+            if info:
+                original_color_rgb = info.get("color_rgb")
+            self.viewport.context.Remove(old_ais, False)
+            self.viewport._ais_shapes = [
+                s for s in self.viewport._ais_shapes if s is not old_ais
+            ]
+            self.viewport._ais_shape_to_node.pop(id(old_ais), None)
+            del self.viewport._node_id_to_ais_shape[id(node)]
+
+        # Redisplay new shape
+        self.viewport.display_subtree(node, f"/{node.label or 'part'}")
+
+        # Restore original color on the new AIS
+        if original_color_rgb is not None:
+            new_ais = self.viewport._node_id_to_ais_shape.get(id(node))
+            if new_ais is not None:
+                from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
+                r, g, b = original_color_rgb
+                color = Quantity_Color(
+                    r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB)
+                new_ais.SetColor(color)
+                self.viewport.context.Redisplay(new_ais, False)
+                info = self.viewport._ais_shape_to_node.get(id(new_ais))
+                if info:
+                    info["color_rgb"] = original_color_rgb
+
+        self.viewport.context.UpdateCurrentViewer()
+        self.viewport.update()
+        print(f"Cut complete: '{node.label}' updated in viewport.")
+
+        # Re-apply orange overlay on the new shape
+        self._on_active_part_changed(node)
+
+
     def _on_node_delete_requested(self, node):
         """
         Delete a node: erase its geometry from the viewport, remove it
@@ -926,13 +1061,19 @@ class MainWindow(QWidget):
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
         from step_assembly_poc import remove_node
 
-        # Erase all leaf AIS_Shapes under this node from the viewport
+        # Clear OCCT selection first -- erasing a selected shape without
+        # clearing selection first causes a segfault in OCCT's context.
+        self.viewport.context.ClearSelected(True)
+
+        # Erase all leaf AIS_Shapes under this node from the viewport.
+        # Use Remove() not Erase() -- Erase only hides visually but leaves
+        # the shape in OCCT's selection structures, breaking MoveTo().
         leaves = [node] if not node.children else \
             [n for n in node.descendants if not n.children]
         for leaf in leaves:
             ais = self.viewport._node_id_to_ais_shape.get(id(leaf))
             if ais is not None:
-                self.viewport.context.Erase(ais, False)
+                self.viewport.context.Remove(ais, False)
                 self.viewport._ais_shapes = [
                     s for s in self.viewport._ais_shapes if s is not ais
                 ]

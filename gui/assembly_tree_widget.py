@@ -58,6 +58,9 @@ class AssemblyTreeWidget(QTreeWidget):
     # Carries the node that was just made active (or None if cleared).
     active_assembly_changed = Signal(object)
 
+    # Emitted when the active part changes (for Cut/Mill highlight).
+    active_part_changed = Signal(object)  # the new active part node, or None
+
     # Emitted when the user requests deletion of a node via RMB menu.
     # main_app handles the viewport erase; tree widget handles tree removal.
     node_delete_requested = Signal(object)  # the node to delete
@@ -87,7 +90,11 @@ class AssemblyTreeWidget(QTreeWidget):
 
         # Currently active assembly node (None = root is implicit target)
         self._active_node = None
-        self._active_item = None  # the QTreeWidgetItem shown in bold
+        self._active_item = None
+
+        # Currently active part node for Cut/Mill (None = no active part)
+        self._active_part = None
+        self._active_part_item = None
 
     # ------------------------------------------------------------------
     # Public API: active assembly
@@ -99,52 +106,75 @@ class AssemblyTreeWidget(QTreeWidget):
         return self._active_node
 
     def set_active_node(self, node, item=None):
-        """
-        Make `node` the active assembly. If `item` is provided, uses it
-        directly instead of searching -- avoids stale id() lookup issues
-        when the item was just created.
-        Pass None to clear the active assembly.
-        """
-        # Clear previous
+        """Make `node` the active assembly. Pass None to clear."""
         if self._active_item is not None:
-            self._set_item_active_style(self._active_item, False)
+            self._set_item_active_style(self._active_item, False, "► ")
             self._active_item = None
         self._active_node = node
 
         if node is not None:
             if item is None:
-                # Search for the item by node identity
                 for item_id, n in self._item_to_node.items():
                     if n is node:
                         item = self._find_item_by_id(item_id)
                         break
             if item is not None:
-                self._set_item_active_style(item, True)
+                self._set_item_active_style(item, True, "► ")
                 self._active_item = item
 
         self.active_assembly_changed.emit(node)
 
-    def _set_item_active_style(self, item, active: bool):
-        """Bold + ► prefix when active; restore normal when cleared."""
-        # Capture the current label FIRST before any signal or style
-        # change can interfere. Strip any existing ► prefix so
-        # re-activating the same item doesn't accumulate arrows.
+    def get_target_node(self):
+        """Return the node new parts/imports should land under."""
+        return self._active_node if self._active_node is not None \
+            else self._root_assembly
+
+    # ------------------------------------------------------------------
+    # Public API: active part
+    # ------------------------------------------------------------------
+
+    @property
+    def active_part(self):
+        """The currently active part node for Cut/Mill, or None."""
+        return self._active_part
+
+    def get_active_part(self):
+        """Return the active part node, or None."""
+        return self._active_part
+
+    def set_active_part(self, node, item=None):
+        """Make `node` the active part. Pass None to clear."""
+        if self._active_part_item is not None:
+            self._set_item_active_style(self._active_part_item, False, "★ ")
+            self._active_part_item = None
+        self._active_part = node
+
+        if node is not None:
+            if item is None:
+                for item_id, n in self._item_to_node.items():
+                    if n is node:
+                        item = self._find_item_by_id(item_id)
+                        break
+            if item is not None:
+                self._set_item_active_style(item, True, "★ ")
+                self._active_part_item = item
+
+        self.active_part_changed.emit(node)
+
+    def _set_item_active_style(self, item, active: bool, prefix: str):
+        """Bold + prefix when active; restore normal when cleared."""
         current_text = item.text(0)
-        base_label = current_text[2:] if current_text.startswith("► ") \
-            else current_text
+        # Strip any existing prefix (► or ★) before applying new one
+        for p in ("► ", "★ "):
+            if current_text.startswith(p):
+                current_text = current_text[2:]
+                break
+        base_label = current_text
 
         font = item.font(0)
         font.setBold(active)
         item.setFont(0, font)
-        item.setText(0, f"► {base_label}" if active else base_label)
-
-    def get_target_node(self):
-        """
-        Return the node new parts/imports should be added under.
-        Returns _active_node if set, otherwise the root assembly.
-        """
-        return self._active_node if self._active_node is not None \
-            else self._root_assembly
+        item.setText(0, f"{prefix}{base_label}" if active else base_label)
 
     # ------------------------------------------------------------------
     # Tree population
@@ -213,6 +243,8 @@ class AssemblyTreeWidget(QTreeWidget):
         """
         if node is self._active_node:
             self.set_active_node(None)
+        if node is self._active_part:
+            self.set_active_part(None)
 
         for item_id, n in list(self._item_to_node.items()):
             if n is node:
@@ -273,7 +305,7 @@ class AssemblyTreeWidget(QTreeWidget):
 
             # Clear active -- only when this node is currently active
             if node is self._active_node:
-                act_clear = QAction("✕ Clear Active", self)
+                act_clear = QAction("✕ Clear Active Assembly", self)
                 act_clear.triggered.connect(lambda: self.set_active_node(None))
                 menu.addAction(act_clear)
 
@@ -284,6 +316,21 @@ class AssemblyTreeWidget(QTreeWidget):
             act_new_assy.triggered.connect(
                 lambda: self._on_new_sub_assembly(node, item))
             menu.addAction(act_new_assy)
+
+            menu.addSeparator()
+
+        else:
+            # Solid (leaf part) -- offer Set Active Part for Cut/Mill
+            act_set_part = QAction("⚙ Set Active Part", self)
+            act_set_part.triggered.connect(
+                lambda: self._on_set_active_part(node, item))
+            menu.addAction(act_set_part)
+
+            if node is self._active_part:
+                act_clear_part = QAction("✕ Clear Active Part", self)
+                act_clear_part.triggered.connect(
+                    lambda: self.set_active_part(None))
+                menu.addAction(act_clear_part)
 
             menu.addSeparator()
 
@@ -298,6 +345,10 @@ class AssemblyTreeWidget(QTreeWidget):
     def _on_set_active(self, node, item):
         self.set_active_node(node, item=item)
         print(f"Active assembly set to: {node.label!r}")
+
+    def _on_set_active_part(self, node, item):
+        self.set_active_part(node, item=item)
+        print(f"Active part set to: {node.label!r}")
 
     def _on_new_sub_assembly(self, parent_node, parent_item):
         """Create a new empty Compound sub-assembly under parent_node."""
