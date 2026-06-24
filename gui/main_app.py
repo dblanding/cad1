@@ -740,9 +740,46 @@ class MainWindow(QWidget):
         add_node(new_node, target)
         print(f"New part '{new_node.label}' added under '{target.label}'.")
 
+        # Rebuild _wrapped for all ancestor Compound nodes so that
+        # export_step's _create_xde can register them in the XDE document.
+        # An empty TopoDS_Compound has no sub-shapes, so AddShape returns a
+        # null label and all descendants get skipped.
+        self._rebuild_ancestors(new_node)
+
         self.viewport.display_subtree(new_node, f"/{new_node.label}")
         self.tree.add_node_to_tree(new_node, parent_node=target)
         print(f"Part '{new_node.label}' created and displayed.")
+
+    def _rebuild_ancestors(self, node):
+        """
+        Walk up the tree from `node`, rebuilding each Compound ancestor's
+        _wrapped to be a TopoDS_Compound containing all its descendants'
+        shapes. This ensures export_step's XDE document can register every
+        node with a non-null label.
+        """
+        from build123d import Compound
+        from OCP.BRep import BRep_Builder
+        from OCP.TopoDS import TopoDS_Compound
+        from anytree import PreOrderIter
+
+        parent = node.parent
+        while parent is not None:
+            if isinstance(parent, Compound):
+                builder = BRep_Builder()
+                compound = TopoDS_Compound()
+                builder.MakeCompound(compound)
+                # Add all descendant shapes to the compound
+                for desc in PreOrderIter(parent):
+                    if desc is parent:
+                        continue
+                    w = getattr(desc, '_wrapped', None)
+                    if w is not None:
+                        try:
+                            builder.Add(compound, w)
+                        except Exception:
+                            pass
+                parent._wrapped = compound
+            parent = parent.parent
 
     def _on_redisplay_after_move(self, moved_node):
         """
@@ -993,8 +1030,12 @@ class MainWindow(QWidget):
         Cut/Mill completed -- replace the part's geometry in the viewport,
         preserving the original display color.
         """
-        # Update wrapped shape
-        node._wrapped = new_shape
+        from build123d import Shape as B3dShape
+
+        # Use Shape.cast() so the updated node goes through build123d's
+        # proper initialisation path and remains export_step() compatible.
+        cast_shape = B3dShape.cast(new_shape)
+        node._wrapped = cast_shape.wrapped
 
         # Erase overlay FIRST -- it refs the old shape, must go before Remove()
         overlay = getattr(self, '_active_part_overlay_ais', None)

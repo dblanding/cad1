@@ -383,6 +383,83 @@ class WorkplaneDialog(QDockWidget):
         # Tell main_app about the new node
         self.part_created.emit(node)
 
+    def _extrude(self, depth, name):
+        """
+        Extrude the current sketch profile along the workplane normal (+wDir).
+        Uses whatever profile has been sketched via the toolbar.
+        Returns a build123d Solid node ready to join the assembly tree.
+        Raises RuntimeError if no profile exists or makeWire() fails.
+        """
+        from build123d import Solid, Shape
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+        from OCP.gp import gp_Vec
+
+        wp = self._workplane
+
+        if not wp.edgeList:
+            raise RuntimeError(
+                "No sketch profile found.\n\n"
+                "Use the sketch toolbar (Step 2) to draw a rectangle, "
+                "circle, or other profile before creating a part."
+            )
+
+        if not wp.makeWire():
+            raise RuntimeError(
+                "makeWire() failed -- the profile may not be closed.\n\n"
+                "Tip: a rectangle (Rect tool) or circle (Circle tool) "
+                "always forms a closed profile. Lines must form a "
+                "closed loop."
+            )
+
+        face_bldr = BRepBuilderAPI_MakeFace(wp.wire)
+        if not face_bldr.IsDone():
+            raise RuntimeError("MakeFace failed.")
+
+        # Extrude in +wDir (out of the face)
+        extrude_vec = gp_Vec(wp.wDir) * depth
+        prism_shape = BRepPrimAPI_MakePrism(face_bldr.Shape(), extrude_vec).Shape()
+
+        # Round-trip through STEP to get a build123d Solid that is fully
+        # XDE-registered (same as shapes from import_step), so export_step()
+        # will include it correctly. Without this, export_step()'s _create_xde()
+        # silently skips freshly constructed Solid nodes.
+        import tempfile, os
+        from build123d import Solid, export_step as b3d_export, import_step
+        from OCP.BRepTools import BRepTools
+        from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+        from OCP.IFSelect import IFSelect_RetDone
+
+        # Write raw shape to a temp STEP file
+        tmp = tempfile.NamedTemporaryFile(suffix='.step', delete=False)
+        tmp.close()
+        try:
+            writer = STEPControl_Writer()
+            writer.Transfer(prism_shape, STEPControl_AsIs)
+            status = writer.Write(tmp.name)
+            if status != IFSelect_RetDone:
+                raise RuntimeError(f"Temp STEP write failed: {status}")
+            # Re-import to get XDE-registered shape
+            imported = import_step(tmp.name)
+            # import_step returns a Solid with a spurious parent Compound
+            # (same bug as documented in step_export_fix.py). The solid
+            # may be the imported object itself or its first child.
+            children = list(imported.children)
+            if children:
+                b3d_solid = children[0]
+            else:
+                b3d_solid = imported
+            # Sever the spurious parent -- required so export_step()
+            # doesn't skip it (same fix as step_export_fix.py applies
+            # to the root assembly node).
+            if b3d_solid.parent is not None:
+                b3d_solid.parent = None
+        finally:
+            os.unlink(tmp.name)
+
+        b3d_solid.label = name
+        return b3d_solid
+
     def _on_cut_clicked(self):
         """Cut the sketched profile into the active part."""
         if self._workplane is None:

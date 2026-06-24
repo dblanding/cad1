@@ -92,13 +92,13 @@ assemblies" + "Position a part, assembly, or workplane set").
 
 ---
 
-### Next things to explore
+### Additional things completed
 
-1. **Dynamic Move** -- implement click-to-translate for rough
+1. ✅ **Dynamic Move** -- implement click-to-translate for rough
    positioning before Mate/Align.
-2. **AIS_Manipulator gizmo** -- the slick drag version, after
+2. ✅ **AIS_Manipulator gizmo** -- the slick drag version, after
    Dynamic Move click-to-translate is working.
-3. **Active Part concept** (CoCreate terminology) -- make the
+3. ✅ **Active Part concept** (CoCreate terminology) -- make the
    currently-selected moving node more visually prominent in the
    dialog and/or viewport so it's always clear what's about to move.
 
@@ -236,7 +236,8 @@ Key implementation notes:
 
 1. ✅ **Mate/Align UI** -- full 3-2-1 working with purity of motion
 2. ✅ **Dynamic Move** -- AIS_Manipulator gizmo, all 6 DOF
-3. ✅ **Import STEP** -- load new files mid-session, re-parent, export
+3. ✅ **Import STEP** -- load new files mid-session, re-parent
+4. ✅ **Export STEP** -- export current assembly tree
 
 ---
 
@@ -491,8 +492,10 @@ full chain was exercised together.
 
 ## 6. Workplanes, Sketch, Part Creation and Cut/Mill
 
-**Status: COMPLETE.** Full create-and-cut workflow confirmed working
-end-to-end on `as1-oc-214.stp`.
+**Status: COMPLETE including STEP export.** Full workflow confirmed
+working end-to-end: create sub-assembly → sketch → extrude/cut →
+export STEP → verified in CAD Assistant. New parts appear with correct
+hierarchy, geometry, and color in the exported file.
 
 **What's working (confirmed via real testing):**
 
@@ -707,3 +710,168 @@ topology with the original -- if the original is removed first, the
 overlay's topology becomes invalid and accessing it segfaults.
 
 **Rule: always remove overlays BEFORE removing the source AIS.**
+
+### Missing `_extrude` method after Cut/Mill refactor
+
+When `_on_cut_clicked` was added to `workplane_dialog.py`, the
+`_extrude` method was accidentally dropped during the refactor of
+`_on_create_clicked`. The error appeared as:
+
+```
+'WorkplaneDialog' object has no attribute '_extrude'
+```
+
+**Fix:** restore `_extrude` as a separate method called by
+`_on_create_clicked`. It extrudes in `+wDir` (out of the face).
+`_cut` (called by `_on_cut_clicked`) extrudes in `-wDir` (into the
+material) and subtracts using `BRepAlgoAPI_Cut`. Both methods share
+the same `makeWire()` → `MakeFace` → `MakePrism` preamble but
+diverge at the boolean operation step.
+
+**Lesson:** when adding a sibling operation (cut alongside extrude),
+factor the shared preamble into a helper so neither operation can
+accidentally clobber the other's method.
+
+---
+
+## 10. Lessons Learned: Exporting Freshly Created Parts to STEP
+
+**Status: RESOLVED AND CONFIRMED WORKING.**
+
+The full workflow -- create sub-assembly → sketch on workplane → extrude
+→ export to STEP -- is now confirmed working end-to-end, including the
+new part appearing correctly in CAD Assistant with proper hierarchy,
+geometry, and color.
+
+**The symptom:** A newly created part appeared correctly in both the
+viewport and the assembly tree (correct volume, correct label, correct
+parent), but was completely absent from the exported STEP file. No
+error, no warning -- just silent omission.
+
+### The investigation (a long trail of false leads)
+
+**False lead 1: Shape.cast() for XDE registration.**
+Hypothesis: `Solid(TopoDS_Shape)` doesn't go through build123d's XDE
+pipeline, so `export_step` can't write it. Tried `Shape.cast()` instead.
+Result: `Shape.cast()` returned `None` for a `TopAbs_SOLID` shape, crashing
+with `'NoneType' has no attribute 'label'`. Dead end.
+
+**False lead 2: Round-trip through temporary STEP file.**
+Hypothesis: write the raw shape to a temp file with `STEPControl_Writer`,
+re-import with `import_step()` to get a fully XDE-registered shape.
+Result: the round-trip worked (118 entities written, re-imported as a
+`Solid`) but the part STILL didn't appear in the export. The re-imported
+`Solid` had a spurious parent Compound (same bug as `step_export_fix.py`),
+and after detaching it, it still didn't export. More investigation needed.
+
+**False lead 3: Spurious parent on the re-imported Solid.**
+After the round-trip, `b3d_solid.parent` was a phantom Compound wrapper
+from the OCCT translator. Severed with `b3d_solid.parent = None`. Still
+didn't fix the export. The Solid was now parentless when added to the
+assembly, which caused it to appear in the tree but still be skipped by
+the exporter.
+
+**The breakthrough: reading `_create_xde` source directly.**
+Added a diagnostic to `step_export_fix.py` that used `pkgutil.walk_packages`
+to search all of `build123d`'s submodules for `_create_xde` and print its
+source. Found it in `build123d.exporters3d`. The critical section:
+
+```python
+for node in PreOrderIter(to_export):
+    if node.wrapped is None:
+        continue
+    parent = getattr(node, "parent", None)
+    if parent is None:
+        node_label = shape_tool.AddShape(node.wrapped, False)
+    else:
+        parent_label = label_map.get(parent, TDF_Label())
+        parent_label = resolve_component_parent_label(parent_label)
+        if parent_label.IsNull():
+            continue          # ← THIS is where new_part was silently dropped
+        node_label = shape_tool.AddComponent(parent_label, node.wrapped)
+```
+
+**The actual root cause:** `new_assembly` was created as an EMPTY
+`TopoDS_Compound` (via `BRep_Builder.MakeCompound()` with nothing added).
+When `_create_xde` called `shape_tool.AddShape(empty_compound, False)`,
+OCCT's ShapeTool returned a **null label** for an empty compound -- it has
+no sub-shapes to register. This null label was stored in `label_map`.
+When `new_part` was processed next, it looked up `label_map[new_assembly]`
+= null label → `parent_label.IsNull()` = True → **silently skipped.**
+
+The assembly tree was completely correct. The node diagnostics showed
+`new_part` with `type=Solid`, `parent='assembly'`, `wrapped=TopoDS_Solid`
+-- indistinguishable from any imported part. The bug was entirely inside
+`_create_xde`'s handling of the parent label lookup.
+
+### The fix
+
+After adding a new part via `_on_part_created`, call `_rebuild_ancestors()`
+which walks up the anytree hierarchy and rebuilds each ancestor Compound's
+`_wrapped` to be a `TopoDS_Compound` containing ALL its descendants'
+shapes:
+
+```python
+def _rebuild_ancestors(self, node):
+    from build123d import Compound
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Compound
+    from anytree import PreOrderIter
+
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, Compound):
+            builder = BRep_Builder()
+            compound = TopoDS_Compound()
+            builder.MakeCompound(compound)
+            for desc in PreOrderIter(parent):
+                if desc is parent:
+                    continue
+                w = getattr(desc, '_wrapped', None)
+                if w is not None:
+                    try:
+                        builder.Add(compound, w)
+                    except Exception:
+                        pass
+            parent._wrapped = compound
+        parent = parent.parent
+```
+
+This ensures `shape_tool.AddShape(compound, False)` receives a compound
+with real sub-shapes, returns a valid (non-null) label, and `_create_xde`
+can then successfully register all child nodes under it.
+
+### Key lessons
+
+1. **`shape_tool.AddShape()` returns a null label for empty TopoDS_Compound.**
+   Any Compound node in the anytree hierarchy whose `_wrapped` is an empty
+   compound will silently cause ALL its descendants to be skipped in the
+   STEP export. This is not an error -- OCCT just has nothing to register.
+
+2. **The node diagnostics (PreOrderIter printout before export) was
+   misleading.** Everything looked correct in the tree. The bug was not
+   in the tree structure but in how OCCT's ShapeTool handled the wrapped
+   shape. Always check BOTH the tree structure AND the XDE label map when
+   debugging STEP export issues.
+
+3. **`Shape.cast()` does not work on raw `TopoDS_Shape` objects from OCCT
+   operations like `BRepPrimAPI_MakePrism`.** It returns `None`. Use
+   `Solid(TopoDS_Shape)` directly for wrapping raw OCCT shapes.
+
+4. **build123d's `_create_xde` is in `build123d.exporters3d`**, not
+   `build123d.exporters`. Use `pkgutil.walk_packages` to search for it
+   when debugging export issues.
+
+5. **The round-trip through a temporary STEP file is unnecessary** once
+   the ancestor `_wrapped` is properly rebuilt. `Solid(TopoDS_Shape)` is
+   sufficient for the new part itself -- the problem was always in the
+   parent Compound, not the Solid.
+
+### Files changed
+- `gui/main_app.py` -- added `_rebuild_ancestors()` called from
+  `_on_part_created()`; also `_on_part_cut()` should call it after
+  cut to keep exported geometry up to date.
+- `src/step_export_fix.py` -- cleaned up (all diagnostics removed);
+  remains a one-line fix for the spurious root parent bug.
+- `gui/workplane_dialog.py` -- restored `_extrude()` method (was
+  accidentally dropped during Cut/Mill refactor).
