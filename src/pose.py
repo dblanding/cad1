@@ -729,44 +729,80 @@ def compute_step1_move(pick1, pick2, mate: bool = True):
     # Target normal for the moving face after step 1
     target_N1 = -N2 if mate else N2
 
-    # Check if already aligned
-    dot = N1.dot(target_N1)
-    if abs(dot - 1.0) < 1e-6:
-        # Already flush -- just close the gap (translation only)
+    print(f"[Step1] N1={N1}  N2={N2}  mate={mate}  target={target_N1}")
+    print(f"[Step1] N1·target={N1.dot(target_N1):.6f}  N1·N2={N1.dot(N2):.6f}")
+
+    result = find_intersection_line(P1, N1, P2, N2)
+
+    if result is None:
+        # Planes are parallel (N1 ∥ N2).
+        # Two sub-cases:
+        #   a) N1 ≈ -N2 (already opposed): mate = just translate to close gap.
+        #                                  align = 180° rotation + translate.
+        #   b) N1 ≈ +N2 (same direction):  mate = 180° rotation + translate.
+        #                                  align = just translate to close gap.
+        gap = (P2 - P1).dot(N2)
+        tv = N2 * gap
+        trans_trsf = gp_Trsf()
+        trans_trsf.SetTranslation(gp_Vec(tv.X, tv.Y, tv.Z))
+        trans_loc = Location(trans_trsf)
+
+        # Check if a 180° rotation is needed
+        needs_rotation = (mate and N1.dot(N2) > 0) or \
+                         (not mate and N1.dot(N2) < 0)
+
+        if not needs_rotation:
+            return trans_loc
+
+        # 180° rotation about an axis perpendicular to N1, through P1
+        arbitrary = Vector(1, 0, 0) if abs(N1.dot(Vector(1, 0, 0))) < 0.9 \
+            else Vector(0, 1, 0)
+        rot_axis = N1.cross(arbitrary).normalized()
+        ax = gp_Ax1(
+            gp_Pnt(P1.X, P1.Y, P1.Z),
+            gp_Dir(rot_axis.X, rot_axis.Y, rot_axis.Z)
+        )
+        rot_trsf = gp_Trsf()
+        rot_trsf.SetRotation(ax, math.pi)
+        rot_loc = Location(rot_trsf)
+        # Apply rotation first, then translation
+        return trans_loc * rot_loc
+
+    L_point, L_dir = result
+
+    # Angle to rotate: from N1 to target_N1
+    cross = N1.cross(target_N1)
+    sin_a = cross.length
+    cos_a = N1.dot(target_N1)
+    angle = math.atan2(sin_a, cos_a)
+
+    if abs(angle) < 1e-6:
+        # N1 already equals target_N1 -- just close the gap with translation
         gap = (P2 - P1).dot(target_N1)
         tv = target_N1 * gap
         t = gp_Trsf()
         t.SetTranslation(gp_Vec(tv.X, tv.Y, tv.Z))
         return Location(t)
 
-    result = find_intersection_line(P1, N1, P2, N2)
-
-    if result is None:
-        # Planes are parallel -- pure translation along normal
-        gap = (P2 - P1).dot(target_N1)
-        if mate:
-            # For mate, gap should bring faces together (opposed normals)
-            # The signed distance from P1 to plane 2 along N2
-            gap = (P2 - P1).dot(N2)
-            tv = N2 * gap
+    if sin_a < 1e-8:
+        # N1 ≈ -target_N1: 180° rotation needed. L_dir from find_intersection_line
+        # may be unreliable; use it if available, otherwise pick an arbitrary
+        # perpendicular axis.
+        if result is not None:
+            L_point, L_dir = result
         else:
-            gap = (P2 - P1).dot(N2)
-            tv = N2 * gap
+            # Parallel planes, 180° needed -- pick axis perpendicular to N1
+            arbitrary = Vector(1, 0, 0) if abs(N1.dot(Vector(1,0,0))) < 0.9 \
+                else Vector(0, 1, 0)
+            L_dir = N1.cross(arbitrary).normalized()
+            L_point = P1
+        ax = gp_Ax1(
+            gp_Pnt(L_point.X, L_point.Y, L_point.Z),
+            gp_Dir(L_dir.X, L_dir.Y, L_dir.Z)
+        )
         t = gp_Trsf()
-        t.SetTranslation(gp_Vec(tv.X, tv.Y, tv.Z))
+        t.SetRotation(ax, math.pi)
         return Location(t)
-
-    L_point, L_dir = result
-
-    # Angle to rotate: from N1 to target_N1
-    # Use atan2 with the cross product for sign correctness
-    cross = N1.cross(target_N1)
-    sin_a = cross.length
-    cos_a = N1.dot(target_N1)
-    angle = math.atan2(sin_a, cos_a)
-
-    if abs(angle) < 1e-8:
-        return Location(gp_Trsf())  # identity
 
     # Rotation axis: L_dir, but we need the sign correct so rotation
     # goes the right way. The cross product N1 × target_N1 gives the
@@ -785,65 +821,12 @@ def compute_step1_move(pick1, pick2, mate: bool = True):
 
 def compute_step2_move(pick1, pick2, mated_normal: Vector):
     """
-    Step 2 of the 3-2-1 workflow: translate the moving part within the
-    flush plane (no rotation) to align an edge or hole axis.
-
-    The part must already be flush from Step 1. This step only moves
-    the part within the mated plane -- any component along the plane
-    normal is ignored to preserve the Step 1 result.
-
-    Two sub-cases (same math, different geometry):
-      a) Edge-to-edge: pick1 = edge on moving part, pick2 = edge on fixed.
-         Translate perpendicular to the edges (within the plane) until
-         the edges are coplanar. Leaves translation along edge direction.
-      b) Hole-to-hole: pick1 = circle center on moving, pick2 = circle
-         center on fixed. Translate until centers coincide (projected
-         onto the mated plane). Leaves rotation about the normal.
-
-    In both cases the math is: translate by the component of
-    (P2 - P1) that lies IN the mated plane.
+    Step 2: rotate within the mated plane until faces are coplanar with the
+    wall (D1_in_plane anti-parallel to D2_in_plane), then translate along
+    D2 to close the gap. Consumes 2 DOF; leaves 1 (along-wall translation).
     """
     from build123d import Location
-    from OCP.gp import gp_Trsf, gp_Vec
-
-    P1 = pick1.point
-    P2 = pick2.point
-    N  = mated_normal.normalized()
-
-    # Full vector from moving feature to fixed feature
-    delta = P2 - P1
-
-    # Remove the normal component -- only move within the plane
-    delta_in_plane = delta - N * delta.dot(N)
-
-    t = gp_Trsf()
-    t.SetTranslation(gp_Vec(
-        delta_in_plane.X,
-        delta_in_plane.Y,
-        delta_in_plane.Z
-    ))
-    return Location(t)
-
-
-def compute_step3_move(pick1, pick2, mated_normal: Vector):
-    """
-    Step 3 of the 3-2-1 workflow: remove the last remaining DOF.
-
-    Two sub-cases:
-      a) After edge-to-edge Step 2: translate along the edge direction
-         (the last remaining DOF) to shove the part into the corner.
-         Same as Step 2 math -- project delta onto the plane.
-      b) After hole-to-hole Step 2: rotate about the mated normal to
-         index to the correct angle. Pick an edge or reference direction
-         on the moving part and a corresponding one on the fixed part;
-         rotate within the plane until they're parallel.
-
-    The dialog will need to distinguish the two sub-cases. For now both
-    are implemented as in-plane translation (case a); case b (rotation
-    about normal) is a separate path.
-    """
-    from build123d import Location
-    from OCP.gp import gp_Trsf, gp_Vec
+    from OCP.gp import gp_Trsf, gp_Vec, gp_Ax1, gp_Dir, gp_Pnt
     import math
 
     P1 = pick1.point
@@ -853,36 +836,127 @@ def compute_step3_move(pick1, pick2, mated_normal: Vector):
     N  = mated_normal.normalized()
 
     if D1 is not None and D2 is not None:
-        # Check if this is a rotation case: directions are in the plane
-        # and not parallel -- rotate about normal to align them.
-        d1_in_plane = (D1 - N * D1.dot(N)).normalized() if (D1 - N * D1.dot(N)).length > 1e-6 else None
-        d2_in_plane = (D2 - N * D2.dot(N)).normalized() if (D2 - N * D2.dot(N)).length > 1e-6 else None
+        # Project directions onto the mated plane
+        d1_proj = (D1 - N * D1.dot(N))
+        d2_proj = (D2 - N * D2.dot(N))
 
-        if d1_in_plane is not None and d2_in_plane is not None:
-            cross = d1_in_plane.cross(d2_in_plane)
-            sin_a = cross.length
-            cos_a = d1_in_plane.dot(d2_in_plane)
-            angle = math.atan2(sin_a, cos_a)
+        if d1_proj.length < 1e-6 or d2_proj.length < 1e-6:
+            delta = P2 - P1
+            delta_in_plane = delta - N * delta.dot(N)
+            t = gp_Trsf()
+            t.SetTranslation(gp_Vec(delta_in_plane.X, delta_in_plane.Y,
+                                    delta_in_plane.Z))
+            return Location(t)
 
-            if abs(angle) > 1e-6:
-                from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt
-                # Rotation about mated normal through P1 (the reference point)
-                sign = 1.0 if cross.dot(N) > 0 else -1.0
-                ax = gp_Ax1(
-                    gp_Pnt(P1.X, P1.Y, P1.Z),
-                    gp_Dir(N.X * sign, N.Y * sign, N.Z * sign)
-                )
-                t = gp_Trsf()
-                t.SetRotation(ax, angle)
-                return Location(t)
+        d1_proj = d1_proj.normalized()
+        d2_proj = d2_proj.normalized()
 
-    # Translation case: project delta onto the plane (same as Step 2)
+        # Target: rotating to make faces COPLANAR means d1_proj should
+        # become PARALLEL to d2_proj (both pointing away from the interface).
+        # Anti-parallel would Mate the faces (pull them together facing each
+        # other) -- we want Align (same direction = faces become coplanar,
+        # like sliding a block against a wall where both outward normals
+        # point the same way once flush).
+        target = d2_proj
+        dot = max(-1.0, min(1.0, d1_proj.dot(target)))
+        angle = math.acos(dot)
+        cross = d1_proj.cross(target)
+        sign = 1.0 if cross.dot(N) > 0 else -1.0
+
+        rot_trsf = gp_Trsf()
+        if abs(angle) > 1e-6:
+            ax = gp_Ax1(
+                gp_Pnt(P1.X, P1.Y, P1.Z),
+                gp_Dir(N.X * sign, N.Y * sign, N.Z * sign)
+            )
+            rot_trsf.SetRotation(ax, angle)
+        rot_loc = Location(rot_trsf)
+
+        # Translate along D2 direction (wall normal in-plane) to close gap
+        delta = P2 - P1
+        delta_in_plane = delta - N * delta.dot(N)
+        d2_in_plane = (D2 - N * D2.dot(N))
+        if d2_in_plane.length > 1e-6:
+            d2_in_plane = d2_in_plane.normalized()
+            delta_perp = d2_in_plane * delta_in_plane.dot(d2_in_plane)
+        else:
+            delta_perp = delta_in_plane
+
+        print(f"[Step2] D1={D1}  D2={D2}  N={N}")
+        print(f"[Step2] d1_proj={d1_proj}  d2_proj={d2_proj}  target={target}")
+        print(f"[Step2] angle={math.degrees(angle):.1f}deg  "
+              f"delta_perp={delta_perp}  len={delta_perp.length:.3f}")
+
+        trans_trsf = gp_Trsf()
+        if delta_perp.length > 1e-6:
+            trans_trsf.SetTranslation(
+                gp_Vec(delta_perp.X, delta_perp.Y, delta_perp.Z))
+        trans_loc = Location(trans_trsf)
+        return trans_loc * rot_loc
+
+    else:
+        # Hole-to-hole: in-plane translation only
+        delta = P2 - P1
+        delta_in_plane = delta - N * delta.dot(N)
+        t = gp_Trsf()
+        t.SetTranslation(gp_Vec(delta_in_plane.X, delta_in_plane.Y,
+                                delta_in_plane.Z))
+        return Location(t)
+
+
+def compute_step3_move(pick1, pick2, mated_normal: Vector,
+                       wall_normal: "Optional[Vector]" = None):
+    """
+    Step 3 of the 3-2-1 workflow: remove the LAST remaining DOF.
+
+    After Steps 1 and 2:
+      - Step 1 established the mated plane (normal = mated_normal)
+      - Step 2 established the wall plane (normal = wall_normal in-plane)
+
+    The only remaining motion is translation along the LINE that is the
+    intersection of the mated plane and the wall plane:
+        free_dir = mated_normal × wall_normal
+
+    Step 3 translates the moving part along free_dir by the component
+    of (P2 - P1) in that direction. No other motion is permitted --
+    doing so would violate Steps 1 or 2.
+
+    If wall_normal is None (Step 2 was skipped or used hole-to-hole),
+    falls back to full in-plane translation.
+    """
+    from build123d import Location
+    from OCP.gp import gp_Trsf, gp_Vec
+
+    P1 = pick1.point
+    P2 = pick2.point
+    N  = mated_normal.normalized()
+
     delta = P2 - P1
-    delta_in_plane = delta - N * delta.dot(N)
+
+    if wall_normal is not None:
+        # Compute the single free direction: intersection of mated plane and wall plane
+        W = wall_normal.normalized()
+        free_dir = N.cross(W)
+        if free_dir.length < 1e-6:
+            # mated_normal and wall_normal are parallel -- degenerate, use in-plane
+            free_dir = None
+        else:
+            free_dir = free_dir.normalized()
+    else:
+        free_dir = None
+
+    if free_dir is not None:
+        # Project delta onto the single free direction only
+        translation = free_dir * delta.dot(free_dir)
+        print(f"[Step3] free_dir={free_dir}  delta={delta}  "
+              f"translation={translation}  len={translation.length:.3f}")
+    else:
+        # Fallback: translate within the mated plane
+        translation = delta - N * delta.dot(N)
+        print(f"[Step3] fallback in-plane translation={translation}")
+
     t = gp_Trsf()
-    t.SetTranslation(gp_Vec(
-        delta_in_plane.X,
-        delta_in_plane.Y,
-        delta_in_plane.Z
-    ))
+    if translation.length > 1e-6:
+        t.SetTranslation(gp_Vec(translation.X, translation.Y, translation.Z))
     return Location(t)
+

@@ -286,6 +286,39 @@ if move1 is not None:
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Test 12: compute_step2_move edge-to-edge WITH rotation
+# ---------------------------------------------------------------------------
+print("\n--- Test 12: compute_step2_move, edge-to-edge with rotation ---")
+
+# Block mated flat on table (mated_normal = Z).
+# Block's side edge points in X direction.
+# Wall edge points in Y direction.
+# Step 2 should: rotate 90° about Z, then translate to wall.
+mated_N = Vector(0, 0, 1)
+pick1 = make_pick((0, 0, 0), (1, 0, 0))   # moving: edge in X direction
+pick2 = make_pick((5, 0, 0), (0, 1, 0))   # fixed:  wall edge in Y direction
+
+move = compute_step2_move(pick1, pick2, mated_N)
+check("move is not None", move is not None)
+
+if move is not None:
+    # After move, the X edge should point in Y direction
+    new_dir = apply_to_dir(move, Vector(1, 0, 0))
+    check("edge rotated to Y direction",
+          vec_close(new_dir, Vector(0, 1, 0)) or vec_close(new_dir, Vector(0, -1, 0)),
+          f"new_dir={new_dir}")
+    # The normal (Z) should be unchanged
+    new_N = apply_to_dir(move, Vector(0, 0, 1))
+    check("mated normal Z preserved", vec_close(new_N, Vector(0, 0, 1)),
+          f"new_N={new_N}")
+    # Point should have moved toward wall (X=5), perpendicular to edge
+    new_P = apply_to_point(move, Vector(0, 0, 0))
+    check("translated toward wall (X≈5)", abs(new_P.X - 5) < 1e-3,
+          f"new_P={new_P}")
+
+
 print(f"\n{'='*50}")
 print(f"Results: {n_pass} passed, {n_fail} failed out of {n_pass+n_fail} checks")
 if n_fail == 0:

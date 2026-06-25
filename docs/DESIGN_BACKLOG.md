@@ -1268,3 +1268,104 @@ Three distinct sections (not radio buttons):
 - The `_world_move_to_local` transform (already in the dialog) is
   still needed since picks are in world space but `node.move()`
   operates in parent-local space.
+
+---
+
+## 18. 3-2-1 Positioning Dialog Redesign (COMPLETE)
+
+**Status: COMPLETE.** All three steps working correctly including the
+parallel-planes Mate case that previously required Reverse.
+
+### What was built
+
+**New `gui/position_dialog.py`** -- converted from `QDockWidget` to
+`QDialog` (proper OS resize handles, normal window decorations).
+
+Three sections:
+
+**Section 1 -- Mate/Align (3-2-1), one column:**
+- Step 1 — Mate: pick face on moving, pick face on fixed. Rotates
+  about intersection line until flush. Reverse toggles mate↔align.
+- Step 2 — Align Face: pick face on moving, pick face on fixed.
+  Rotates within mated plane + translates to wall. Face type
+  (flat/cylindrical) detected automatically.
+- Step 3 — Complete: pick any face on moving, any face on fixed.
+  Translates along the single remaining free direction only
+  (mated_normal × wall_normal). Steps 1 and 2 preserved exactly.
+
+**Section 2 -- Align Axis:** single 4-DOF step.
+
+**Section 3 -- Dynamic:** AIS manipulator gizmo.
+
+**New state stored between steps:**
+- `_mated_normal`: set from Step 1's pick2 direction. Used by Steps
+  2 and 3 to constrain moves to the mated plane.
+- `_wall_normal`: set from Step 2's pick2 direction projected onto
+  the mated plane. Used by Step 3 to find the single free direction.
+
+### New math in `src/pose.py`
+
+`find_intersection_line(P1, N1, P2, N2)`:
+- Returns `(point, direction)` or `None` if planes are parallel.
+
+`compute_step1_move(pick1, pick2, mate)`:
+- Rotates about the intersection line of the two face planes.
+- **Fixed parallel-planes case:** when N1 ∥ N2, four sub-cases:
+  - N1 ≈ +N2, mate → 180° rotation + translation (was broken: gave
+    pure translation only, same result as align)
+  - N1 ≈ +N2, align → pure translation
+  - N1 ≈ -N2, mate → pure translation
+  - N1 ≈ -N2, align → 180° rotation + translation
+
+`compute_step2_move(pick1, pick2, mated_normal)`:
+- Projects D1 and D2 onto the mated plane.
+- Rotates about mated_normal until D1_in_plane ∥ D2_in_plane
+  (target = d2_proj, not -d2_proj -- parallel not anti-parallel).
+- Translates by delta projected onto D2 direction (wall normal).
+
+`compute_step3_move(pick1, pick2, mated_normal, wall_normal)`:
+- free_dir = mated_normal × wall_normal (the single remaining DOF).
+- Translates only along free_dir by delta·free_dir.
+- No other motion -- Steps 1 and 2 preserved exactly.
+
+### Bugs found and fixed
+
+**Bug 1: Step 2 used anti-parallel target instead of parallel.**
+`target = -d2_proj` rotated moving face to Mate with wall (normals
+opposed) instead of Align (normals same). Fixed to `target = d2_proj`.
+
+**Bug 2: Step 3 spoiled Step 2.**
+`compute_step3_move` only knew about the mated plane normal, not the
+wall normal. It could translate in any in-plane direction, including
+perpendicular to the wall (undoing Step 2). Fixed by passing
+`wall_normal` and computing `free_dir = N × W`.
+
+**Bug 3: Reverse for Step 1 gave identity when N1 ≈ N2.**
+When the moving and fixed faces start parallel (N1 ≈ N2), the
+parallel-planes branch gave the SAME pure translation for both mate
+and align -- the 180° flip for mate was missing entirely. Root cause:
+`find_intersection_line` correctly returns None for parallel planes,
+but the fallback only translated, never rotated.
+
+**Bug 4: Reverse mode toggle was correct but math was wrong.**
+Reverse correctly toggled mate↔align mode, but the underlying
+`compute_step1_move` produced the same result for both when N1 ≈ N2.
+Fixed in Bug 3's fix.
+
+### UX improvements
+
+- `QDialog` instead of `QDockWidget`: proper resize handles, normal
+  window title bar, stays on top.
+- Section 1 simplified from two-column (Mate/Align, Edge/Axis,
+  Edge/Angle) to single-column (Mate, Align Face, Complete).
+  Face type determines constraint type automatically.
+- Step 2 and Step 3 buttons greyed out until Step 1 is done.
+- Reverse toggles mate↔align for Step 1; flips pick2 direction for
+  Steps 2, 3, and Align Axis.
+- No "Start Step" button needed -- clicking a step button immediately
+  begins that step's pick sequence.
+
+### Smoke test update
+
+`src/position_math_smoke_test.py` updated with Test 12 (edge-to-edge
+with rotation). All 39 checks pass.

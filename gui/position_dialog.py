@@ -49,6 +49,7 @@ from enum import Enum, auto
 from typing import Optional
 
 from PySide6.QtWidgets import (
+    QDialog,
     QDockWidget,
     QWidget,
     QVBoxLayout,
@@ -59,6 +60,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QGroupBox,
     QFrame,
+    QScrollArea,
 )
 from PySide6.QtCore import Qt, Signal, QObject
 from PySide6.QtGui import QFont
@@ -66,7 +68,8 @@ from PySide6.QtGui import QFont
 from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from pose import PointRef, DirectionRef, Plane, compute_move, move_location_only  # noqa: E402
+from pose import (PointRef, DirectionRef, Plane, compute_move, move_location_only,  # noqa: E402
+    find_intersection_line, compute_step1_move, compute_step2_move, compute_step3_move)
 from build123d import Vector  # safe at module level -- pure geometry, no OCCT context dependency
 
 # Heavier build123d shape wrappers (Face, Edge, GeomType) are imported
@@ -332,49 +335,58 @@ def compute_dynamic_move(pick1: PickResult, pick2: PickResult):
 # The dialog widget itself
 # ---------------------------------------------------------------------------
 
-class PositionDialog(QDockWidget):
+class PositionDialog(QDialog):
     """
-    The Mate/Align positioning dialog. Opens as a dock alongside the
-    main window. When open, puts the viewport in "positioning mode"
-    where clicks feed into this dialog's state machine rather than
-    the normal tree-sync behavior.
+    Positioning dialog with three distinct sections:
 
-    Connects to MainWindow via:
-        - MainWindow calls set_moving_node(node) when a tree row is
-          selected while the dialog is open.
-        - MainWindow calls receive_pick(raw_shape, shape_type) when
-          the viewport has a pick in positioning mode.
-        - This dialog emits request_redisplay(node) when a move has
-          been applied, so MainWindow can refresh the viewport.
-        - This dialog emits positioning_done() when the user closes
-          or clicks Apply, so MainWindow can exit positioning mode.
+    SECTION 1: Mate/Align (3-2-1)
+      Step 1 -- Rotate to flush: rotate moving part about the
+                intersection line of the two face planes.
+      Step 2 -- In-plane constraint: translate within the flush
+                plane (no rotation). Edge or axis pick.
+      Step 3 -- Last DOF: translate or rotate to remove final DOF.
+      The mated_normal from Step 1 is remembered so Steps 2+3
+      correctly constrain moves to the plane.
+
+    SECTION 2: Align Axis
+      Single step: aligns cylinder/circle axis (4 DOF).
+
+    SECTION 3: Dynamic
+      AIS manipulator gizmo for rough positioning.
+
+    Each section has its own buttons and status area.
+    All three share the same Back (undo) and Done buttons.
     """
 
-    request_redisplay = Signal(object)  # node that moved
-    positioning_done = Signal()
+    request_redisplay = Signal(object)
+    positioning_done  = Signal()
 
     def __init__(self, parent=None, viewport=None):
-        super().__init__("Position", parent)
-        self.setAllowedAreas(
-            Qt.DockWidgetArea.LeftDockWidgetArea |
-            Qt.DockWidgetArea.RightDockWidgetArea
+        super().__init__(parent)
+        self.setWindowTitle("Position")
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetMovable |
-            QDockWidget.DockWidgetFeature.DockWidgetFloatable
-        )
+        self.resize(300, 580)
+        self.setMinimumWidth(260)
+        self.setMinimumHeight(480)
 
-        self._viewport = viewport     # SyncedViewportWidget, for manipulator
-        self._moving_node = None      # the tree-selected node being positioned
-        self._state = PositionState.IDLE
-        self._constraint_type = ConstraintType.MATE
+        self._viewport      = viewport
+        self._moving_node   = None
+        self._state         = PositionState.IDLE
         self._pick1: Optional[PickResult] = None
         self._pick2: Optional[PickResult] = None
-        self._move_history = []       # list of applied Locations (for Back)
-        # Last applied step -- kept so Reverse can undo + re-apply flipped.
+        self._move_history  = []           # list of applied Locations
+        self._mated_normal: Optional[Vector] = None   # set by Step 1
+        self._wall_normal: Optional[Vector] = None    # set by Step 2 (D2 in-plane)
+        self._active_section = "mate_align"  # "mate_align" | "align_axis" | "dynamic"
+        self._active_step    = None          # "step1" | "step2" | "step3" | "axis" | "dynamic"
+        self._step1_mode     = "mate"        # "mate" | "align"
+        # For Reverse:
         self._last_pick1: Optional[PickResult] = None
         self._last_pick2: Optional[PickResult] = None
-        self._last_constraint_type: Optional[ConstraintType] = None
+        self._last_step:  Optional[str]        = None
 
         self._build_ui()
 
@@ -383,140 +395,149 @@ class PositionDialog(QDockWidget):
     # -----------------------------------------------------------------------
 
     def _build_ui(self):
-        root = QWidget()
-        self.setWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setSpacing(8)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+        layout.setContentsMargins(6, 6, 6, 6)
 
         # --- Moving part display ----------------------------------------
         moving_box = QGroupBox("Moving part / assembly")
-        moving_layout = QVBoxLayout(moving_box)
+        ml = QVBoxLayout(moving_box)
         self._moving_label = QLabel("(select a row in the tree)")
         self._moving_label.setWordWrap(True)
-        font = QFont()
-        font.setBold(True)
-        self._moving_label.setFont(font)
-        moving_layout.addWidget(self._moving_label)
+        f = QFont(); f.setBold(True)
+        self._moving_label.setFont(f)
+        ml.addWidget(self._moving_label)
         layout.addWidget(moving_box)
 
-        # --- Constraint type radio buttons ------------------------------
-        method_box = QGroupBox("Method")
-        method_layout = QVBoxLayout(method_box)
-        self._method_group = QButtonGroup(self)
+        # ================================================================
+        # SECTION 1: Mate / Align  (3-2-1)
+        # ================================================================
+        sec1 = QGroupBox("1 — Mate / Align  (3-2-1)")
+        sec1_layout = QVBoxLayout(sec1)
 
-        for i, ct in enumerate([ConstraintType.MATE, ConstraintType.ALIGN,
-                   ConstraintType.ALIGN_AXIS, ConstraintType.DYNAMIC]):
-            rb = QRadioButton(ct.value)
-            if ct == ConstraintType.MATE:
-                rb.setChecked(True)
-            self._method_group.addButton(rb, i)
-            rb.toggled.connect(lambda checked, c=ct: self._on_method_changed(c) if checked else None)
-            method_layout.addWidget(rb)
+        self._step1_mate_btn = QPushButton("Step 1 — Mate")
+        self._step1_mate_btn.setToolTip(
+            "Pick a face on the MOVING part, then a face on the fixed part.\n"
+            "Rotates about the intersection line until faces are flush.\n"
+            "Use Reverse if the part flips the wrong way (Align).")
+        self._step1_mate_btn.clicked.connect(
+            lambda: self._start_step("step1", "mate"))
+        sec1_layout.addWidget(self._step1_mate_btn)
 
-        layout.addWidget(method_box)
+        self._step2_edge_btn = QPushButton("Step 2 — Align Face")
+        self._step2_edge_btn.setToolTip(
+            "Pick a face on the MOVING part, then a face on the fixed part.\n"
+            "Rotates and translates within the mated plane until coplanar.\n"
+            "Flat face → wall/corner constraint.\n"
+            "Cylindrical face → hole axis constraint.\n"
+            "Detected automatically from the face type picked.")
+        self._step2_edge_btn.clicked.connect(
+            lambda: self._start_step("step2", "edge"))
+        sec1_layout.addWidget(self._step2_edge_btn)
 
-        # --- Status / prompt display ------------------------------------
+        self._step3_edge_btn = QPushButton("Step 3 — Complete")
+        self._step3_edge_btn.setToolTip(
+            "Pick a face on the MOVING part, then a face on the fixed part.\n"
+            "Translates along the single remaining free direction only.\n"
+            "Steps 1 and 2 constraints are preserved exactly.")
+        self._step3_edge_btn.clicked.connect(
+            lambda: self._start_step("step3", "edge"))
+        sec1_layout.addWidget(self._step3_edge_btn)
+
+        layout.addWidget(sec1)
+
+        # Unused button refs (kept so _update_ui_state doesn't crash)
+        self._step1_align_btn = None
+        self._step2_axis_btn  = None
+        self._step3_angle_btn = None
+        # ================================================================
+        # SECTION 2: Align Axis
+        # ================================================================
+        sec2 = QGroupBox("2 — Align Axis")
+        sec2_layout = QVBoxLayout(sec2)
+        self._axis_btn = QPushButton("Align Axis (4 DOF)")
+        self._axis_btn.setToolTip(
+            "Pick cylinder/circle on moving part, then on fixed part.\n"
+            "Aligns both position and direction of the axis.")
+        self._axis_btn.clicked.connect(
+            lambda: self._start_step("axis", None))
+        sec2_layout.addWidget(self._axis_btn)
+        layout.addWidget(sec2)
+
+        # ================================================================
+        # SECTION 3: Dynamic
+        # ================================================================
+        sec3 = QGroupBox("3 — Dynamic (AIS Manipulator)")
+        sec3_layout = QVBoxLayout(sec3)
+        self._dynamic_btn = QPushButton("Attach Manipulator")
+        self._dynamic_btn.clicked.connect(self._on_dynamic)
+        sec3_layout.addWidget(self._dynamic_btn)
+        layout.addWidget(sec3)
+
+        # ================================================================
+        # Status / picks (shared)
+        # ================================================================
         status_box = QGroupBox("Status")
-        status_layout = QVBoxLayout(status_box)
-        self._status_label = QLabel("Choose a method and click\n'Start Step' to begin.")
+        sl = QVBoxLayout(status_box)
+        self._status_label = QLabel("Select a row in the tree,\nthen use a step button above.")
         self._status_label.setWordWrap(True)
-        self._status_label.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self._status_label.setMinimumHeight(80)
-        status_layout.addWidget(self._status_label)
-        layout.addWidget(status_box)
-
-        # --- Pick display -----------------------------------------------
-        picks_box = QGroupBox("Picks")
-        picks_layout = QVBoxLayout(picks_box)
+        self._status_label.setMinimumHeight(70)
+        sl.addWidget(self._status_label)
         self._pick1_label = QLabel("Pick 1 (moving): —")
         self._pick1_label.setWordWrap(True)
         self._pick2_label = QLabel("Pick 2 (fixed):  —")
         self._pick2_label.setWordWrap(True)
-        picks_layout.addWidget(self._pick1_label)
-        picks_layout.addWidget(self._pick2_label)
-        layout.addWidget(picks_box)
+        sl.addWidget(self._pick1_label)
+        sl.addWidget(self._pick2_label)
+        layout.addWidget(status_box)
 
-        # Separator
+        # ================================================================
+        # Shared action buttons
+        # ================================================================
         line = QFrame()
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
         layout.addWidget(line)
 
-        # --- Reverse / Re-apply -----------------------------------------
-        # The "Reverse" button flips the normal direction of the LAST
-        # applied step and re-applies it -- exactly the CoCreate
-        # "Reverse" button described in the PTC docs. Useful when the
-        # part moved the right distance but in the wrong direction
-        # (e.g. Mate landed the bracket below the plate instead of on
-        # top of it). Works by undoing the last step and re-applying
-        # with the flipped direction, without requiring the user to
-        # re-pick both faces.
-        reverse_row = QHBoxLayout()
+        btn_row = QHBoxLayout()
         self._reverse_btn = QPushButton("Reverse")
         self._reverse_btn.setEnabled(False)
-        self._reverse_btn.setToolTip(
-            "Flip the direction of the last applied step\n"
-            "and re-apply it. Use when the part moved the\n"
-            "right amount but in the wrong direction."
-        )
+        self._reverse_btn.setToolTip("Re-apply last step with direction flipped.")
         self._reverse_btn.clicked.connect(self._on_reverse)
-        reverse_row.addWidget(self._reverse_btn)
-        layout.addLayout(reverse_row)
+        btn_row.addWidget(self._reverse_btn)
 
-        # --- Buttons ----------------------------------------------------
-        btn_layout = QVBoxLayout()
-
-        self._start_btn = QPushButton("Start Step")
-        self._start_btn.setToolTip(
-            "Begin a new constraint step.\n"
-            "Then click a face/edge/axis on the MOVING part,\n"
-            "then one on the FIXED target."
-        )
-        self._start_btn.clicked.connect(self._on_start)
-        btn_layout.addWidget(self._start_btn)
-
-        self._back_btn = QPushButton("Back (undo 1 step)")
+        self._back_btn = QPushButton("↩ Back")
         self._back_btn.setEnabled(False)
+        self._back_btn.setToolTip("Undo last applied step.")
         self._back_btn.clicked.connect(self._on_back)
-        btn_layout.addWidget(self._back_btn)
+        btn_row.addWidget(self._back_btn)
+        layout.addLayout(btn_row)
 
         self._done_btn = QPushButton("✓  Done")
+        f2 = QFont(); f2.setBold(True)
+        self._done_btn.setFont(f2)
         self._done_btn.clicked.connect(self._on_done)
-        font_done = QFont()
-        font_done.setBold(True)
-        self._done_btn.setFont(font_done)
-        btn_layout.addWidget(self._done_btn)
+        layout.addWidget(self._done_btn)
 
-        layout.addLayout(btn_layout)
         layout.addStretch()
-
         self._update_ui_state()
 
     # -----------------------------------------------------------------------
-    # External interface (called by MainWindow)
+    # External interface
     # -----------------------------------------------------------------------
 
     def set_moving_node(self, node):
-        """
-        Called by MainWindow whenever a tree row is selected while
-        this dialog is open. Sets the part/assembly to be moved.
-        """
         self._moving_node = node
         label = getattr(node, "label", "?") if node else "(none)"
         self._moving_label.setText(label)
         self._update_ui_state()
 
     def receive_pick(self, raw_shape, shape_type):
-        """
-        Called by MainWindow when the viewport has a pick while in
-        positioning mode. Routes the pick into the state machine.
-        """
         if self._state == PositionState.IDLE:
             return
-
         result = resolve_pick(raw_shape, shape_type)
         if result is None:
-            self._set_status("Could not resolve that pick -- try a face,\nedge, or vertex.")
+            self._set_status("Could not resolve that pick -- try a face or edge.")
             return
 
         if self._state == PositionState.WAITING_PICK1:
@@ -524,272 +545,114 @@ class PositionDialog(QDockWidget):
             self._pick1_label.setText(f"Pick 1 (moving): {result.label}")
             self._state = PositionState.WAITING_PICK2
             self._set_status(
-                f"✓ Moving reference: {result.label}\n\n"
-                f"Now click a face, edge, or axis on the\nFIXED target part."
+                f"✓ Moving: {result.label}\n\n"
+                f"Now pick the corresponding feature on the FIXED part."
             )
-
         elif self._state == PositionState.WAITING_PICK2:
             self._pick2 = result
             self._pick2_label.setText(f"Pick 2 (fixed):  {result.label}")
-            self._apply_current_step()
-
+            self._apply_step()
         self._update_ui_state()
 
+    def is_in_positioning_mode(self) -> bool:
+        return self._state not in (PositionState.IDLE, PositionState.DYNAMIC_MOVE)
+
     # -----------------------------------------------------------------------
-    # Button handlers
+    # Step dispatch
     # -----------------------------------------------------------------------
 
-    def _on_method_changed(self, constraint_type: ConstraintType):
-        self._constraint_type = constraint_type
-
-    def _on_start(self):
-        """Begin a new constraint step -- or attach manipulator for Dynamic Move."""
+    def _start_step(self, step: str, mode):
+        """Begin a two-pick step. step = "step1"|"step2"|"step3"|"axis"."""
         if self._moving_node is None:
-            self._set_status("Select the part or assembly to\nmove in the tree first.")
+            self._set_status("Select the part to move in the tree first.")
             return
+        if step in ("step2", "step3") and self._mated_normal is None:
+            self._set_status(
+                "Complete Step 1 (Mate or Align) first.\n"
+                "The mated plane normal is needed for Steps 2 and 3."
+            )
+            return
+
+        self._active_step = step
+        self._step1_mode  = mode  # "mate"|"align"|"edge"|"axis"|"angle"|None
         self._pick1 = None
         self._pick2 = None
         self._pick1_label.setText("Pick 1 (moving): —")
         self._pick2_label.setText("Pick 2 (fixed):  —")
+        self._state = PositionState.WAITING_PICK1
 
-        if self._constraint_type == ConstraintType.DYNAMIC:
-            # Dynamic Move: attach the AIS_Manipulator gizmo and let
-            # the user drag freely. No pick-pair state machine needed.
-            if self._viewport is not None:
-                ok = self._viewport.attach_manipulator(self._moving_node)
-                if ok:
-                    self._state = PositionState.DYNAMIC_MOVE
-                    self._set_status(
-                        f"Dynamic Move active on\n'{self._moving_node.label}'.\n\n"
-                        f"Drag the arrows (translate) or\n"
-                        f"rings (rotate) in the viewport.\n\n"
-                        f"Click '✓ Done' when finished."
-                    )
-                else:
-                    self._set_status("Could not attach manipulator.\nTry a different node.")
-            else:
-                self._set_status("No viewport connected.")
-        else:
-            self._state = PositionState.WAITING_PICK1
-            method_name = self._constraint_type.value
-            self._set_status(
-                f"{method_name}: click a face, edge, or\naxis on the MOVING part\n"
-                f"('{self._moving_node.label}' or any child)."
-            )
+        prompts = {
+            ("step1", "mate"):  "MATE — Step 1\nPick a face on the MOVING part.",
+            ("step1", "align"): "ALIGN — Step 1\nPick a face on the MOVING part.",
+            ("step2", "edge"):  "STEP 2 (Face→Wall)\nPick a FACE on the MOVING part.",
+            ("step2", "axis"):  "STEP 2 (Hole Axis)\nPick a hole/circle on the MOVING part.",
+            ("step3", "edge"):  "STEP 3 (Edge→Corner)\nPick an EDGE on the MOVING part.",
+            ("step3", "angle"): "STEP 3 (Index Angle)\nPick a reference EDGE on the MOVING part.",
+            ("axis",  None):    "ALIGN AXIS\nPick a cylinder/circle on the MOVING part.",
+        }
+        self._set_status(prompts.get((step, mode), "Pick on the MOVING part."))
         self._update_ui_state()
 
-    def _on_back(self):
-        """Undo the most recently applied move step."""
-        if not self._move_history or self._moving_node is None:
-            return
-
-        # Undo: apply the inverse of the last move.
-        last_move = self._move_history.pop()
-        try:
-            self._moving_node.move(last_move.inverse())
-            self.request_redisplay.emit(self._moving_node)
-        except Exception as e:
-            print(f"[position_dialog] Back failed: {e}")
-
-        # Clear last-step memory so Reverse is no longer available.
-        self._last_pick1 = None
-        self._last_pick2 = None
-        self._last_constraint_type = None
-
-        # Reset to idle, clear picks.
-        self._state = PositionState.IDLE
-        self._pick1 = None
-        self._pick2 = None
-        self._pick1_label.setText("Pick 1 (moving): —")
-        self._pick2_label.setText("Pick 2 (fixed):  —")
-        self._set_status("Step undone. Click 'Start Step' to\ncontinue positioning.")
-        self._update_ui_state()
-
-    def _on_reverse(self):
-        """
-        Undo the last applied step and re-apply it with the direction
-        reversed -- i.e. flip pick2's direction (and pick1's for Mate,
-        where both normals determine the orientation). Equivalent to
-        CoCreate's 'Reverse' button: use when the part moved the right
-        distance but ended up on the wrong side.
-        """
-        if not self._move_history or self._moving_node is None:
-            return
-        if self._last_pick1 is None or self._last_pick2 is None:
-            return
-
-        # Undo the last step first.
-        last_move = self._move_history.pop()
-        try:
-            self._moving_node.move(last_move.inverse())
-            self.request_redisplay.emit(self._moving_node)
-        except Exception as e:
-            print(f"[position_dialog] Reverse (undo phase) failed: {e}")
-            return
-
-        # Re-build picks with direction flipped on pick2 (and pick1
-        # for Mate, since Mate's orientation depends on both normals).
-        from dataclasses import replace
-        ct = self._last_constraint_type
-
-        if self._last_pick2.direction is not None:
-            flipped_pick2 = replace(
-                self._last_pick2,
-                direction=-self._last_pick2.direction
-            )
-        else:
-            flipped_pick2 = self._last_pick2
-
-        # For Mate, also flip pick1 so the faces re-oppose correctly.
-        if ct == ConstraintType.MATE and self._last_pick1.direction is not None:
-            flipped_pick1 = replace(
-                self._last_pick1,
-                direction=-self._last_pick1.direction
-            )
-        else:
-            flipped_pick1 = self._last_pick1
-
-        # Re-compute and apply with the flipped directions.
-        if ct == ConstraintType.MATE:
-            move = compute_mate_move(flipped_pick1, flipped_pick2)
-        elif ct == ConstraintType.ALIGN:
-            move = compute_align_move(flipped_pick1, flipped_pick2)
-        elif ct == ConstraintType.ALIGN_AXIS:
-            move = compute_align_axis_move(flipped_pick1, flipped_pick2)
-        else:
-            move = compute_dynamic_move(flipped_pick1, flipped_pick2)
-
-        if move is None:
-            self._set_status("Reverse: could not compute flipped move.")
-            return
-
-        try:
-            self._moving_node.move(move)
-            self._move_history.append(move)
-            # Update stored picks to the flipped versions so Reverse
-            # can be clicked again if needed.
-            self._last_pick1 = flipped_pick1
-            self._last_pick2 = flipped_pick2
-            self.request_redisplay.emit(self._moving_node)
-            self._set_status(
-                f"✓ {ct.value} reversed and re-applied.\n\n"
-                f"Click 'Reverse' again if still wrong,\n"
-                f"'Start Step' for the next constraint,\n"
-                f"or '✓ Done' when finished."
-            )
-        except Exception as e:
-            print(f"[position_dialog] Reverse (re-apply phase) failed: {e}")
-        self._update_ui_state()
-
-    def _on_done(self):
-        """Close the dialog and signal MainWindow to exit positioning mode."""
-        # If Dynamic Move was active, apply the manipulator's accumulated
-        # transform to the node before detaching.
-        if self._state == PositionState.DYNAMIC_MOVE and self._viewport is not None:
-            try:
-                world_move = self._viewport.get_manipulator_transform()
-                if world_move is not None and self._moving_node is not None:
-                    local_move = self._world_move_to_local(world_move)
-                    self._moving_node.move(local_move)
-                    self.request_redisplay.emit(self._moving_node)
-            except Exception as e:
-                print(f"[position_dialog] applying dynamic move transform failed: {e}")
-            self._viewport.detach_manipulator()
-
-        self._state = PositionState.IDLE
-        self._move_history.clear()
-        self.positioning_done.emit()
-
-    # -----------------------------------------------------------------------
-    # Move application
-    # -----------------------------------------------------------------------
-
-    def _world_move_to_local(self, move):
-        """
-        Convert a world-space Location (as computed from world-space
-        pick coordinates) into the moving node's parent-local frame.
-
-        WHY THIS IS NEEDED:
-        Pick coordinates from OCCT are always in world space. The move
-        computed from two world-space picks is therefore also in world
-        space. But Shape.move() applies the delta in the node's PARENT
-        frame -- which is the world frame only if the parent sits at
-        the origin. For deeply nested nodes (e.g. l-bracket inside
-        l-bracket-assembly inside as1), the parent frame is NOT the
-        world frame, and applying a world-space delta directly produces
-        the wrong result (confirmed: l-bracket moved to wrong position
-        while l-bracket-assembly, whose parent IS at origin, moved
-        correctly with the same code).
-
-        Fix: transform the world-space move into the parent's local
-        frame using the parent's global_location (world position).
-        If P is the parent's world location:
-            local_move = P.inverse() * world_move * P
-        This converts the move from "expressed in world frame" to
-        "expressed in parent's local frame."
-
-        If the node has no parent (top-level) or parent has identity
-        location, this is a no-op and the world-space move is used
-        directly (correct behavior for the simple case).
-        """
-        from build123d import Location
-        parent = getattr(self._moving_node, 'parent', None)
-        if parent is None:
-            return move
-        try:
-            parent_world = parent.global_location
-            # Check if parent is at origin (identity) -- skip transform
-            if parent_world.position == (0, 0, 0):
-                return move
-            # Transform: express world-space move in parent-local frame
-            return parent_world.inverse() * move * parent_world
-        except Exception as e:
-            print(f"[position_dialog] world_move_to_local failed: {e}, "
-                  f"using world-space move directly")
-            return move
-
-    def _apply_current_step(self):
-        """
-        Both picks are in -- compute and apply the move, then return
-        to IDLE ready for the next step.
-        """
+    def _apply_step(self):
+        """Both picks received -- compute and apply the move."""
         if self._moving_node is None or self._pick1 is None or self._pick2 is None:
             return
 
-        ct = self._constraint_type
-        if ct == ConstraintType.MATE:
-            move = compute_mate_move(self._pick1, self._pick2)
-        elif ct == ConstraintType.ALIGN:
-            move = compute_align_move(self._pick1, self._pick2)
-        elif ct == ConstraintType.ALIGN_AXIS:
+        step = self._active_step
+        mode = self._step1_mode
+        move = None
+
+        if step == "step1":
+            move = compute_step1_move(self._pick1, self._pick2,
+                                      mate=(mode == "mate"))
+            if move is not None:
+                # Remember the mated normal for Steps 2 and 3.
+                # After step1 the moving face normal should match -pick2.direction
+                # (for mate) or +pick2.direction (for align).
+                N2 = self._pick2.direction
+                if N2 is not None:
+                    self._mated_normal = -N2 if mode == "mate" else N2
+
+        elif step == "step2":
+            move = compute_step2_move(self._pick1, self._pick2,
+                                      self._mated_normal)
+            if move is not None:
+                # Remember the wall normal (D2 projected onto mated plane)
+                # so Step 3 can constrain motion to the single remaining DOF.
+                N = self._mated_normal.normalized()
+                D2 = self._pick2.direction
+                if D2 is not None:
+                    d2_in_plane = D2 - N * D2.dot(N)
+                    if d2_in_plane.length > 1e-6:
+                        self._wall_normal = d2_in_plane.normalized()
+
+        elif step == "step3":
+            move = compute_step3_move(self._pick1, self._pick2,
+                                      self._mated_normal,
+                                      self._wall_normal)
+
+        elif step == "axis":
             move = compute_align_axis_move(self._pick1, self._pick2)
-        elif ct == ConstraintType.DYNAMIC:
-            move = compute_dynamic_move(self._pick1, self._pick2)
-        else:
-            move = None
 
         if move is None:
-            self._set_status("Could not compute move from these\npicks. Try again.")
+            self._set_status("Could not compute move from these picks. Try again.")
             self._state = PositionState.IDLE
             return
 
-        # Convert world-space move to parent-local frame before applying.
         local_move = self._world_move_to_local(move)
-
+        print(f"[dialog debug] step={step} mode={mode} move={move} local_move={local_move}")
         try:
             self._moving_node.move(local_move)
             self._move_history.append(local_move)
-            # Remember the picks so Reverse can undo + re-apply flipped.
             self._last_pick1 = self._pick1
             self._last_pick2 = self._pick2
-            self._last_constraint_type = ct
+            self._last_step  = (step, mode)
             self.request_redisplay.emit(self._moving_node)
-            n_steps = len(self._move_history)
+            n = len(self._move_history)
             self._set_status(
-                f"✓ {ct.value} applied (step {n_steps}).\n\n"
-                f"Click 'Reverse' if the direction was wrong,\n"
-                f"'Start Step' for the next constraint,\n"
-                f"or '✓ Done' when finished."
+                f"✓ {step.upper()} ({mode}) applied (step {n}).\n\n"
+                f"Click Reverse if direction was wrong,\n"
+                f"or continue with next step."
             )
         except Exception as e:
             self._set_status(f"Move failed: {e}")
@@ -800,6 +663,160 @@ class PositionDialog(QDockWidget):
         self._pick2 = None
 
     # -----------------------------------------------------------------------
+    # Shared action handlers
+    # -----------------------------------------------------------------------
+
+    def _on_dynamic(self):
+        if self._moving_node is None:
+            self._set_status("Select the part to move in the tree first.")
+            return
+        if self._viewport is not None:
+            ok = self._viewport.attach_manipulator(self._moving_node)
+            if ok:
+                self._state = PositionState.DYNAMIC_MOVE
+                self._set_status(
+                    f"Dynamic Move active on '{self._moving_node.label}'.\n\n"
+                    f"Drag arrows (translate) or rings (rotate).\n"
+                    f"Click '✓ Done' when finished."
+                )
+            else:
+                self._set_status("Could not attach manipulator.")
+        self._update_ui_state()
+
+    def _on_back(self):
+        if not self._move_history or self._moving_node is None:
+            return
+        last_move = self._move_history.pop()
+        try:
+            self._moving_node.move(last_move.inverse())
+            self.request_redisplay.emit(self._moving_node)
+        except Exception as e:
+            print(f"[position_dialog] Back failed: {e}")
+        self._last_pick1 = None
+        self._last_pick2 = None
+        self._last_step  = None
+        # If we undid step1, also clear the mated normal
+        if len(self._move_history) == 0:
+            self._mated_normal = None
+        self._state = PositionState.IDLE
+        self._pick1 = None
+        self._pick2 = None
+        self._pick1_label.setText("Pick 1 (moving): —")
+        self._pick2_label.setText("Pick 2 (fixed):  —")
+        self._set_status("Step undone.")
+        self._update_ui_state()
+
+    def _on_reverse(self):
+        if not self._move_history or self._moving_node is None:
+            return
+        if self._last_pick1 is None or self._last_pick2 is None:
+            return
+
+        last_move = self._move_history.pop()
+        try:
+            self._moving_node.move(last_move.inverse())
+            self.request_redisplay.emit(self._moving_node)
+        except Exception as e:
+            print(f"[position_dialog] Reverse (undo) failed: {e}")
+            return
+
+        step, mode = self._last_step if self._last_step else ("step1", "mate")
+        p1 = self._last_pick1
+        p2 = self._last_pick2
+
+        if step == "step1":
+            new_mode = "align" if mode == "mate" else "mate"
+            print(f"[Reverse] step1: toggling {mode} → {new_mode}")
+            print(f"[Reverse] p1.direction={p1.direction}  p2.direction={p2.direction}")
+            move = compute_step1_move(p1, p2, mate=(new_mode == "mate"))
+            # But if original N1 ≈ N2 (faces started aligned), mate gives 180° and
+            # align gives 0° (identity). In that edge case, force 180° for mate by
+            # checking if the move is near-identity and flipping pick2 normal.
+            if move is not None and new_mode == "mate":
+                from build123d import Vertex
+                test_pt = Vertex(p1.point.X, p1.point.Y, p1.point.Z)
+                moved_pt = test_pt.moved(move).center()
+                if (moved_pt - p1.point).length < 1e-3:
+                    # Identity move -- faces already opposed, try flipping p2
+                    from dataclasses import replace
+                    p2_flipped = replace(p2, direction=-p2.direction) if p2.direction else p2
+                    move = compute_step1_move(p1, p2_flipped, mate=True)
+                    p2 = p2_flipped
+                    self._last_pick2 = p2
+            # Update mated_normal
+            if move is not None and p2.direction is not None:
+                self._mated_normal = -p2.direction if new_mode == "mate" else p2.direction
+            self._last_step = (step, new_mode)
+        elif step == "step2":
+            from dataclasses import replace
+            p2 = replace(p2, direction=-p2.direction) if p2.direction else p2
+            move = compute_step2_move(p1, p2, self._mated_normal)
+            self._last_pick2 = p2
+        elif step == "step3":
+            from dataclasses import replace
+            p2 = replace(p2, direction=-p2.direction) if p2.direction else p2
+            move = compute_step3_move(p1, p2, self._mated_normal, self._wall_normal)
+            self._last_pick2 = p2
+        elif step == "axis":
+            from dataclasses import replace
+            p2 = replace(p2, direction=-p2.direction) if p2.direction else p2
+            move = compute_align_axis_move(p1, p2)
+            self._last_pick2 = p2
+        else:
+            move = None
+
+        if move is None:
+            self._set_status("Reverse: could not compute flipped move.")
+            return
+
+        local_move = self._world_move_to_local(move)
+        print(f"[Reverse] move={move}  local_move={local_move}")
+        try:
+            self._moving_node.move(local_move)
+            self._move_history.append(local_move)
+            self.request_redisplay.emit(self._moving_node)
+            self._set_status("✓ Reversed and re-applied.")
+        except Exception as e:
+            print(f"[position_dialog] Reverse (re-apply) failed: {e}")
+        self._update_ui_state()
+
+    def _on_done(self):
+        if self._state == PositionState.DYNAMIC_MOVE and self._viewport is not None:
+            try:
+                world_move = self._viewport.get_manipulator_transform()
+                if world_move is not None and self._moving_node is not None:
+                    local_move = self._world_move_to_local(world_move)
+                    self._moving_node.move(local_move)
+                    self.request_redisplay.emit(self._moving_node)
+            except Exception as e:
+                print(f"[position_dialog] applying dynamic move failed: {e}")
+            self._viewport.detach_manipulator()
+
+        self._state = PositionState.IDLE
+        self._mated_normal = None
+        self._wall_normal = None
+        self._move_history.clear()
+        self.positioning_done.emit()
+
+    # -----------------------------------------------------------------------
+    # World → local frame conversion (unchanged from original)
+    # -----------------------------------------------------------------------
+
+    def _world_move_to_local(self, move):
+        from build123d import Location
+        parent = getattr(self._moving_node, 'parent', None)
+        if parent is None:
+            return move
+        try:
+            parent_world = parent.global_location
+            if parent_world.position == (0, 0, 0):
+                return move
+            return parent_world.inverse() * move * parent_world
+        except Exception as e:
+            print(f"[position_dialog] world_move_to_local failed: {e}")
+            return move
+
+    # -----------------------------------------------------------------------
     # UI helpers
     # -----------------------------------------------------------------------
 
@@ -807,20 +824,22 @@ class PositionDialog(QDockWidget):
         self._status_label.setText(text)
 
     def _update_ui_state(self):
-        has_moving = self._moving_node is not None
-        is_idle = self._state == PositionState.IDLE
-        is_dynamic = self._state == PositionState.DYNAMIC_MOVE
-        self._start_btn.setEnabled(has_moving and is_idle)
+        has_node = self._moving_node is not None
+        is_idle  = self._state == PositionState.IDLE
+        has_normal = self._mated_normal is not None
+
+        # Step buttons enabled only when idle and node selected
+        for btn in [self._step1_mate_btn, self._axis_btn, self._dynamic_btn]:
+            if btn is not None:
+                btn.setEnabled(has_node and is_idle)
+
+        # Step 2 & 3 need a mated normal from Step 1
+        for btn in [self._step2_edge_btn, self._step3_edge_btn]:
+            if btn is not None:
+                btn.setEnabled(has_node and is_idle and has_normal)
+
         self._back_btn.setEnabled(len(self._move_history) > 0 and is_idle)
         self._reverse_btn.setEnabled(
-            is_idle and
-            self._last_pick1 is not None and
-            self._last_pick2 is not None
-        )
-        # Disable method radios and back/reverse while manipulator is active.
-        for btn in self._method_group.buttons():
-            btn.setEnabled(is_idle)
+            is_idle and self._last_pick1 is not None)
+        self._done_btn.setEnabled(True)
 
-    def is_in_positioning_mode(self) -> bool:
-        """MainWindow calls this to know whether clicks go to the dialog."""
-        return self._state not in (PositionState.IDLE, PositionState.DYNAMIC_MOVE)

@@ -723,7 +723,6 @@ class MainWindow(QWidget):
             return
         self._position_dialog.set_moving_node(node)
         # Show the dialog as a floating window next to the main window.
-        self._position_dialog.setFloating(True)
         self._position_dialog.show()
         self._position_dialog.raise_()
 
