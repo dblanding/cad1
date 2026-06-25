@@ -318,40 +318,35 @@ class SyncedViewportWidget(OcctViewportWidget):
         # instance) -- confirmed from the runtime AttributeError's own
         # suggested correction, same "_s" convention seen once before
         # during the STEP export investigation.
-        edge_mode = AIS_Shape.SelectionMode_s(TopAbs_EDGE)
-        self.context.Activate(ais_shape, edge_mode)
+        # Only FACE selection is activated at load time.
+        # Activating EDGE/VERTEX on all parts simultaneously crashes
+        # OCCT's selection index on the first Select() call.
+        # Edge/vertex picking still works via context.Select() without
+        # explicit activation -- activation only controls hover highlight.
 
-        # Also activate VERTEX-level picking -- needed for pose.py's
-        # "vertex" PointRef kind and for Mate/Align operations that
-        # target a corner point directly. Same SelectionMode()
-        # translation pattern as above.
-        vertex_mode = AIS_Shape.SelectionMode_s(TopAbs_VERTEX)
-        self.context.Activate(ais_shape, vertex_mode)
+        # EDGE and VERTEX modes are NOT activated globally.
+        # They are activated only on the active part when it is set
+        # via RMB -> Set Active Part. This avoids crashing OCCT's
+        # MoveTo() when traversing selection structures for 18+ parts.
 
-        # THE ACTUAL FIX for "edges never get picked, only faces":
-        # OCCT's default pixel tolerance for MoveTo()/Select() picking
-        # is just 2 PIXELS (confirmed directly from OCCT's own class
-        # reference docs). A face covers most of the visible surface
-        # area of a solid, so it's almost always under the cursor --
-        # but an edge (or especially a vertex -- a single POINT) has
-        # essentially zero area, so the cursor has to land within ~2px
-        # of the actual geometry to register at all. This is NOT a
-        # selection-priority problem (multiple modes ARE active,
-        # confirmed) -- it's specifically that the hit tolerance was
-        # too tight to realistically land a precise pick by eye.
-        # Widening it fixes this directly, per OCCT's own documented
-        # SetSelectionSensitivity(object, mode, new_sensitivity) call.
-        # NOTE: also fixed here -- this previously passed raw
-        # TopAbs_EDGE as the mode argument, the SAME bug as the
-        # Activate() calls above; now uses the correct translated
-        # mode value for both edge and vertex.
-        try:
-            self.context.SetSelectionSensitivity(ais_shape, edge_mode, 6)
-            self.context.SetSelectionSensitivity(ais_shape, vertex_mode, 8)
-        except Exception as e:
-            print(f"(could not widen edge/vertex selection sensitivity, "
-                  f"precise picks may be hard to land: {e})")
 
+    def _set_selection_mode(self, shape_type, active: bool):
+        """
+        Activate or deactivate a selection mode (EDGE, VERTEX, etc.)
+        on all currently displayed AIS shapes.
+        Called on-demand when dialogs that need edge/vertex picking
+        open or close, rather than keeping all modes active all the time
+        (which crashes OCCT's selection index on initial load).
+        """
+        mode = AIS_Shape.SelectionMode_s(shape_type)
+        for ais in self._ais_shapes:
+            try:
+                if active:
+                    self.context.Activate(ais, mode)
+                else:
+                    self.context.Deactivate(ais, mode)
+            except Exception:
+                pass
 
     def _report_selection(self):
         """
@@ -399,8 +394,6 @@ class SyncedViewportWidget(OcctViewportWidget):
             return
 
         if visible:
-            # Display in shaded mode explicitly (mode 1 = AIS_Shaded)
-            # to avoid re-adding wireframe mode 0.
             self.context.Display(ais_shape, False)
             self.context.SetDisplayMode(ais_shape, 1, False)
             face_mode = AIS_Shape.SelectionMode_s(TopAbs_FACE)
@@ -433,7 +426,7 @@ class SyncedViewportWidget(OcctViewportWidget):
         ais_shape = self._node_id_to_ais_shape.get(id(node))
         if ais_shape is None:
             return  # sub-assembly container, nothing to highlight directly
-        self.context.ClearSelected(True)
+        self.context.ClearSelected(False)
         self.context.AddOrRemoveSelected(ais_shape, True)
         self.view.FitAll()  # keep the part in view; comment out if too aggressive
         self.update()
@@ -779,13 +772,14 @@ class MainWindow(QWidget):
         node._wrapped = new_shape
         self._rebuild_ancestors(node)
 
-        self.viewport.context.ClearSelected(True)
+        self.viewport.context.ClearSelected(False)
         old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
         original_color_rgb = None
         if old_ais is not None:
             info = self.viewport._ais_shape_to_node.get(id(old_ais))
             if info:
                 original_color_rgb = info.get("color_rgb")
+            self.viewport.context.Deactivate(old_ais)
             self.viewport.context.Remove(old_ais, False)
             self.viewport._ais_shapes = [
                 s for s in self.viewport._ais_shapes if s is not old_ais
@@ -834,13 +828,14 @@ class MainWindow(QWidget):
         node._wrapped = new_shape
         self._rebuild_ancestors(node)
 
-        self.viewport.context.ClearSelected(True)
+        self.viewport.context.ClearSelected(False)
         old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
         original_color_rgb = None
         if old_ais is not None:
             info = self.viewport._ais_shape_to_node.get(id(old_ais))
             if info:
                 original_color_rgb = info.get("color_rgb")
+            self.viewport.context.Deactivate(old_ais)
             self.viewport.context.Remove(old_ais, False)
             self.viewport._ais_shapes = [
                 s for s in self.viewport._ais_shapes if s is not old_ais
@@ -1112,11 +1107,11 @@ class MainWindow(QWidget):
 
     def _on_active_part_changed(self, node):
         """
-        Active part changed:
-          - Orange background on the tree item (Qt only, no OCCT risk)
-          - Orange wireframe overlay in the viewport using a COPIED shape
-            so the overlay has no shared state with the shaded AIS.
-          - Overlay is erased cleanly before the old AIS is ever touched.
+        Active part changed -- update orange overlay and tree highlight.
+        Also activates EDGE+VERTEX selection on the new active part
+        and deactivates them on the previous one. This gives edge hover
+        highlighting only where it's needed (the part being worked on)
+        without activating it on all 18+ parts which crashes MoveTo().
         """
         from PySide6.QtGui import QColor, QBrush
         from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
@@ -1125,12 +1120,27 @@ class MainWindow(QWidget):
 
         orange = Quantity_Color(1.0, 0.55, 0.0,
                                 Quantity_TypeOfColor.Quantity_TOC_RGB)
+        edge_mode   = AIS_Shape.SelectionMode_s(TopAbs_EDGE)
+        vertex_mode = AIS_Shape.SelectionMode_s(TopAbs_VERTEX)
+
+        # --- Deactivate edge/vertex on previous active part ---
+        prev_active = getattr(self, '_active_part_node', None)
+        if prev_active is not None:
+            prev_ais = self.viewport._node_id_to_ais_shape.get(id(prev_active))
+            if prev_ais is not None:
+                try:
+                    self.viewport.context.Deactivate(prev_ais, edge_mode)
+                    self.viewport.context.Deactivate(prev_ais, vertex_mode)
+                except Exception:
+                    pass
+        self._active_part_node = node
 
         # --- Clear previous overlay and tree highlight ---
         prev_overlay = getattr(self, '_active_part_overlay_ais', None)
         if prev_overlay is not None:
             try:
-                self.viewport.context.Remove(prev_overlay, True)
+                self.viewport.context.Deactivate(prev_overlay)
+                self.viewport.context.Remove(prev_overlay, False)
             except Exception:
                 pass
             self._active_part_overlay_ais = None
@@ -1151,12 +1161,21 @@ class MainWindow(QWidget):
                         self._active_part_tree_item = item
                     break
 
-            # --- Viewport wireframe overlay ---
+            # --- Activate edge/vertex on new active part only ---
             ais = self.viewport._node_id_to_ais_shape.get(id(node))
             if ais is not None:
                 try:
-                    # Copy the shape -- independent TopoDS_Shape means
-                    # SetColor on the overlay cannot bleed to the shaded AIS
+                    self.viewport.context.Activate(ais, edge_mode)
+                    self.viewport.context.Activate(ais, vertex_mode)
+                    self.viewport.context.SetSelectionSensitivity(
+                        ais, edge_mode, 6)
+                    self.viewport.context.SetSelectionSensitivity(
+                        ais, vertex_mode, 8)
+                except Exception:
+                    pass
+
+                # --- Viewport wireframe overlay ---
+                try:
                     shape_copy = BRepBuilderAPI_Copy(ais.Shape()).Shape()
                     overlay = AIS_Shape(shape_copy)
                     overlay.SetDisplayMode(AIS_DisplayMode.AIS_WireFrame)
@@ -1205,13 +1224,14 @@ class MainWindow(QWidget):
         overlay = getattr(self, '_active_part_overlay_ais', None)
         if overlay is not None:
             try:
+                self.viewport.context.Deactivate(overlay)
                 self.viewport.context.Remove(overlay, False)
             except Exception:
                 pass
             self._active_part_overlay_ais = None
 
         # Clear OCCT selection before removing
-        self.viewport.context.ClearSelected(True)
+        self.viewport.context.ClearSelected(False)
 
         # Save original color before removing old AIS
         old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
@@ -1220,6 +1240,7 @@ class MainWindow(QWidget):
             info = self.viewport._ais_shape_to_node.get(id(old_ais))
             if info:
                 original_color_rgb = info.get("color_rgb")
+            self.viewport.context.Deactivate(old_ais)
             self.viewport.context.Remove(old_ais, False)
             self.viewport._ais_shapes = [
                 s for s in self.viewport._ais_shapes if s is not old_ais
@@ -1268,7 +1289,7 @@ class MainWindow(QWidget):
 
         # Clear OCCT selection first -- erasing a selected shape without
         # clearing selection first causes a segfault in OCCT's context.
-        self.viewport.context.ClearSelected(True)
+        self.viewport.context.ClearSelected(False)
 
         # Erase all leaf AIS_Shapes under this node from the viewport.
         # Use Remove() not Erase() -- Erase only hides visually but leaves
@@ -1278,6 +1299,7 @@ class MainWindow(QWidget):
         for leaf in leaves:
             ais = self.viewport._node_id_to_ais_shape.get(id(leaf))
             if ais is not None:
+                self.viewport.context.Deactivate(ais)
                 self.viewport.context.Remove(ais, False)
                 self.viewport._ais_shapes = [
                     s for s in self.viewport._ais_shapes if s is not ais

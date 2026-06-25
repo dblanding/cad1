@@ -1518,6 +1518,27 @@ reach the C++ selection structures simultaneously.
 significant refactor but would fix this crash permanently and also
 improve overall navigation robustness.
 
-**Current status:** Documented as a known limitation. Users should
-avoid double-clicking in the viewport. Single deliberate clicks work
-reliably.
+**Current status:** UNRESOLVED. Added to backlog for future investigation
+if new information becomes available.
+
+**What we know for certain:**
+- The crash happens in `context.MoveTo()` inside `mouseMoveEvent`,
+  not in `context.Select()`. It fires just from moving the mouse
+  over the viewport, before any click.
+- The crash produces NO Python output -- it is a C++ segfault that
+  kills the process instantly.
+- The working version (b572c19) had EDGE+VERTEX activation on all
+  parts AND worked fine. Something we added after that commit broke it.
+- Reducing to FACE-only activation, or EDGE+VERTEX on active part
+  only, still crashes.
+- The `True` vs `False` flag on `MoveTo()` makes no difference.
+- The crash was NOT present before we added fillet/shell/workplane
+  dialogs, position dialog redesign, and cut/mill operations. The
+  exact change that introduced it is unknown.
+
+**Next steps if revisiting:**
+1. Binary search the commits between b572c19 and current to find
+   the exact change that introduced the crash.
+2. Investigate OCCT's AIS_ViewController as the proper high-level
+   interface (used by CAD Assistant) that serializes mouse events
+   and avoids direct context.MoveTo()/Select() calls.
