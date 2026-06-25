@@ -87,6 +87,15 @@ class OcctViewportWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_PaintOnScreen)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        # Prevent double-click from reaching OCCT -- a double-click fires two
+        # context.Select() calls in rapid succession which segfaults inside
+        # OCCT's C++ selection structures. There is no Python-catchable way to
+        # prevent the crash once Select() is called twice, so we suppress the
+        # OS-level double-click gesture entirely by setting the click interval
+        # to 1ms (effectively disabling it). Users can still click rapidly --
+        # each click is treated as a single click with a short cooldown.
+        from PySide6.QtWidgets import QApplication
+        QApplication.setDoubleClickInterval(1)
         # REQUIRED for hover-highlight: by default Qt only sends
         # mouseMoveEvent while a button is held. MoveTo()-based
         # highlighting needs move events on EVERY mouse movement,
@@ -119,7 +128,10 @@ class OcctViewportWidget(QWidget):
         # the mouse moved between press and release.
         self._press_pos = None
         self._drag_distance = 0.0
-        self._click_drag_threshold_px = 4  # movement below this = treat as a click
+        self._click_drag_threshold_px = 4
+        self._ignore_next_click = False
+        self._last_click_time = 0.0
+        self._selecting = False  # guard against re-entrant context.Select()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -404,6 +416,10 @@ class OcctViewportWidget(QWidget):
     def mousePressEvent(self, event):
         self._last_mouse_pos = event.position()
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._ignore_next_click:
+                # This is the second press in a double-click sequence.
+                # Leave _press_pos as None so the following release is also ignored.
+                return
             self._press_pos = event.position()
             self._drag_distance = 0.0
             x, y = int(event.position().x()), int(event.position().y())
@@ -457,13 +473,39 @@ class OcctViewportWidget(QWidget):
         self._last_mouse_pos = pos
         self.update()  # redraw after every mouse-driven view change
 
+    def mouseDoubleClickEvent(self, event):
+        """
+        Swallow double-click events entirely.
+        Qt double-click sequence: press→release→doubleClick→press→release.
+        We set a cooldown flag here so the second press→release pair is
+        ignored by mouseReleaseEvent.
+        """
+        self._ignore_next_click = True
+        self._press_pos = None
+        self._drag_distance = 0.0
+        event.accept()
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
             if self._drag_distance < self._click_drag_threshold_px:
+                self._ignore_next_click = False  # clear after consuming the click
                 # It's a click -- check if it landed on the view cube.
                 # MoveTo in mouseMoveEvent already updated DetectedInteractive
                 # during hover, so we can read it here without calling
                 # MoveTo again (which would conflict with StartRotation state).
+
+                # Cooldown: reject clicks that arrive within 300ms of the last
+                # one. A double-click fires two release events in rapid
+                # succession; the second one hits context.Select() while OCCT
+                # is still processing the first, causing a C++ segfault.
+                import time
+                now = time.monotonic()
+                if now - self._last_click_time < 0.3:
+                    self._press_pos = None
+                    self._drag_distance = 0.0
+                    return
+                self._last_click_time = now
+
                 if self._view_cube is not None:
                     try:
                         detected = self.context.DetectedInteractive()
@@ -486,9 +528,12 @@ class OcctViewportWidget(QWidget):
                                     pass
                     except Exception:
                         pass
-                # Normal click -- select whatever is highlighted.
-                self.context.Select(True)
-                self._report_selection()
+                # Defer Select() to the next event loop tick so that if two
+                # clicks arrive in rapid succession (double-click), both
+                # release events are fully processed by Qt before either
+                # Select() runs -- preventing OCCT re-entrancy segfault.
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(0, self._do_select)
             self._press_pos = None
             self._drag_distance = 0.0
 
@@ -504,6 +549,22 @@ class OcctViewportWidget(QWidget):
             self._show_context_menu(event.globalPosition().toPoint())
 
         self.update()
+
+    def _do_select(self):
+        """
+        Deferred selection -- called via QTimer.singleShot(0).
+        A boolean guard prevents any re-entrant or overlapping Select() calls.
+        """
+        if self._selecting:
+            return
+        self._selecting = True
+        try:
+            self.context.Select(True)
+            self._report_selection()
+        except Exception as e:
+            print(f"[viewport] Select failed: {e}")
+        finally:
+            self._selecting = False
 
     def _show_context_menu(self, global_pos):
         """RMB context menu with common view commands."""

@@ -1444,3 +1444,80 @@ move=((~0, ~0, 0.0), (0, 0, 28.8°))   ← translation now ~zero
   group box titles.
 - `src/pose.py` -- `compute_step3_move` accepts `pivot` parameter;
   hole rotation pivots about stored hole center not pick1 point.
+
+---
+
+## 20. Known Issue: Double-Click in Viewport Causes Crash
+
+**Status: UNRESOLVED.** Multiple fix attempts failed. Documented as a
+known limitation.
+
+**Symptom:** A double-click (or two rapid clicks) in the OCCT viewport
+causes an immediate C++ segfault with no Python traceback. The app
+exits silently.
+
+**Root cause:** Qt's double-click event sequence is:
+```
+press → release → doubleClick → press → release
+```
+The two `release` events each call `context.Select(True)` in rapid
+succession. OCCT's `AIS_InteractiveContext::Select()` is not
+re-entrant -- the second call hits internal C++ selection structures
+while they are still being modified by the first call, causing a
+memory corruption segfault.
+
+**Fix attempts (all failed):**
+
+1. `mouseDoubleClickEvent` handler setting `_press_pos = None` --
+   failed because the second `press` event resets it before the
+   second `release` fires.
+
+2. `_ignore_next_click` flag set in `mouseDoubleClickEvent`, checked
+   in `mousePressEvent` to skip the second press -- failed because
+   the segfault occurs inside C++ before Python regains control.
+
+3. 300ms timestamp cooldown on `context.Select()` -- failed for the
+   same reason: the second release arrives before Python can check
+   the timestamp.
+
+4. `QApplication.setDoubleClickInterval(1)` to suppress Qt's
+   double-click detection entirely -- failed. Even with a 1ms
+   double-click interval, two rapid physical clicks still fire two
+   release events close enough together to trigger the crash.
+
+**Why Python can't catch it:** A C++ segfault bypasses Python's
+exception handling entirely. `try/except` around `context.Select()`
+cannot catch a segmentation fault -- the process simply dies.
+
+**Workaround:** Click deliberately and avoid rapid double-clicks in
+the viewport. The crash only occurs with very rapid successive clicks.
+Normal usage does not trigger it.
+
+**All attempted fixes (all failed):**
+1. `mouseDoubleClickEvent` setting `_press_pos = None`
+2. `_ignore_next_click` flag checked in `mousePressEvent`
+3. 300ms timestamp cooldown before `context.Select()`
+4. `QApplication.setDoubleClickInterval(1)` to suppress double-click
+5. `QTimer.singleShot(0, _do_select)` to defer to next event loop tick
+6. `_selecting` boolean guard around `context.Select()`
+
+All fail because the C++ segfault occurs inside `context.Select()`
+itself -- the process dies before Python `finally` blocks or flags
+can take effect. CPython is single-threaded so re-entrancy isn't
+the issue; OCCT is simply crashing on its own internal state.
+
+**Why CAD Assistant doesn't crash:** CAD Assistant uses OCCT's
+`AIS_ViewController::HandleMouseButton()` high-level interface rather
+than calling `context.Select()` directly. `AIS_ViewController` queues
+and serializes selection events internally, so rapid clicks never
+reach the C++ selection structures simultaneously.
+
+**The proper long-term fix:** Refactor mouse handling in
+`assembly_viewer.py` to use `AIS_ViewController` instead of calling
+`context.Select()`, `view.StartRotation()` etc. directly. This is a
+significant refactor but would fix this crash permanently and also
+improve overall navigation robustness.
+
+**Current status:** Documented as a known limitation. Users should
+avoid double-clicking in the viewport. Single deliberate clicks work
+reliably.
