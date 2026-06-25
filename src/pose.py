@@ -642,3 +642,247 @@ def _self_test():
 
 if __name__ == "__main__":
     _self_test()
+
+
+# ---------------------------------------------------------------------------
+# 5. Constrained 3-2-1 positioning math
+#    (Step 1: rotate to flush, Step 2: translate in-plane, Step 3: last DOF)
+# ---------------------------------------------------------------------------
+
+def find_intersection_line(P1: Vector, N1: Vector, P2: Vector, N2: Vector):
+    """
+    Find the intersection line of two infinite planes.
+
+    Plane 1: N1 · (X - P1) = 0
+    Plane 2: N2 · (X - P2) = 0
+
+    Returns (point_on_line, direction) where:
+      - direction = N1 × N2 (normalized)
+      - point_on_line = the point on L closest to the midpoint of P1, P2
+                        (a well-defined unique point even though L is infinite)
+
+    Returns None if the planes are parallel (|N1 × N2| < tol), in which
+    case the caller should fall back to pure translation.
+
+    DERIVATION of point_on_line:
+      L direction: D = N1 × N2  (normalized)
+      A point on L satisfies both plane equations:
+        N1 · X = d1   where d1 = N1 · P1
+        N2 · X = d2   where d2 = N2 · P2
+      Using the formula for the intersection of two planes:
+        P = ((d1 * N2 - d2 * N1) × D) / |D|²
+      This gives the point on L closest to the origin. To get the point
+      closest to the midpoint M of P1,P2 (more numerically stable and
+      geometrically meaningful), we project M onto L:
+        P_near = P + ((M - P) · D) * D
+    """
+    D = N1.cross(N2)
+    d_len_sq = D.dot(D)
+
+    TOL = 1e-8
+    if d_len_sq < TOL:
+        return None  # planes are parallel
+
+    D_norm = D * (1.0 / d_len_sq ** 0.5)
+
+    d1 = N1.dot(P1)
+    d2 = N2.dot(P2)
+
+    # Point on L closest to origin
+    P_origin = (N2 * d1 - N1 * d2).cross(D) * (1.0 / d_len_sq)
+
+    # Project midpoint of P1,P2 onto L for a more central reference point
+    M = (P1 + P2) * 0.5
+    P_near = P_origin + D_norm * (M - P_origin).dot(D_norm)
+
+    return P_near, D_norm
+
+
+def compute_step1_move(pick1, pick2, mate: bool = True):
+    """
+    Step 1 of the 3-2-1 workflow: rotate the moving part about the
+    intersection line of the two face planes until the faces are flush.
+
+    mate=True:  normals become OPPOSED  (N1_new = -N2)
+    mate=False: normals become PARALLEL (N1_new = +N2)
+
+    If the planes are already parallel (degenerate intersection line),
+    falls back to a pure translation along the target normal to close
+    the gap between the faces -- the axis is "at infinity" so rotation
+    degenerates to translation.
+
+    Returns a build123d Location to be applied with node.move(result).
+    """
+    from build123d import Location
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
+    import math
+
+    P1 = pick1.point
+    N1 = pick1.direction
+    P2 = pick2.point
+    N2 = pick2.direction
+
+    if N1 is None or N2 is None:
+        print("[pose] Step 1 requires directed picks (faces).")
+        return None
+
+    # Target normal for the moving face after step 1
+    target_N1 = -N2 if mate else N2
+
+    # Check if already aligned
+    dot = N1.dot(target_N1)
+    if abs(dot - 1.0) < 1e-6:
+        # Already flush -- just close the gap (translation only)
+        gap = (P2 - P1).dot(target_N1)
+        tv = target_N1 * gap
+        t = gp_Trsf()
+        t.SetTranslation(gp_Vec(tv.X, tv.Y, tv.Z))
+        return Location(t)
+
+    result = find_intersection_line(P1, N1, P2, N2)
+
+    if result is None:
+        # Planes are parallel -- pure translation along normal
+        gap = (P2 - P1).dot(target_N1)
+        if mate:
+            # For mate, gap should bring faces together (opposed normals)
+            # The signed distance from P1 to plane 2 along N2
+            gap = (P2 - P1).dot(N2)
+            tv = N2 * gap
+        else:
+            gap = (P2 - P1).dot(N2)
+            tv = N2 * gap
+        t = gp_Trsf()
+        t.SetTranslation(gp_Vec(tv.X, tv.Y, tv.Z))
+        return Location(t)
+
+    L_point, L_dir = result
+
+    # Angle to rotate: from N1 to target_N1
+    # Use atan2 with the cross product for sign correctness
+    cross = N1.cross(target_N1)
+    sin_a = cross.length
+    cos_a = N1.dot(target_N1)
+    angle = math.atan2(sin_a, cos_a)
+
+    if abs(angle) < 1e-8:
+        return Location(gp_Trsf())  # identity
+
+    # Rotation axis: L_dir, but we need the sign correct so rotation
+    # goes the right way. The cross product N1 × target_N1 gives the
+    # axis direction; use L_dir sign-aligned to that.
+    if cross.dot(L_dir) < 0:
+        L_dir = -L_dir
+
+    ax = gp_Ax1(
+        gp_Pnt(L_point.X, L_point.Y, L_point.Z),
+        gp_Dir(L_dir.X, L_dir.Y, L_dir.Z)
+    )
+    t = gp_Trsf()
+    t.SetRotation(ax, angle)
+    return Location(t)
+
+
+def compute_step2_move(pick1, pick2, mated_normal: Vector):
+    """
+    Step 2 of the 3-2-1 workflow: translate the moving part within the
+    flush plane (no rotation) to align an edge or hole axis.
+
+    The part must already be flush from Step 1. This step only moves
+    the part within the mated plane -- any component along the plane
+    normal is ignored to preserve the Step 1 result.
+
+    Two sub-cases (same math, different geometry):
+      a) Edge-to-edge: pick1 = edge on moving part, pick2 = edge on fixed.
+         Translate perpendicular to the edges (within the plane) until
+         the edges are coplanar. Leaves translation along edge direction.
+      b) Hole-to-hole: pick1 = circle center on moving, pick2 = circle
+         center on fixed. Translate until centers coincide (projected
+         onto the mated plane). Leaves rotation about the normal.
+
+    In both cases the math is: translate by the component of
+    (P2 - P1) that lies IN the mated plane.
+    """
+    from build123d import Location
+    from OCP.gp import gp_Trsf, gp_Vec
+
+    P1 = pick1.point
+    P2 = pick2.point
+    N  = mated_normal.normalized()
+
+    # Full vector from moving feature to fixed feature
+    delta = P2 - P1
+
+    # Remove the normal component -- only move within the plane
+    delta_in_plane = delta - N * delta.dot(N)
+
+    t = gp_Trsf()
+    t.SetTranslation(gp_Vec(
+        delta_in_plane.X,
+        delta_in_plane.Y,
+        delta_in_plane.Z
+    ))
+    return Location(t)
+
+
+def compute_step3_move(pick1, pick2, mated_normal: Vector):
+    """
+    Step 3 of the 3-2-1 workflow: remove the last remaining DOF.
+
+    Two sub-cases:
+      a) After edge-to-edge Step 2: translate along the edge direction
+         (the last remaining DOF) to shove the part into the corner.
+         Same as Step 2 math -- project delta onto the plane.
+      b) After hole-to-hole Step 2: rotate about the mated normal to
+         index to the correct angle. Pick an edge or reference direction
+         on the moving part and a corresponding one on the fixed part;
+         rotate within the plane until they're parallel.
+
+    The dialog will need to distinguish the two sub-cases. For now both
+    are implemented as in-plane translation (case a); case b (rotation
+    about normal) is a separate path.
+    """
+    from build123d import Location
+    from OCP.gp import gp_Trsf, gp_Vec
+    import math
+
+    P1 = pick1.point
+    P2 = pick2.point
+    D1 = pick1.direction
+    D2 = pick2.direction
+    N  = mated_normal.normalized()
+
+    if D1 is not None and D2 is not None:
+        # Check if this is a rotation case: directions are in the plane
+        # and not parallel -- rotate about normal to align them.
+        d1_in_plane = (D1 - N * D1.dot(N)).normalized() if (D1 - N * D1.dot(N)).length > 1e-6 else None
+        d2_in_plane = (D2 - N * D2.dot(N)).normalized() if (D2 - N * D2.dot(N)).length > 1e-6 else None
+
+        if d1_in_plane is not None and d2_in_plane is not None:
+            cross = d1_in_plane.cross(d2_in_plane)
+            sin_a = cross.length
+            cos_a = d1_in_plane.dot(d2_in_plane)
+            angle = math.atan2(sin_a, cos_a)
+
+            if abs(angle) > 1e-6:
+                from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt
+                # Rotation about mated normal through P1 (the reference point)
+                sign = 1.0 if cross.dot(N) > 0 else -1.0
+                ax = gp_Ax1(
+                    gp_Pnt(P1.X, P1.Y, P1.Z),
+                    gp_Dir(N.X * sign, N.Y * sign, N.Z * sign)
+                )
+                t = gp_Trsf()
+                t.SetRotation(ax, angle)
+                return Location(t)
+
+    # Translation case: project delta onto the plane (same as Step 2)
+    delta = P2 - P1
+    delta_in_plane = delta - N * delta.dot(N)
+    t = gp_Trsf()
+    t.SetTranslation(gp_Vec(
+        delta_in_plane.X,
+        delta_in_plane.Y,
+        delta_in_plane.Z
+    ))
+    return Location(t)

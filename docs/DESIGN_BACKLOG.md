@@ -1182,3 +1182,89 @@ CAD Assistant. This validates the full modeling workflow.
 - Chamfer (similar to fillet but with distance instead of radius)
 - Part positioning / Mate-Align on newly created parts
 - Saving session state (currently relying on STEP as "poor man's save")
+
+---
+
+## 17. Redesigned 3-2-1 Positioning (In Progress)
+
+**Status: MATH COMPLETE, DIALOG REDESIGN PENDING.**
+
+### Background / Motivation
+
+The existing Mate/Align dialog (item 1) had a bug: performing Step 2
+(Align) after Step 1 (Mate) would "spoil" the mate -- the part would
+rotate away from the mated plane. Root cause: `compute_align_move`
+applied a full 6-DOF transform without constraining the move to remain
+within the mated plane.
+
+### Correct 3-2-1 Algorithm
+
+**Step 1 -- Rotate to flush (3 DOF consumed):**
+- Given face 1 on moving part (point P1, normal N1) and face 2 on
+  fixed part (point P2, normal N2):
+- Compute intersection line L of the two infinite planes:
+  - Direction: D = N1 × N2
+  - Point on L: P = ((d1·N2 - d2·N1) × D) / |D|²
+    where d1 = N1·P1, d2 = N2·P2
+- Rotate moving part about L by angle = atan2(|N1×N2|, N1·N2)
+- Degenerate case (|D| ≈ 0, planes parallel): pure translation along
+  normal to close the gap. The rotation axis is "at infinity."
+- Mate: target normal is -N2 (opposed). Align: target is +N2 (same).
+- NO translation along L -- any needed translation is handled in
+  steps 2 and 3.
+
+**Step 2 -- In-plane constraint (2 DOF consumed):**
+- Part stays on the mated plane (no rotation).
+- Translate by (P2 - P1) with the normal component removed:
+  `delta_in_plane = (P2-P1) - N·(P2-P1)·N`
+- Two sub-cases (same math, different geometry):
+  a) Edge-to-edge: constrains translation ⊥ to edge + rotation.
+     Leaves one translational DOF along edge direction for step 3.
+  b) Hole-to-hole: constrains both in-plane translations (X, Y).
+     Leaves one rotational DOF (spin about normal) for step 3.
+
+**Step 3 -- Last DOF (1 DOF consumed):**
+- Translation case (after edge-to-edge step 2): same in-plane
+  translation math as step 2 -- "shove into corner."
+- Rotation case (after hole-to-hole step 2): rotate about mated
+  normal to align an edge or reference direction.
+  `angle = atan2(|d1_in_plane × d2_in_plane|, d1_in_plane · d2_in_plane)`
+
+### New Functions in pose.py
+
+- `find_intersection_line(P1, N1, P2, N2)` → `(point, direction)` or None
+- `compute_step1_move(pick1, pick2, mate=True)` → Location
+- `compute_step2_move(pick1, pick2, mated_normal)` → Location
+- `compute_step3_move(pick1, pick2, mated_normal)` → Location
+
+All four functions confirmed correct by smoke test
+`src/position_math_smoke_test.py`: **35/35 checks passed.**
+
+### Planned Dialog Redesign
+
+Three distinct sections (not radio buttons):
+
+**Section 1: Mate/Align (3-2-1)**
+- Step 1 button: "Mate" or "Align" (pick face on moving, pick face
+  on fixed → rotate to flush)
+- Step 2 button: "Align Edge" or "Align Axis" (pick feature on
+  moving, pick feature on fixed → in-plane translate)
+- Step 3 button: "Align Edge" or "Index Angle" (pick feature on
+  moving, pick feature on fixed → last DOF)
+- Each step shows its current state and result clearly.
+- The mated_normal is remembered from Step 1 so Steps 2 and 3 can
+  use it to constrain moves to the plane.
+
+**Section 2: Align Axis**
+- Single step: aligns 4 DOF (cylinder axis position + orientation).
+- Pick axis on moving part, pick axis on fixed part → done.
+
+**Section 3: Dynamic**
+- AIS manipulator gizmo for rough positioning.
+
+### Next Session
+- Redesign `gui/position_dialog.py` to implement the 3-section UI
+  and wire in the new pose.py functions.
+- The `_world_move_to_local` transform (already in the dialog) is
+  still needed since picks are in world space but `node.move()`
+  operates in parent-local space.
