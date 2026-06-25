@@ -330,6 +330,20 @@ class SyncedViewportWidget(OcctViewportWidget):
         # MoveTo() when traversing selection structures for 18+ parts.
 
 
+    def _apply_black_edges(self, ais):
+        """Reapply crisp black face boundary edges to an AIS_Shape."""
+        from OCP.Quantity import Quantity_NOC_BLACK
+        from OCP.Aspect import Aspect_TOL_SOLID
+        try:
+            drawer = ais.Attributes()
+            drawer.SetFaceBoundaryDraw(True)
+            drawer.FaceBoundaryAspect().SetColor(
+                Quantity_Color(Quantity_NOC_BLACK))
+            drawer.FaceBoundaryAspect().SetWidth(1.0)
+            drawer.FaceBoundaryAspect().SetTypeOfLine(Aspect_TOL_SOLID)
+        except Exception:
+            pass
+
     def _set_selection_mode(self, shape_type, active: bool):
         """
         Activate or deactivate a selection mode (EDGE, VERTEX, etc.)
@@ -796,6 +810,7 @@ class MainWindow(QWidget):
                 r, g, b = original_color_rgb
                 new_ais.SetColor(Quantity_Color(
                     r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB))
+                self.viewport._apply_black_edges(new_ais)
                 self.viewport.context.Redisplay(new_ais, False)
                 info = self.viewport._ais_shape_to_node.get(id(new_ais))
                 if info:
@@ -852,6 +867,7 @@ class MainWindow(QWidget):
                 r, g, b = original_color_rgb
                 new_ais.SetColor(Quantity_Color(
                     r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB))
+                self.viewport._apply_black_edges(new_ais)
                 self.viewport.context.Redisplay(new_ais, False)
                 info = self.viewport._ais_shape_to_node.get(id(new_ais))
                 if info:

@@ -334,6 +334,15 @@ class OcctViewportWidget(QWidget):
         ais_shape.SetColor(color)
         ais_shape.SetDisplayMode(AIS_DisplayMode.AIS_Shaded)
 
+        # Crisp black face boundary edges over the shaded display.
+        from OCP.Quantity import Quantity_NOC_BLACK
+        from OCP.Aspect import Aspect_TOL_SOLID
+        drawer = ais_shape.Attributes()
+        drawer.SetFaceBoundaryDraw(True)
+        drawer.FaceBoundaryAspect().SetColor(Quantity_Color(Quantity_NOC_BLACK))
+        drawer.FaceBoundaryAspect().SetWidth(1.0)
+        drawer.FaceBoundaryAspect().SetTypeOfLine(Aspect_TOL_SOLID)
+
         self.context.Display(ais_shape, True)
         # FIX: AIS_Shape's selection-mode integers are NOT guaranteed
         # to be numerically identical to TopAbs_ShapeEnum's own values
