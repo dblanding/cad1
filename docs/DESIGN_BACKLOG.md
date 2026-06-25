@@ -1542,3 +1542,35 @@ if new information becomes available.
 2. Investigate OCCT's AIS_ViewController as the proper high-level
    interface (used by CAD Assistant) that serializes mouse events
    and avoids direct context.MoveTo()/Select() calls.
+
+---
+
+## 21. Black Edge Display: Persistence After Operations
+
+**Status: COMPLETE.**
+
+**What was built:**
+Black face boundary edges (`SetFaceBoundaryDraw`) are applied in
+`_display_leaf` for all newly displayed parts. They give the model
+a crisp technical illustration look.
+
+**Bug: edges disappeared after cut/fillet/shell/move.**
+`context.Redisplay(ais, False)` resets the AIS presentation including
+the drawer attributes set by `SetFaceBoundaryDraw`. So after any
+operation that calls Redisplay (cut, fillet, shell, part move), the
+black edges were wiped from the affected part.
+
+**Fix:** Added `_apply_black_edges(ais=None)` to `SyncedViewportWidget`:
+- Called with an AIS arg: reapplies black edges to that one shape.
+- Called with no args: reapplies to ALL `_ais_shapes` and calls
+  `Redisplay` on each.
+
+Called at the end of `_on_part_cut`, `_on_fillet_done`, and
+`_on_shell_done` after all color restoration is complete -- ensuring
+black edges are always the last thing applied.
+
+**Also documented in this session:**
+The viewport crash on mouse move (item 20) was traced to
+`context.MoveTo()` with EDGE+VERTEX active on 18+ parts. The crash
+has no Python-catchable fix. The proper long-term solution is to use
+`AIS_ViewController` instead of calling `context.MoveTo()` directly.

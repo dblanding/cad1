@@ -330,19 +330,27 @@ class SyncedViewportWidget(OcctViewportWidget):
         # MoveTo() when traversing selection structures for 18+ parts.
 
 
-    def _apply_black_edges(self, ais):
-        """Reapply crisp black face boundary edges to an AIS_Shape."""
+    def _apply_black_edges(self, ais=None):
+        """
+        Reapply crisp black face boundary edges to an AIS_Shape.
+        If ais is None, applies to ALL currently displayed AIS shapes.
+        Call after Redisplay() or display_subtree() since those can
+        reset the drawer attributes.
+        """
         from OCP.Quantity import Quantity_NOC_BLACK
         from OCP.Aspect import Aspect_TOL_SOLID
-        try:
-            drawer = ais.Attributes()
-            drawer.SetFaceBoundaryDraw(True)
-            drawer.FaceBoundaryAspect().SetColor(
-                Quantity_Color(Quantity_NOC_BLACK))
-            drawer.FaceBoundaryAspect().SetWidth(1.0)
-            drawer.FaceBoundaryAspect().SetTypeOfLine(Aspect_TOL_SOLID)
-        except Exception:
-            pass
+        targets = [ais] if ais is not None else self._ais_shapes
+        for a in targets:
+            try:
+                drawer = a.Attributes()
+                drawer.SetFaceBoundaryDraw(True)
+                drawer.FaceBoundaryAspect().SetColor(
+                    Quantity_Color(Quantity_NOC_BLACK))
+                drawer.FaceBoundaryAspect().SetWidth(1.0)
+                drawer.FaceBoundaryAspect().SetTypeOfLine(Aspect_TOL_SOLID)
+                self.context.Redisplay(a, False)
+            except Exception:
+                pass
 
     def _set_selection_mode(self, shape_type, active: bool):
         """
@@ -810,12 +818,13 @@ class MainWindow(QWidget):
                 r, g, b = original_color_rgb
                 new_ais.SetColor(Quantity_Color(
                     r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB))
-                self.viewport._apply_black_edges(new_ais)
                 self.viewport.context.Redisplay(new_ais, False)
+                self.viewport._apply_black_edges(new_ais)
                 info = self.viewport._ais_shape_to_node.get(id(new_ais))
                 if info:
                     info["color_rgb"] = original_color_rgb
 
+        self.viewport._apply_black_edges()
         self.viewport.context.UpdateCurrentViewer()
         self.viewport.update()
         self._on_active_part_changed(node)
@@ -867,12 +876,13 @@ class MainWindow(QWidget):
                 r, g, b = original_color_rgb
                 new_ais.SetColor(Quantity_Color(
                     r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB))
-                self.viewport._apply_black_edges(new_ais)
                 self.viewport.context.Redisplay(new_ais, False)
+                self.viewport._apply_black_edges(new_ais)
                 info = self.viewport._ais_shape_to_node.get(id(new_ais))
                 if info:
                     info["color_rgb"] = original_color_rgb
 
+        self.viewport._apply_black_edges()
         self.viewport.context.UpdateCurrentViewer()
         self.viewport.update()
         self._on_active_part_changed(node)
@@ -1006,7 +1016,8 @@ class MainWindow(QWidget):
                     r, g, b = original_color
                     color = Quantity_Color(r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB)
                     new_ais.SetColor(color)
-                    self.viewport.context.Redisplay(new_ais, True)
+                    self.viewport.context.Redisplay(new_ais, False)
+                    self.viewport._apply_black_edges(new_ais)
                     # Also update stored color in the tracking dict.
                     info = self.viewport._ais_shape_to_node.get(id(new_ais))
                     if info is not None:
@@ -1277,10 +1288,12 @@ class MainWindow(QWidget):
                     r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB)
                 new_ais.SetColor(color)
                 self.viewport.context.Redisplay(new_ais, False)
+                self.viewport._apply_black_edges(new_ais)
                 info = self.viewport._ais_shape_to_node.get(id(new_ais))
                 if info:
                     info["color_rgb"] = original_color_rgb
 
+        self.viewport._apply_black_edges()
         self.viewport.context.UpdateCurrentViewer()
         self.viewport.update()
         print(f"Cut complete: '{node.label}' updated in viewport.")
