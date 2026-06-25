@@ -905,58 +905,108 @@ def compute_step2_move(pick1, pick2, mated_normal: Vector):
 
 
 def compute_step3_move(pick1, pick2, mated_normal: Vector,
-                       wall_normal: "Optional[Vector]" = None):
+                       wall_normal=None, step2_type: str = "wall",
+                       pivot: "Optional[Vector]" = None):
     """
-    Step 3 of the 3-2-1 workflow: remove the LAST remaining DOF.
+    Step 3: remove the last remaining DOF.
 
-    After Steps 1 and 2:
-      - Step 1 established the mated plane (normal = mated_normal)
-      - Step 2 established the wall plane (normal = wall_normal in-plane)
+    TWO CASES depending on what Step 2 did:
 
-    The only remaining motion is translation along the LINE that is the
-    intersection of the mated plane and the wall plane:
-        free_dir = mated_normal × wall_normal
+    a) step2_type == "wall" (Step 2 aligned to a flat face/wall):
+       After Steps 1+2, the only remaining motion is translation along
+       the intersection of the mated plane and the wall plane:
+           free_dir = mated_normal x wall_normal
+       Translate only along free_dir. No other motion permitted.
 
-    Step 3 translates the moving part along free_dir by the component
-    of (P2 - P1) in that direction. No other motion is permitted --
-    doing so would violate Steps 1 or 2.
-
-    If wall_normal is None (Step 2 was skipped or used hole-to-hole),
-    falls back to full in-plane translation.
+    b) step2_type == "hole" (Step 2 aligned hole axes):
+       After Steps 1+2, the only remaining DOF is rotation about the
+       mated normal (spin). Pick two faces or edges; rotate about
+       mated_normal through P1 until D1_in_plane || D2_in_plane.
+       No translation permitted.
     """
     from build123d import Location
-    from OCP.gp import gp_Trsf, gp_Vec
+    from OCP.gp import gp_Trsf, gp_Vec, gp_Ax1, gp_Dir, gp_Pnt
+    import math
 
     P1 = pick1.point
     P2 = pick2.point
+    D1 = pick1.direction
+    D2 = pick2.direction
     N  = mated_normal.normalized()
 
-    delta = P2 - P1
+    if step2_type == "hole":
+        # --- Rotation about mated normal to index the angle ---
+        if D1 is None or D2 is None:
+            # No directions: fall back to translation
+            print("[Step3/hole] No directions -- cannot determine rotation angle.")
+            t = gp_Trsf()
+            return Location(t)
 
-    if wall_normal is not None:
-        # Compute the single free direction: intersection of mated plane and wall plane
-        W = wall_normal.normalized()
-        free_dir = N.cross(W)
-        if free_dir.length < 1e-6:
-            # mated_normal and wall_normal are parallel -- degenerate, use in-plane
-            free_dir = None
+        # Project directions onto mated plane
+        d1 = (D1 - N * D1.dot(N))
+        d2 = (D2 - N * D2.dot(N))
+        if d1.length < 1e-6 or d2.length < 1e-6:
+            print("[Step3/hole] Directions perpendicular to mated plane.")
+            return Location(gp_Trsf())
+
+        d1 = d1.normalized()
+        d2 = d2.normalized()
+
+        # Rotate d1 to align with d2 (or -d2, pick the smaller angle)
+        dot_pos = max(-1.0, min(1.0, d1.dot(d2)))
+        dot_neg = max(-1.0, min(1.0, d1.dot(-d2)))
+        if abs(dot_pos) >= abs(dot_neg):
+            target = d2
+            dot = dot_pos
         else:
-            free_dir = free_dir.normalized()
-    else:
-        free_dir = None
+            target = -d2
+            dot = dot_neg
 
-    if free_dir is not None:
-        # Project delta onto the single free direction only
-        translation = free_dir * delta.dot(free_dir)
-        print(f"[Step3] free_dir={free_dir}  delta={delta}  "
-              f"translation={translation}  len={translation.length:.3f}")
-    else:
-        # Fallback: translate within the mated plane
-        translation = delta - N * delta.dot(N)
-        print(f"[Step3] fallback in-plane translation={translation}")
+        angle = math.acos(dot)
+        cross = d1.cross(target)
+        sign = 1.0 if cross.dot(N) > 0 else -1.0
 
-    t = gp_Trsf()
-    if translation.length > 1e-6:
-        t.SetTranslation(gp_Vec(translation.X, translation.Y, translation.Z))
-    return Location(t)
+        # Rotate about mated_normal through the HOLE CENTER from Step 2.
+        # Using P1 (the picked face center) would translate the part as
+        # a side effect of the rotation. The hole center is the correct
+        # pivot because that's the point Step 2 constrained.
+        rot_pivot = pivot if pivot is not None else P1
+        print(f"[Step3/hole] angle={math.degrees(angle):.1f}deg  "
+              f"pivot={rot_pivot}")
+
+        t = gp_Trsf()
+        if abs(angle) > 1e-6:
+            ax = gp_Ax1(
+                gp_Pnt(rot_pivot.X, rot_pivot.Y, rot_pivot.Z),
+                gp_Dir(N.X * sign, N.Y * sign, N.Z * sign)
+            )
+            t.SetRotation(ax, angle)
+        return Location(t)
+
+    else:
+        # --- Translation along single free direction ---
+        delta = P2 - P1
+
+        if wall_normal is not None:
+            W = wall_normal.normalized()
+            free_dir = N.cross(W)
+            if free_dir.length < 1e-6:
+                free_dir = None
+            else:
+                free_dir = free_dir.normalized()
+        else:
+            free_dir = None
+
+        if free_dir is not None:
+            translation = free_dir * delta.dot(free_dir)
+            print(f"[Step3/wall] free_dir={free_dir}  "
+                  f"translation len={translation.length:.3f}")
+        else:
+            translation = delta - N * delta.dot(N)
+            print(f"[Step3/wall] fallback in-plane translation")
+
+        t = gp_Trsf()
+        if translation.length > 1e-6:
+            t.SetTranslation(gp_Vec(translation.X, translation.Y, translation.Z))
+        return Location(t)
 

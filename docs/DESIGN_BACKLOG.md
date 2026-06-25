@@ -1369,3 +1369,78 @@ Fixed in Bug 3's fix.
 
 `src/position_math_smoke_test.py` updated with Test 12 (edge-to-edge
 with rotation). All 39 checks pass.
+
+---
+
+## 19. 3-2-1 Positioning: Hole/Axis Step 2 and Step 3 Fixes
+
+**Status: COMPLETE.** Full 3-2-1 workflow confirmed working for both
+the wall/corner scenario and the hole/axis scenario.
+
+### What was fixed
+
+**Bug 1: Cylinder face misidentified as wall in Step 2.**
+The label check used `'circle' in label.lower()` but the cylinder
+face label reads `"cylinder axis (via rim edge, ...)"`. Fixed to
+`lbl.startswith('cylinder')` which correctly matches the label format
+set by `resolve_pick`.
+
+**Bug 2: Step 3 rotated about the wrong pivot point (hole scenario).**
+After hole alignment in Step 2, Step 3 must rotate the moving part
+about the **bolt hole axis** — the point Step 2 constrained. The
+original code rotated about P1 (the picked face center in Step 3),
+which introduced a spurious translation that moved the holes out of
+alignment.
+
+Root cause visible in debug output:
+```
+move=((73.3, -70.8, 0.0), (0, 0, 28.8°))
+```
+The 28.8° rotation was correct but `(73.3, -70.8)` translation showed
+the pivot was wrong. The part was rotating about the face center
+`(174, 107, 40)` instead of the hole center `(132.5, 88, 0)`.
+
+**Fix:** store `_step2_pivot = pick2.point` (the fixed hole center
+in world coordinates) when Step 2 detects a hole pick. Pass it to
+`compute_step3_move` as the rotation axis origin. Rotating about the
+hole center keeps the holes coincident -- Step 2 preserved exactly.
+
+After fix:
+```
+[Step3/hole] angle=28.8deg  pivot=(132.5, 88.0, 0.0)
+move=((~0, ~0, 0.0), (0, 0, 28.8°))   ← translation now ~zero
+```
+
+### State stored across steps
+
+- `_mated_normal`: face plane normal from Step 1 (constrains Steps 2+3)
+- `_wall_normal`: fixed face normal projected onto mated plane, set
+  by Step 2 wall pick (constrains Step 3 to single translation DOF)
+- `_step2_type`: "wall" or "hole" -- determines Step 3 behavior
+- `_step2_pivot`: fixed hole center from Step 2 hole pick -- used as
+  rotation axis origin in Step 3 hole scenario
+
+### Final 3-2-1 algorithm summary
+
+**Step 1 (Mate/Align):** rotate about intersection line of face planes.
+  Parallel planes (N1 ∥ N2): translate + optional 180° rotation.
+  `_mated_normal` stored from pick2.direction (±N2).
+
+**Step 2 (Align Face):**
+  - Flat face pick: rotate within mated plane until D1 ∥ D2, then
+    translate along D2 to close gap to wall. Stores `_wall_normal`.
+  - Cylinder face pick: translate in-plane until hole axes coincide.
+    Stores `_step2_pivot` = hole center in world coords.
+
+**Step 3 (Complete):**
+  - After wall Step 2: translate along `mated_normal × wall_normal`
+    only. No rotation, no other translation.
+  - After hole Step 2: rotate about `_step2_pivot` along `mated_normal`
+    until picked face directions align. No translation.
+
+### Files changed
+- `gui/position_dialog.py` -- `_step2_pivot` stored and passed to
+  Step 3; cylinder detection fixed; section numbers removed from
+  group box titles.
+- `src/pose.py` -- `compute_step3_move` accepts `pivot` parameter;
+  hole rotation pivots about stored hole center not pick1 point.

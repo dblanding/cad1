@@ -380,6 +380,8 @@ class PositionDialog(QDialog):
         self._move_history  = []           # list of applied Locations
         self._mated_normal: Optional[Vector] = None   # set by Step 1
         self._wall_normal: Optional[Vector] = None    # set by Step 2 (D2 in-plane)
+        self._step2_type: Optional[str] = None        # "wall" or "hole"
+        self._step2_pivot: Optional[Vector] = None    # hole center for Step 3 rotation
         self._active_section = "mate_align"  # "mate_align" | "align_axis" | "dynamic"
         self._active_step    = None          # "step1" | "step2" | "step3" | "axis" | "dynamic"
         self._step1_mode     = "mate"        # "mate" | "align"
@@ -412,7 +414,7 @@ class PositionDialog(QDialog):
         # ================================================================
         # SECTION 1: Mate / Align  (3-2-1)
         # ================================================================
-        sec1 = QGroupBox("1 — Mate / Align  (3-2-1)")
+        sec1 = QGroupBox("Mate / Align  (3-2-1)")
         sec1_layout = QVBoxLayout(sec1)
 
         self._step1_mate_btn = QPushButton("Step 1 — Mate")
@@ -453,7 +455,7 @@ class PositionDialog(QDialog):
         # ================================================================
         # SECTION 2: Align Axis
         # ================================================================
-        sec2 = QGroupBox("2 — Align Axis")
+        sec2 = QGroupBox("Align Axis")
         sec2_layout = QVBoxLayout(sec2)
         self._axis_btn = QPushButton("Align Axis (4 DOF)")
         self._axis_btn.setToolTip(
@@ -467,7 +469,7 @@ class PositionDialog(QDialog):
         # ================================================================
         # SECTION 3: Dynamic
         # ================================================================
-        sec3 = QGroupBox("3 — Dynamic (AIS Manipulator)")
+        sec3 = QGroupBox("Dynamic (AIS Manipulator)")
         sec3_layout = QVBoxLayout(sec3)
         self._dynamic_btn = QPushButton("Attach Manipulator")
         self._dynamic_btn.clicked.connect(self._on_dynamic)
@@ -617,19 +619,37 @@ class PositionDialog(QDialog):
             move = compute_step2_move(self._pick1, self._pick2,
                                       self._mated_normal)
             if move is not None:
-                # Remember the wall normal (D2 projected onto mated plane)
-                # so Step 3 can constrain motion to the single remaining DOF.
+                # Detect whether Step 2 was wall (flat face) or hole (cylinder).
+                # A cylindrical face pick has its circle_axis as direction AND
+                # the shape_type tells us; simplest heuristic: if pick2 has a
+                # circle_center it's a cylinder, otherwise it's a flat face.
+                # We use pick2.label which contains "circle" for cylinders.
                 N = self._mated_normal.normalized()
                 D2 = self._pick2.direction
-                if D2 is not None:
-                    d2_in_plane = D2 - N * D2.dot(N)
-                    if d2_in_plane.length > 1e-6:
-                        self._wall_normal = d2_in_plane.normalized()
+                # Detect hole (cylinder) vs wall (flat face) from pick label.
+                # resolve_pick sets label="cylinder axis ..." for cylindrical
+                # faces and "face normal ..." for flat faces.
+                lbl = (self._pick2.label or '').lower()
+                is_hole = lbl.startswith('cylinder') or 'circle' in lbl
+                self._step2_type = "hole" if is_hole else "wall"
+                print(f"[Step2] step2_type={self._step2_type}  label={self._pick2.label}")
+                if is_hole:
+                    # Store the fixed hole center as the rotation pivot for Step 3.
+                    # pick2.point is the circle center of the fixed hole.
+                    self._step2_pivot = self._pick2.point
+                else:
+                    D2 = self._pick2.direction
+                    if D2 is not None:
+                        d2_in_plane = D2 - N * D2.dot(N)
+                        if d2_in_plane.length > 1e-6:
+                            self._wall_normal = d2_in_plane.normalized()
 
         elif step == "step3":
             move = compute_step3_move(self._pick1, self._pick2,
                                       self._mated_normal,
-                                      self._wall_normal)
+                                      self._wall_normal,
+                                      self._step2_type,
+                                      self._step2_pivot)
 
         elif step == "axis":
             move = compute_align_axis_move(self._pick1, self._pick2)
@@ -795,6 +815,8 @@ class PositionDialog(QDialog):
         self._state = PositionState.IDLE
         self._mated_normal = None
         self._wall_normal = None
+        self._step2_type = None
+        self._step2_pivot = None
         self._move_history.clear()
         self.positioning_done.emit()
 
