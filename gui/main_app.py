@@ -782,7 +782,6 @@ class MainWindow(QWidget):
             )
             return
         self._fillet_dialog.set_active_part(active)
-        self._fillet_dialog.setFloating(True)
         self._fillet_dialog.show()
         self._fillet_dialog.raise_()
 
@@ -843,7 +842,6 @@ class MainWindow(QWidget):
             )
             return
         self._shell_dialog.set_active_part(active)
-        self._shell_dialog.setFloating(True)
         self._shell_dialog.show()
         self._shell_dialog.raise_()
 
@@ -892,7 +890,6 @@ class MainWindow(QWidget):
         """Open the Workplane/Create Part dialog."""
         if self._assembly is None:
             return
-        self._workplane_dialog.setFloating(True)
         self._workplane_dialog.show()
         self._workplane_dialog.raise_()
         # Sync the current active part in case it was set before dialog opened

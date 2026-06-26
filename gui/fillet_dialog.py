@@ -37,7 +37,7 @@ from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
 from OCP.AIS import AIS_Shape
 
 
-class FilletDialog(QDockWidget):
+class FilletDialog(QDialog):
     """
     Floating dock that manages: activate edge pick → accumulate edges
     → enter radius → apply fillet → replace part geometry.
@@ -47,7 +47,7 @@ class FilletDialog(QDockWidget):
     fillet_done = Signal(object, object)
 
     def __init__(self, parent=None, viewport=None):
-        super().__init__("Fillet / Blend", parent)
+        super().__init__(parent)
         self.setAllowedAreas(Qt.DockWidgetArea.NoDockWidgetArea)
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetFloatable |
@@ -110,9 +110,7 @@ class FilletDialog(QDockWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        container = QWidget()
-        self.setWidget(container)
-        layout = QVBoxLayout(container)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 

@@ -38,7 +38,7 @@ from OCP.gp import gp_Pnt
 from OCP.TopExp import TopExp_Explorer
 
 
-class ShellDialog(QDockWidget):
+class ShellDialog(QDialog):
     """
     Floating dock that manages: select open faces → enter thickness
     → apply shell → replace part geometry.
@@ -47,7 +47,7 @@ class ShellDialog(QDockWidget):
     shell_done = Signal(object, object)  # (node, new_TopoDS_Shape)
 
     def __init__(self, parent=None, viewport=None):
-        super().__init__("Shell", parent)
+        super().__init__(parent)
         self.setAllowedAreas(Qt.DockWidgetArea.NoDockWidgetArea)
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetFloatable |
@@ -107,9 +107,7 @@ class ShellDialog(QDockWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        container = QWidget()
-        self.setWidget(container)
-        layout = QVBoxLayout(container)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 

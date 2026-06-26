@@ -63,7 +63,7 @@ _WP_AXIS_COLOR = Quantity_Color(0.85, 0.2, 0.55, Quantity_TypeOfColor.Quantity_T
 _PART_COLOR = Quantity_Color(0.25, 0.45, 0.75, Quantity_TypeOfColor.Quantity_TOC_RGB)
 
 
-class WorkplaneDialog(QDockWidget):
+class WorkplaneDialog(QDialog):
     """
     Floating dock that manages: pick a face → show workplane →
     enter dimensions → extrude new part → add to assembly.
@@ -78,7 +78,7 @@ class WorkplaneDialog(QDockWidget):
     part_cut = Signal(object, object)
 
     def __init__(self, parent=None, viewport=None):
-        super().__init__("Workplane / Sketch / Extrude", parent)
+        super().__init__(parent)
         self.setAllowedAreas(Qt.DockWidgetArea.NoDockWidgetArea)
         self.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetFloatable |
@@ -98,9 +98,7 @@ class WorkplaneDialog(QDockWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        container = QWidget()
-        self.setWidget(container)
-        layout = QVBoxLayout(container)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
