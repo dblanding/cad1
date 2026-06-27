@@ -317,8 +317,12 @@ class OcctViewportWidget(QWidget):
         ais_shape = AIS_Shape(shape_to_display)
 
         if node.color is not None:
+            # build123d Color.wrapped is Quantity_ColorRGBA in this OCP build.
+            # GetRGB() returns a Quantity_Color with Red/Green/Blue methods.
             try:
-                r, g, b = node.color.to_tuple()[:3]
+                rgba = node.color.wrapped
+                rgb = rgba.GetRGB()
+                r, g, b = rgb.Red(), rgb.Green(), rgb.Blue()
             except Exception:
                 r, g, b = FALLBACK_PALETTE[palette_index % len(FALLBACK_PALETTE)]
         else:

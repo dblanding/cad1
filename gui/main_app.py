@@ -457,7 +457,7 @@ class SyncedViewportWidget(OcctViewportWidget):
 class MainWindow(QWidget):
     def __init__(self, step_path):
         super().__init__()
-        self.setWindowTitle(f"CAD Assistant (ours) -- {step_path}")
+        self.setWindowTitle(f"cad1 -- {step_path}")
         self.resize(1400, 800)
 
         outer_layout = QVBoxLayout(self)

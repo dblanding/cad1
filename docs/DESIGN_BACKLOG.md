@@ -1604,3 +1604,50 @@ has no Python-catchable fix. The proper long-term solution is to use
 - Called after cut/fillet/shell operations to reapply
   `SetFaceBoundaryDraw` which `context.Redisplay()` resets.
 - Also called after part moves so repositioned parts retain edges.
+
+---
+
+## 23. STEP Color Reading Fix
+
+**Status: COMPLETE.** Parts now display their correct STEP-embedded
+colors, matching CAD Assistant, Onshape, and KodaCAD.
+
+**Symptom:** All parts displayed in randomized palette colors instead
+of their correct STEP colors (bolts=blue, nuts=red, brackets=green,
+plate=yellow). The fallback palette was being used for every part.
+
+**Root cause investigation (three layers of failure):**
+
+1. **`node.color.to_tuple()` doesn't exist.**
+   The original code called `node.color.to_tuple()` but build123d's
+   `Color` class has no such method. The `try/except` silently caught
+   the `AttributeError` every time and fell back to the palette.
+   `Color` only has two attributes: `wrapped` and `categorical_set`.
+
+2. **`node.color.wrapped` is `Quantity_ColorRGBA`, not `Quantity_Color`.**
+   The second attempt used `node.color.wrapped.Red()` but this OCP
+   build wraps colors as `Quantity_ColorRGBA` (RGBA, not RGB). That
+   class has no `.Red()` method directly -- another silent fallback.
+
+3. **Correct chain: `.wrapped.GetRGB().Red/Green/Blue()`.**
+   `Quantity_ColorRGBA.GetRGB()` returns a `Quantity_Color` (RGB),
+   which then has `.Red()`, `.Green()`, `.Blue()` methods.
+
+**The fix (one clean expression):**
+```python
+rgba = node.color.wrapped   # Quantity_ColorRGBA
+rgb  = rgba.GetRGB()        # Quantity_Color
+r, g, b = rgb.Red(), rgb.Green(), rgb.Blue()
+```
+
+**Confirmed working:** nuts=red (1,0,0), bolts=blue (0,0,1),
+l-brackets=green (0,1,0), rod=orange, plate=yellow-green.
+Colors now match all other CAD viewers that read the same STEP file.
+
+**The colors were always in the file.** `check_colors.py` confirmed
+build123d's `import_step()` reads them correctly -- they were present
+on every node. The bug was entirely in how we extracted the RGB values
+from the `Color` object.
+
+**File changed:** `gui/assembly_viewer.py` -- `_display_leaf()` color
+extraction.
