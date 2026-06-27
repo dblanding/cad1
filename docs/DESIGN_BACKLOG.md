@@ -1775,3 +1775,72 @@ and how `node._wrapped` is managed.
 Alternatively: detect shared instances on load (same referred shape
 label in XDE), group them, and propagate modifications to all members
 of each group.
+
+---
+
+## 26. Shared Instances: Modifications Create Copies (Known Limitation)
+
+**Status: KNOWN LIMITATION -- documented, not hidden.**
+
+### Background: what shared instances are
+
+In a STEP file using XDE's reference architecture, multiple placements
+of the same part share a single referred shape at the document root.
+Each placement (instance) carries only a location transform. This is
+the DRY principle applied to CAD: one definition, many placements.
+The as1-oc-214.stp file has two l-bracket instances that share one
+referred shape (confirmed: `IsSame()` returns True for both nodes).
+
+### What happens when you modify a shared instance
+
+**Current behavior:** When fillet, shell, or cut is applied to one
+instance, that instance's `node._wrapped` is replaced with the
+modified shape -- a new `TopoDS_Shape` with a new `TShape` pointer.
+The modified instance is NO LONGER shared with the others. It has
+become an independent copy.
+
+The other instances are unaffected -- they still share the original
+root shape and remain shared instances of each other.
+
+So after filleting one l-bracket:
+- The filleted l-bracket becomes an independent copy. ✗
+- The other l-bracket remains a shared instance (of the original). ✓
+- They are now two different parts, not two instances of one part. ✗
+- Export to STEP will produce two separate shapes. ✗
+
+### Why this happens
+
+`import_step()` walks the XDE document and creates a Python node tree
+where each instance gets its own `_wrapped` TopoDS_Shape object. The
+underlying TShape pointer IS shared (IsSame=True), but `_wrapped` is
+a separate Python object per node. Replacing `_wrapped` on one node
+does not affect any other node.
+
+### What the correct approach would be
+
+In KodaCAD's XDE-aware architecture, the geometry is stored at a root
+label (identity location). Modifying a part calls `replace_shape()`
+on the ROOT label. Since all instances reference that root, they all
+automatically reflect the change.
+
+To do this correctly we would need to:
+1. Maintain the XDE document structure through modifications
+   (using `XCAFDoc_DocumentTool_ShapeTool.SetShape(root_label, ...)`).
+2. Store root geometry and instance locations separately.
+3. On display, apply each instance's location to the shared root geometry.
+
+This is a significant refactor of `step_assembly_poc.py` and the node
+model. It is deferred to a future session.
+
+### Current workaround (NOT implemented -- see note below)
+
+An earlier draft of this code added `get_shared_instances()` tracking
+via `_tshape_to_nodes` and propagated modifications to all instances.
+This was REMOVED because it masked the limitation rather than fixing it:
+propagating a copy to all instances makes them all into independent
+copies simultaneously, which is worse than the honest behavior of
+making only the modified instance into a copy.
+
+The correct user-visible behavior is: modify one instance → that
+instance becomes a copy, others stay shared. This is what we have now.
+Users should be aware that modifications break sharing.

@@ -786,26 +786,73 @@ class MainWindow(QWidget):
         self._fillet_dialog.show()
         self._fillet_dialog.raise_()
 
-    def _on_fillet_done(self, node, new_shape):
+    def _apply_shape_to_node(self, node, new_shape, operation="modify"):
         """
-        Fillet complete -- replace the part's geometry, same pattern as
-        _on_part_cut: preserve color, rebuild ancestors for export.
+        Replace node._wrapped with new_shape and redisplay the node
+        in its correct assembled position. Handles the global_location
+        capture, ancestor rebuild, AIS removal, and redisplay.
+        Used by fillet, shell, and cut to propagate to shared instances.
         """
-        # Capture the PARENT's global location before replacing _wrapped.
-        # MakeFillet geometry is computed in work_shape's local frame
-        # (after its rotation is applied to coordinates). So we need
-        # to apply only the parent's world transform, not the full
-        # global_location (which would re-apply node's own rotation).
-        # parent_global = global_location * node.location.inverse
         from build123d import Location as B123Location
+
+        # Capture parent's global location BEFORE replacing _wrapped.
+        # Boolean/fillet ops strip the location tag from their result.
+        # global_location is derived from _wrapped.Location(), so it
+        # breaks after we store the identity-located new_shape.
+        # We need parent's transform only (not node's own rotation)
+        # since the result geometry is already in node's local frame.
         node_loc = node.location
         global_loc = node.global_location
-        # Compose: parent_loc = global_loc * node_loc^-1
         parent_global = B123Location(
             global_loc.wrapped.Multiplied(node_loc.wrapped.Inverted()))
-        saved_global_location = parent_global
+
         node._wrapped = new_shape
         self._rebuild_ancestors(node)
+
+        self.viewport.context.ClearSelected(False)
+        old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
+        original_color_rgb = None
+        if old_ais is not None:
+            info = self.viewport._ais_shape_to_node.get(id(old_ais))
+            if info:
+                original_color_rgb = info.get("color_rgb")
+            self.viewport.context.Deactivate(old_ais)
+            self.viewport.context.Remove(old_ais, False)
+            self.viewport._ais_shapes = [
+                s for s in self.viewport._ais_shapes if s is not old_ais
+            ]
+            self.viewport._ais_shape_to_node.pop(id(old_ais), None)
+            del self.viewport._node_id_to_ais_shape[id(node)]
+
+        self.viewport.display_node(node, f"/{node.label or 'part'}",
+                                   override_location=parent_global)
+
+        if original_color_rgb is not None:
+            new_ais = self.viewport._node_id_to_ais_shape.get(id(node))
+            if new_ais is not None:
+                from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
+                r, g, b = original_color_rgb
+                new_ais.SetColor(Quantity_Color(
+                    r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB))
+                self.viewport.context.Redisplay(new_ais, False)
+                self.viewport._apply_black_edges(new_ais)
+                info = self.viewport._ais_shape_to_node.get(id(new_ais))
+                if info:
+                    info["color_rgb"] = original_color_rgb
+
+        self.viewport._apply_black_edges()
+        self.viewport.context.UpdateCurrentViewer()
+        self.viewport.update()
+        self._on_active_part_changed(node)
+        print(f"{operation} complete: '{node.label}' updated.")
+
+    def _on_fillet_done(self, node, new_shape):
+        """
+        Fillet complete -- replace the part's geometry.
+        NOTE: This makes the modified instance an independent copy --
+        it is no longer a shared instance. See DESIGN_BACKLOG item 26.
+        """
+        self._apply_shape_to_node(node, new_shape, operation="fillet")
 
         self.viewport.context.ClearSelected(False)
         old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
@@ -861,52 +908,9 @@ class MainWindow(QWidget):
         self._shell_dialog.raise_()
 
     def _on_shell_done(self, node, new_shape):
-        """Shell complete -- same replace-in-place pattern as fillet/cut."""
-        from build123d import Location as B123Location
-        node_loc = node.location
-        global_loc = node.global_location
-        parent_global = B123Location(
-            global_loc.wrapped.Multiplied(node_loc.wrapped.Inverted()))
-        saved_global_location = parent_global
-        node._wrapped = new_shape
-        self._rebuild_ancestors(node)
-
-        self.viewport.context.ClearSelected(False)
-        old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
-        original_color_rgb = None
-        if old_ais is not None:
-            info = self.viewport._ais_shape_to_node.get(id(old_ais))
-            if info:
-                original_color_rgb = info.get("color_rgb")
-            self.viewport.context.Deactivate(old_ais)
-            self.viewport.context.Remove(old_ais, False)
-            self.viewport._ais_shapes = [
-                s for s in self.viewport._ais_shapes if s is not old_ais
-            ]
-            self.viewport._ais_shape_to_node.pop(id(old_ais), None)
-            del self.viewport._node_id_to_ais_shape[id(node)]
-
-        self.viewport.display_node(node, f"/{node.label or 'part'}",
-                                   override_location=saved_global_location)
-
-        if original_color_rgb is not None:
-            new_ais = self.viewport._node_id_to_ais_shape.get(id(node))
-            if new_ais is not None:
-                from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
-                r, g, b = original_color_rgb
-                new_ais.SetColor(Quantity_Color(
-                    r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB))
-                self.viewport.context.Redisplay(new_ais, False)
-                self.viewport._apply_black_edges(new_ais)
-                info = self.viewport._ais_shape_to_node.get(id(new_ais))
-                if info:
-                    info["color_rgb"] = original_color_rgb
-
-        self.viewport._apply_black_edges()
-        self.viewport.context.UpdateCurrentViewer()
-        self.viewport.update()
-        self._on_active_part_changed(node)
-        print(f"Shell complete: '{node.label}' updated.")
+        """Shell complete -- same replace-in-place pattern as fillet/cut.
+        NOTE: Makes the modified instance an independent copy. See item 26."""
+        self._apply_shape_to_node(node, new_shape, operation="shell")
 
     def _on_create_part_clicked(self):
         """Open the Workplane/Create Part dialog."""
@@ -1255,26 +1259,10 @@ class MainWindow(QWidget):
 
     def _on_part_cut(self, node, new_shape):
         """
-        Cut/Mill completed -- replace the part's geometry in the viewport,
-        preserving the original display color.
+        Cut/Mill completed -- replace the part's geometry in the viewport.
+        Cut intentionally does NOT propagate to shared instances -- cutting
+        into one instance leaves others unchanged.
         """
-        # Update node's wrapped shape directly -- Shape.cast() returns None
-        # for raw OCCT shapes, so assign _wrapped directly.
-        # Capture the parent's global location before replacing _wrapped.
-        # Boolean ops strip the location; we need parent's transform only
-        # since the result geometry is already in node's local frame.
-        from build123d import Location as B123Location
-        node_loc = node.location
-        global_loc = node.global_location
-        parent_global = B123Location(
-            global_loc.wrapped.Multiplied(node_loc.wrapped.Inverted()))
-        saved_global_location = parent_global
-        node._wrapped = new_shape
-
-        # Rebuild ancestor compounds so export_step can register them
-        # (same reason as _rebuild_ancestors in _on_part_created).
-        self._rebuild_ancestors(node)
-
         # Erase overlay FIRST -- it refs the old shape, must go before Remove()
         overlay = getattr(self, '_active_part_overlay_ais', None)
         if overlay is not None:
@@ -1285,51 +1273,7 @@ class MainWindow(QWidget):
                 pass
             self._active_part_overlay_ais = None
 
-        # Clear OCCT selection before removing
-        self.viewport.context.ClearSelected(False)
-
-        # Save original color before removing old AIS
-        old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
-        original_color_rgb = None
-        if old_ais is not None:
-            info = self.viewport._ais_shape_to_node.get(id(old_ais))
-            if info:
-                original_color_rgb = info.get("color_rgb")
-            self.viewport.context.Deactivate(old_ais)
-            self.viewport.context.Remove(old_ais, False)
-            self.viewport._ais_shapes = [
-                s for s in self.viewport._ais_shapes if s is not old_ais
-            ]
-            self.viewport._ais_shape_to_node.pop(id(old_ais), None)
-            del self.viewport._node_id_to_ais_shape[id(node)]
-
-        # Redisplay new shape with saved location (boolean ops strip location)
-        self.viewport.display_node(node, f"/{node.label or 'part'}",
-                                   override_location=saved_global_location)
-
-        # Restore original color on the new AIS
-        if original_color_rgb is not None:
-            new_ais = self.viewport._node_id_to_ais_shape.get(id(node))
-            if new_ais is not None:
-                from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
-                r, g, b = original_color_rgb
-                color = Quantity_Color(
-                    r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB)
-                new_ais.SetColor(color)
-                self.viewport.context.Redisplay(new_ais, False)
-                self.viewport._apply_black_edges(new_ais)
-                info = self.viewport._ais_shape_to_node.get(id(new_ais))
-                if info:
-                    info["color_rgb"] = original_color_rgb
-
-        self.viewport._apply_black_edges()
-        self.viewport.context.UpdateCurrentViewer()
-        self.viewport.update()
-        print(f"Cut complete: '{node.label}' updated in viewport.")
-
-        # Re-apply orange overlay on the new shape
-        self._on_active_part_changed(node)
-
+        self._apply_shape_to_node(node, new_shape, operation="cut")
 
     def _on_node_delete_requested(self, node):
         """
