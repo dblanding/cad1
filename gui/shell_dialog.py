@@ -23,7 +23,7 @@ import sys
 import os
 
 from PySide6.QtWidgets import (
-    QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
+    QDialog, QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QGroupBox,
     QListWidget, QListWidgetItem, QMessageBox,
 )
@@ -48,11 +48,13 @@ class ShellDialog(QDialog):
 
     def __init__(self, parent=None, viewport=None):
         super().__init__(parent)
-        self.setAllowedAreas(Qt.DockWidgetArea.NoDockWidgetArea)
-        self.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetFloatable |
-            QDockWidget.DockWidgetFeature.DockWidgetClosable
+        self.setWindowTitle("Shell")
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowStaysOnTopHint
         )
+        self.resize(300, 380)
+        self.setMinimumWidth(260)
 
         self._viewport = viewport
         self._active_part = None

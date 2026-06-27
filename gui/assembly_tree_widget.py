@@ -335,6 +335,10 @@ class AssemblyTreeWidget(QTreeWidget):
             menu.addSeparator()
 
         # Delete -- not available on root
+        act_rename = QAction("✏ Rename...", self)
+        act_rename.triggered.connect(lambda: self._on_rename(item, node))
+        menu.addAction(act_rename)
+
         act_delete = QAction("🗑 Delete", self)
         act_delete.setEnabled(not is_root)
         act_delete.triggered.connect(lambda: self._on_delete(node))
@@ -382,6 +386,33 @@ class AssemblyTreeWidget(QTreeWidget):
 
         print(f"Created sub-assembly '{name}' under '{parent_node.label}'")
         self.sub_assembly_created.emit(new_assy, parent_node)
+
+    def _on_rename(self, item, node):
+        """Prompt for a new name and update both the tree item and node label."""
+        from PySide6.QtWidgets import QInputDialog
+
+        # Strip any active/prefix decorations to get the base label
+        current = item.text(0)
+        for prefix in ("► ", "★ "):
+            if current.startswith(prefix):
+                current = current[2:]
+                break
+
+        new_name, ok = QInputDialog.getText(
+            self, "Rename", "New name:", text=current)
+        if not ok or not new_name.strip():
+            return
+
+        new_name = new_name.strip()
+        node.label = new_name
+
+        # Restore any active prefix
+        prefix = ""
+        if item.text(0).startswith("► "):
+            prefix = "► "
+        elif item.text(0).startswith("★ "):
+            prefix = "★ "
+        item.setText(0, f"{prefix}{new_name}")
 
     def _on_delete(self, node):
         """Delete a node from tree + assembly data after confirmation."""

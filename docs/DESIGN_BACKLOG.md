@@ -1574,3 +1574,33 @@ The viewport crash on mouse move (item 20) was traced to
 `context.MoveTo()` with EDGE+VERTEX active on 18+ parts. The crash
 has no Python-catchable fix. The proper long-term solution is to use
 `AIS_ViewController` instead of calling `context.MoveTo()` directly.
+
+---
+
+## 22. Minor UI Improvements
+
+**Status: COMPLETE.**
+
+### RMB Rename in Assembly Tree
+- Added "✏ Rename..." to the RMB context menu on all tree nodes.
+- Pops a `QInputDialog` pre-filled with the current label.
+- Updates both `node.label` and the displayed tree item text.
+- Correctly preserves `► ` (active assembly) and `★ ` (active part)
+  prefixes if the item is currently active.
+- File: `gui/assembly_tree_widget.py`
+
+### All Floating Dialogs Converted to QDialog
+- `WorkplaneDialog`, `FilletDialog`, `ShellDialog` converted from
+  `QDockWidget` to `QDialog` (matching `PositionDialog` which was
+  converted earlier in item 18).
+- Result: proper OS window decorations with full-size resize handles
+  on all floating operation dialogs.
+- Fixed `NameError: QDialog not defined` by adding `QDialog` to
+  imports and removing leftover `setAllowedAreas`/`setFeatures`
+  dock-widget-specific calls that don't exist on `QDialog`.
+
+### Black Edges Persist After Operations
+- `_apply_black_edges()` helper added to `SyncedViewportWidget`.
+- Called after cut/fillet/shell operations to reapply
+  `SetFaceBoundaryDraw` which `context.Redisplay()` resets.
+- Also called after part moves so repositioned parts retain edges.

@@ -34,7 +34,7 @@ import sys
 import os
 
 from PySide6.QtWidgets import (
-    QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
+    QDialog, QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QGroupBox,
     QMessageBox, QSizePolicy,
 )
@@ -79,11 +79,13 @@ class WorkplaneDialog(QDialog):
 
     def __init__(self, parent=None, viewport=None):
         super().__init__(parent)
-        self.setAllowedAreas(Qt.DockWidgetArea.NoDockWidgetArea)
-        self.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetFloatable |
-            QDockWidget.DockWidgetFeature.DockWidgetClosable
+        self.setWindowTitle("Workplane / Sketch / Extrude")
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowStaysOnTopHint
         )
+        self.resize(320, 560)
+        self.setMinimumWidth(280)
 
         self._viewport = viewport       # OcctViewportWidget (or subclass)
         self._workplane = None          # WorkPlane instance, set after face pick
