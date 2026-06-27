@@ -198,6 +198,17 @@ class OcctViewportWidget(QWidget):
         # documented Qt+OpenGL gotcha, not specific to OCCT).
         self.update()
 
+    def display_node(self, node, path_prefix="", override_location=None):
+        """Display a single leaf node, optionally with an overridden location."""
+        palette_index = len(self._ais_shapes)
+        if not node.children and node.wrapped is not None:
+            self._display_leaf(node, path_prefix, palette_index,
+                               override_location=override_location)
+            self.context.UpdateCurrentViewer()
+            self.update()
+            return 1
+        return self.display_subtree(node, path_prefix)
+
     def display_subtree(self, node, path_prefix=""):
         """
         Walk a node's subtree and display all leaf solids, adding them
@@ -265,7 +276,7 @@ class OcctViewportWidget(QWidget):
 
         return assembly
 
-    def _display_leaf(self, node, path, palette_index):
+    def _display_leaf(self, node, path, palette_index, override_location=None):
         """
         Create one shaded, colored AIS_Shape for a single leaf solid,
         and record it in the pick -> part lookup map.
@@ -311,7 +322,8 @@ class OcctViewportWidget(QWidget):
         # this REPLACES a shape's location outright (confirmed,
         # unambiguous contract; this is the same .Located() call used
         # successfully in the manual-fallback path below already).
-        global_loc = node.global_location
+        global_loc = override_location if override_location is not None \
+            else node.global_location
         shape_to_display = node.wrapped.Located(global_loc.wrapped)
 
         ais_shape = AIS_Shape(shape_to_display)

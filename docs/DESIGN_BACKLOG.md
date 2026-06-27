@@ -1651,3 +1651,127 @@ from the `Color` object.
 
 **File changed:** `gui/assembly_viewer.py` -- `_display_leaf()` color
 extraction.
+
+---
+
+## 24. Fillet/Shell/Cut Redisplay Position Fix
+
+**Status: COMPLETE.** Fillet, shell, and cut results now display in
+the correct assembled position.
+
+### Root cause (took many attempts to find)
+
+`BRepFilletAPI_MakeFillet` (and boolean ops like Cut/Fuse) **strip the
+location tag** from their result. `mk.Shape()` always returns
+`IsIdentity=True` even when the input shape had a non-identity location.
+
+`build123d`'s `node.global_location` is computed as:
+```python
+reduce(lambda loc, n: loc * n.location, self.path, Location())
+```
+where `node.location = Location(node._wrapped.Location())`.
+
+So when we store `node._wrapped = mk.Shape()` (identity location),
+`node.location` becomes identity and `global_location` loses the node's
+own rotation -- producing a completely wrong world position.
+
+### Key discoveries along the way
+
+- `TopoDS_Shape.Located()` REPLACES the location tag (confirmed by
+  applying twice gives same result as once).
+- `TopoDS_Shape.Location().IsIdentity()` returns True for `mk.Shape()`
+  but the shape is NOT truly at origin -- the geometry coordinates are
+  in the shape's LOCAL frame (after the node's own rotation is applied
+  to the coordinates). The location tag is just stripped/missing.
+- `BRepBuilderAPI_Transform`, `Move()`, and `Located()` all compound
+  with the existing location rather than truly replacing it in the way
+  we needed.
+- `node.global_location` is derived from `_wrapped.Location()`, not
+  from the tree hierarchy independently. Changing `_wrapped` changes
+  `global_location`.
+
+### The fix
+
+Capture `node.global_location` and `node.location` BEFORE replacing
+`_wrapped`. Compute the PARENT's world transform by removing the node's
+own contribution:
+
+```python
+node_loc    = node.location
+global_loc  = node.global_location
+parent_global = Location(global_loc.wrapped.Multiplied(
+                    node_loc.wrapped.Inverted()))
+saved_global_location = parent_global
+node._wrapped = new_shape  # identity-located result from MakeFillet
+```
+
+Then display with `override_location=saved_global_location`:
+- `_display_leaf` now accepts `override_location` parameter
+- New `display_node()` method passes `override_location` through
+- `_on_fillet_done`, `_on_shell_done`, `_on_part_cut` all use this
+
+Why parent's global location (not full global_location):
+The fillet result geometry is already in the node's local coordinate
+frame (with node's rotation applied to coordinates). Applying the full
+`global_location` (which includes node's rotation) would double-apply
+it. The parent's location provides only the parent-chain transforms,
+which is exactly what's needed to position the node's local geometry
+in world space.
+
+### Edge matching fix (also in this session)
+
+Fillet edge matching and shell face matching also needed the same
+world-space treatment. Fixed by walking both `work_shape` (local,
+for passing to `MakeFillet`) and `world_shape = work_shape.Located(gloc)`
+(for midpoint comparison with world-space picked edges) in parallel.
+
+### Shared vs. copied parts (known issue, item 25)
+
+In KodaCAD (which uses XDE's STEP reference architecture), filleting
+one l-bracket instance updates BOTH instances because they share the
+same referred shape in the XDE document. Our implementation stores
+`node._wrapped` per-node, so each instance is independent. The STEP
+file has two l-bracket instances that share one referred shape -- we
+currently treat them as independent copies. This is correct for
+export but loses the shared-reference relationship. See item 25.
+
+---
+
+## 25. Shared vs. Copied Part Instances (FUTURE)
+
+**Status: FUTURE INVESTIGATION.**
+
+### The issue
+
+STEP files use an XDE reference architecture where multiple instances
+of the same part share a single referred shape at the document root.
+The location of each instance is stored separately as a transform.
+
+KodaCAD's `replace_shape()` modifies the referred shape at the document
+root, so ALL instances that reference it are updated simultaneously.
+This is the correct CAD behavior -- modifying a shared part updates
+everywhere it appears.
+
+Our implementation stores `node._wrapped` independently per node, so
+each tree node holds its own copy of the geometry. Filleting one
+l-bracket does not affect the other because they have separate `_wrapped`
+objects even though the STEP file defined them as shared instances.
+
+### What this means in practice
+
+- Fillet/shell/cut on one instance does NOT update other instances ✗
+- Each modification creates an independent copy of the part ✗
+- Export to STEP will produce two separate shapes instead of one
+  referred shape with two instances ✗
+
+### Possible future fix
+
+Adopt KodaCAD's XDE approach: use `XCAFDoc_DocumentTool_ShapeTool`
+to maintain the STEP document structure, store shapes at root labels,
+and apply `replace_shape()` to update all instances simultaneously.
+This would require a significant refactor of `step_assembly_poc.py`
+and how `node._wrapped` is managed.
+
+Alternatively: detect shared instances on load (same referred shape
+label in XDE), group them, and propagate modifications to all members
+of each group.

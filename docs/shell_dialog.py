@@ -273,4 +273,4 @@ class ShellDialog(QDialog):
                 "BRepOffsetAPI_MakeThickSolid failed.\n"
                 "Check that the thickness is not larger than the part geometry."
             )
-        return mk.Shape()
+        return mk.Shape().Located(work_shape.Location())

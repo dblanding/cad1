@@ -296,4 +296,4 @@ class FilletDialog(QDialog):
             )
         # Restore the original location so the result has the same transform
         # as the input shape -- _display_leaf applies global_location correctly.
-        return mk.Shape()
+        return mk.Shape().Located(work_shape.Location())
