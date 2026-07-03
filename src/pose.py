@@ -1,31 +1,46 @@
 """
 pose.py
 
-The "move a part from here to there" system, designed around the
-3-2-1 workplane-pair idea: you define a `from_plane` (a coordinate
-frame anchored to the part being moved, derived from picked geometry)
-and a `to_plane` (a coordinate frame anchored to the target location,
-also derived from picked geometry), and the move is simply "make
-from_plane coincide with to_plane."
+POSITIONING MATH -- geometry for the Mate/Align 3-2-1 workflow.
 
-KEY DESIGN DECISION: this builds on build123d's own `Plane` and
-`Location` classes rather than reinventing coordinate-frame math.
-build123d's Plane is already exactly the "workplane" abstraction
-(origin + x_dir + y_dir(implicit) + z_dir, right-handed -- see
-build123d's own "Understanding Planes" discussion #569), and
-Location already supports composition via the `*` operator. We are
-NOT rebuilding gp_Trsf composition by hand; we're building the layer
-ABOVE that -- resolving picked geometry (vertices, edges, faces) into
-a Plane, and computing the one-shot transform between two Planes.
+All public functions take PickResult named tuples and return build123d
+Location objects representing the move to apply to the moving part.
 
-This module has ZERO GUI dependency on purpose, same philosophy as
-step_assembly_poc.py: the pose math should be fully testable and
-debuggable before any picking UI or AIS_Manipulator gizmo touches it.
+A PickResult is created by resolve_pick() from an AIS selection:
+  face        -> .point = face center, .direction = face normal
+  edge        -> .point = edge midpoint, .direction = edge direction
+  cylinder    -> .point = axis center, .direction = axis direction
+                 .label starts with "cylinder axis"
 
-NOT YET TESTED (no execution environment available here) -- written
-carefully against build123d's documented Plane/Location API, but
-treat the first run as a debugging session, same as every other piece
-of this project so far.
+FUNCTIONS:
+
+  resolve_pick(shape, shape_type, node)
+    Convert an AIS selection into a PickResult with point + direction.
+
+  find_intersection_line(P1, N1, P2, N2)
+    Return (point, direction) of intersection line of two planes,
+    or None if planes are parallel.
+
+  compute_step1_move(pick1, pick2, mate)
+    Step 1: rotate about intersection line of face planes until flush.
+    mate=True: normals become opposed. mate=False: normals become parallel.
+    PARALLEL PLANES: when N1 || N2, find_intersection_line returns None.
+    Four sub-cases: N1~=N2 mate needs 180-deg rotation + translation;
+    N1~=-N2 mate needs only translation; opposite for align.
+
+  compute_step2_move(pick1, pick2, mated_normal)
+    Step 2: rotate within mated plane until D1_in_plane || D2_in_plane,
+    then translate along D2 to close the gap. Target is parallel (not
+    anti-parallel) -- align means same direction, not opposed.
+
+  compute_step3_move(pick1, pick2, mated_normal, wall_normal,
+                     step2_type, pivot)
+    Step 3: remove the last remaining DOF.
+    wall: translate along free_dir = mated_normal x wall_normal only.
+    hole: rotate about pivot (hole center from Step 2) along mated_normal.
+
+  compute_align_axis_move(pick1, pick2)
+    Align Axis: make cylinder axes parallel and coincident.
 """
 
 from __future__ import annotations

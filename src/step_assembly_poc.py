@@ -1,29 +1,46 @@
 """
 step_assembly_poc.py
 
-Minimal proof-of-concept for the one capability that makes or breaks a
-DIY CAD app: round-tripping a STEP assembly.
+STEP ASSEMBLY LOAD/SAVE -- the data model for cad1.
 
-    1. Import a STEP file as a build123d Compound, preserving the
-       assembly hierarchy (sub-assemblies / parts / names).
-    2. Print the tree so you can see what survived the import.
-    3. Programmatically add a new part to the assembly and remove an
-       existing one, by label.
-    4. Re-export the modified assembly as a new STEP file.
+Wraps build123d's import_step() to load a STEP file as a build123d
+Compound tree, and provides add/remove/save operations on that tree.
 
-This is deliberately a command-line script, not a GUI, so the geometry
-plumbing can be verified in isolation before any Qt code is written.
+WHY import_step() INSTEAD OF RAW OCCT:
+  build123d's import_step() uses OCCT's STEPCAFControl_Reader (not the
+  bare STEPControl_Reader), which gives you the full XDE document with
+  names, colors, and assembly hierarchy preserved. Getting that right
+  from raw OCCT is tedious; leaning on build123d here is worth it.
 
-CONFIRMED WORKING as of real-world testing (see README.md for the
-full diagnosis). Getting here required working around a genuine bug
-in build123d's export_step() -- see step_export_fix.py. The fix is
-applied transparently via the import below; no special handling
-needed elsewhere in this file.
+FUNCTIONS:
+  load_assembly(step_path)
+    Load a STEP file. Returns a build123d Compound. Each node has:
+      .label           -- part name from the STEP file
+      .color           -- Quantity_ColorRGBA if the file has color data,
+                          else None. Extract RGB via:
+                          node.color.wrapped.GetRGB()  (NOT .to_tuple())
+      .location        -- local transform within its parent (Location)
+      .global_location -- full world transform (product of all ancestors)
+                          Computed as: reduce(loc * n.location, self.path)
+                          Derived from _wrapped.Location() -- changes when
+                          _wrapped is replaced. Capture BEFORE modifying.
+      .wrapped         -- the underlying TopoDS_Shape
 
-Requires:
-    pip install build123d
+  add_node(parent, label, shape)  -- add a new Solid leaf under parent
+  remove_node(node)               -- detach node from its parent
+  save_assembly(assembly, path)   -- export to STEP (uses step_export_fix)
+
+STEP EXPORT BUG (fixed transparently):
+  build123d's export_step() silently produces an empty file when called
+  on a Compound whose .parent is not None. The fix is in step_export_fix.py.
+  See DESIGN_BACKLOG item 5.
+
+SHARED INSTANCES:
+  When a STEP file has multiple instances of the same part, import_step()
+  preserves the shared TShape pointer (node.wrapped.IsSame() returns True
+  for all instances). Modifying one instance's _wrapped breaks the share --
+  it becomes an independent copy. See DESIGN_BACKLOG item 26.
 """
-
 from __future__ import annotations
 
 import sys

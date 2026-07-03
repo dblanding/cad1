@@ -1,41 +1,43 @@
 """
 workplane.py
 
+THE WORKPLANE -- 2D coordinate system anchored to a 3D face.
+
 Ported from Doug Blanding's kodacad project (github.com/dblanding/kodacad)
-with permission. Original copyright 2022 Doug Blanding.
+with permission. Changes from original: OCC.Core.* -> OCP.*, simplified
+__init__ to accept a build123d Face directly, OCCUtils replaced inline.
 
-Changes from the original:
-  - OCC.Core.* imports translated to OCP.* (the newer Python bindings)
-  - OCCUtils.Construct.face_normal replaced with inline implementation
-  - WorkPlane.__init__ simplified: 'On Face' mode now accepts a
-    build123d Face wrapper directly (as well as the original TopoDS_Face)
-  - No other logic changes; all 2D geometry math is identical
+WHAT A WORKPLANE IS:
+  A coordinate system with:
+    origin  -- face center (in 3D world coordinates)
+    U axis  -- x direction of the 2D sketch
+    V axis  -- y direction of the 2D sketch
+    W axis  -- face normal (extrusion direction, points out of the face)
+  All 2D sketch coordinates are in (U, V) space. self.Trsf converts
+  them to 3D world coordinates for OCCT operations.
 
-WHAT THIS MODULE PROVIDES:
+CREATION MODES:
+  WorkPlane()              -- at origin, aligned with global XY plane
+  WorkPlane(face, faceU)   -- on a picked face; faceU defines U direction
+  WorkPlane(ax3=gp_Ax3())  -- fully specified (programmatic use)
 
-WorkPlane -- a 2D coordinate system anchored to 3D geometry, used for
-  creating 2D profiles (sketch geometry) that can be extruded or cut
-  to create or modify 3D solid parts.
+2D GEOMETRY STORED:
+  self.clines  -- construction lines as (a, b, c) coefficients (ax+by+c=0)
+  self.ccircs  -- construction circles as ((cx, cy), r)
+  self.edgeList -- profile edges as TopoDS_Edge objects
 
-  Key concepts:
-    - The workplane has a W direction (the face normal, pointing out of
-      the plane), a U direction (x-axis of the 2D sketch), and a V
-      direction (y-axis). U x V = W.
-    - All sketch geometry is expressed in 2D (U, V) coordinates and
-      transformed to 3D world coordinates via self.Trsf.
-    - Construction geometry (clines, ccircs) aids layout but is not
-      included in the final profile.
-    - Profile geometry (edgeList) forms the closed loop that gets
-      turned into a wire and extruded/cut.
-
-  Creation modes:
-    1. Default: workplane at origin, aligned with XY plane.
-    2. On Face (face + faceU): workplane lies on face, U direction
-       defined by the normal of faceU. This is the primary mode for
-       interactive use ("pick a face, pick another face for U direction").
-    3. By gp_Ax3: fully specified axis system (for programmatic use).
+KEY METHODS:
+  hcl(pnt)       -- horizontal construction line through pnt
+  vcl(pnt)       -- vertical construction line through pnt
+  hvcl(pnt)      -- H + V clines through pnt
+  ccirc(pnt, r)  -- construction circle at pnt with radius r
+  line(p1, p2)   -- profile line from p1 to p2
+  rect(p1, p2)   -- profile rectangle
+  circ(p1, r)    -- profile circle
+  arc_3p(p1, p2, p3) -- profile arc through three points
+  makeWire()     -- convert edgeList to a closed TopoDS_Wire for extrusion
+  toW(uv)        -- convert 2D (u, v) point to 3D world coordinates
 """
-
 import math
 
 from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge,

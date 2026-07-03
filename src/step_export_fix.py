@@ -1,38 +1,33 @@
 """
 step_export_fix.py
 
-CONFIRMED ROOT CAUSE (found via a long elimination process -- see
-README.md for the full diagnosis): build123d's import_step() returns
-a Compound whose `.parent` is a synthetic, invisible outer wrapper --
-NOT None, even though every other property (.children, .descendants,
-.label) makes it look like a clean tree root.
+WORKAROUND for a build123d export_step() bug.
 
-build123d's real export_step() -> _create_xde() walks the shape tree
-with anytree's PreOrderIter and checks `getattr(node, "parent", None)`
-for every node, including the very first one. Because the "root" you
-get back from import_step() isn't actually parentless, _create_xde()
-treats it as a child needing a parent label that was never registered
--- every node gets silently skipped via a `continue` guard, producing
-an empty-but-validly-constructed XCAF document. The writer then
-reports IFSelect_RetVoid ("nothing done") with no exception and no
-diagnostic message anywhere in the pipeline.
+THE BUG:
+  build123d's import_step() returns a Compound whose .parent attribute
+  is a hidden outer wrapper -- NOT None, even though every other property
+  (.children, .label, etc.) makes it look like a root node.
 
-THE FIX is one line: sever that spurious parent relationship before
-exporting. This module wraps the REAL, FULL-FEATURED build123d
-export_step() -- not a stripped-down reimplementation -- so you keep
-SetColorMode/SetLayerMode/SetNameMode, proper STEP headers, and every
-other feature of the real exporter. The only change is the one-line
-fix applied first.
+  build123d's export_step() -> _create_xde() walks the tree with
+  anytree's PreOrderIter and checks getattr(node, "parent", None) on
+  every node. Because the "root" returned by import_step() has a parent,
+  _create_xde() treats it as a child needing a parent label that was
+  never registered -- every node is silently skipped, producing an empty
+  XCAF document. The STEP writer reports IFSelect_RetVoid with no error.
 
-Usage:
-    from step_export_fix import export_step
-    # use exactly like build123d's own export_step() everywhere
+THE FIX:
+  Sever the spurious parent before exporting:
+    assembly.parent = None
 
-This is a drop-in replacement: same signature, same behavior, plus
-the fix. If/when this is patched upstream in build123d (worth filing
-as a GitHub issue -- see README.md), you can switch back to
-`from build123d import export_step` directly with no other code
-changes needed.
+  This module is a drop-in replacement for build123d's own export_step()
+  with exactly this one-line fix applied first. Everything else (color
+  modes, layer modes, STEP headers) is the real build123d exporter.
+
+USAGE:
+  from step_export_fix import export_step
+  # Use exactly like build123d's export_step() -- same signature.
+  # If this is ever fixed upstream, switch back to:
+  # from build123d import export_step
 """
 
 from os import PathLike

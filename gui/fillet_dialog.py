@@ -1,26 +1,37 @@
 """
 fillet_dialog.py
 
-Floating dialog that drives the "Select edges → Fillet" workflow.
+THE FILLET DIALOG -- rounds selected edges of the active part.
 
-WORKFLOW
---------
-1.  User clicks "⌀ Fillet..." button in main_app (only enabled when an
-    active part is set via RMB → Set Active Part).
-2.  This dialog opens and activates edge-selection mode in the viewport.
-3.  User clicks edges on the active part one by one. Each click adds
-    that edge to the selection list shown in the dialog.
-4.  User enters the fillet radius and clicks "Apply Fillet".
-5.  BRepFilletAPI_MakeFillet runs on the active part's wrapped shape.
-6.  The active part's geometry is replaced in-place (same pattern as
-    Cut/Mill) and the viewport is updated.
-7.  Dialog resets for the next fillet operation.
+WORKFLOW:
+  1. RMB -> Set Active Part on a solid in the tree.
+  2. Click Fillet... in the toolbar.
+  3. Click edges on the active part in the 3D viewport.
+     Each click adds one edge to the list shown in this dialog.
+  4. Enter the fillet radius (mm).
+  5. Click Apply Fillet.
+  6. BRepFilletAPI_MakeFillet runs; the active part is replaced in-place.
 
-SIGNALS
--------
-  fillet_done(node, new_shape)  -- active part node + new TopoDS_Shape
+EDGE MATCHING (world-space):
+  The viewport reports picked edge midpoints in WORLD coordinates.
+  node.wrapped is in LOCAL coordinates. We walk work_shape (local, for
+  MakeFillet) and world_shape = work_shape.Located(global_loc) (for
+  midpoint comparison) in parallel to match picked world edges to their
+  local counterparts.
+
+LOCATION STRIPPING (critical):
+  MakeFillet strips the location tag from its result -- mk.Shape() has
+  IsIdentity=True even when the input had a non-identity location.
+  Storing this directly as node._wrapped breaks global_location. The fix
+  is in _apply_shape_to_node() in main_app.py. See DESIGN_BACKLOG item 24.
+
+SHARED INSTANCES (see DESIGN_BACKLOG item 26):
+  Filleting a shared instance makes it an independent copy.
+  Other instances of the same part are not modified.
+
+SIGNALS:
+  fillet_done(node, new_shape)  -- active part node + MakeFillet result shape
 """
-
 import sys
 import os
 

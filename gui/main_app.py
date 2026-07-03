@@ -1,30 +1,56 @@
 """
 main_app.py
 
-The merge: AssemblyTreeWidget (proven standalone in
-assembly_tree_widget.py) docked alongside OcctViewportWidget (proven
-standalone in assembly_viewer.py), both showing the SAME loaded
-assembly, wired together via Qt signals so:
+THE MAIN APPLICATION -- wires together all components of cad1.
 
-    1. Checkbox in the tree -> show/hide that part in the 3D view.
-    2. Click a part in the 3D view -> that row gets selected/
-       highlighted in the tree.
-    3. Click a row in the tree -> that part gets highlighted in the
-       3D view.
+ARCHITECTURE:
+  MainWindow (QWidget)
+    |- SyncedViewportWidget  (subclass of assembly_viewer.SyncedViewportWidget)
+    |    Adds: _node_id_to_ais_shape, _apply_shape_to_node(),
+    |          active-part orange overlay, edge/vertex mode management
+    |- AssemblyTreeWidget    (assembly_tree_widget.py)
+    |- WorkplaneDialog       (workplane_dialog.py)   -- Create Part workflow
+    |- FilletDialog          (fillet_dialog.py)      -- Fillet workflow
+    |- ShellDialog           (shell_dialog.py)       -- Shell workflow
+    +- PositionDialog        (position_dialog.py)    -- Mate/Align workflow
 
-DESIGN CHOICE: rather than editing OcctViewportWidget or
-AssemblyTreeWidget in place, this file SUBCLASSES/extends behavior at
-the integration points only (a new Qt signal on the viewport, a couple
-of new methods), so both proven standalone scripts
-(assembly_viewer.py, assembly_tree_widget.py) stay untouched and
-still independently runnable/debuggable if something about the
-INTEGRATION breaks but the pieces individually still work -- same
-"isolate one variable" discipline as the rest of this project.
+TWO-WAY SYNC (tree and viewport):
+  Click part in viewport  -> viewport emits part_selected(node)
+                          -> tree highlights that row
+  Click row in tree       -> tree emits node_selected(node)
+                          -> viewport highlights that AIS_Shape
 
-Usage:
-    uv run gui/main_app.py step/as1-oc-214.stp
+PART MODIFICATION PATTERN (_apply_shape_to_node):
+  All operations that replace a part's geometry (fillet, shell, cut, pull)
+  use this single method to:
+    1. Capture parent_global location BEFORE replacing _wrapped (boolean
+       ops strip location; global_location breaks if we don't save it first)
+    2. Replace node._wrapped with the new TopoDS_Shape
+    3. Rebuild ancestor Compounds for STEP export
+    4. Remove old AIS, display new AIS with override_location=parent_global
+    5. Restore STEP color on new AIS
+    6. Re-apply black boundary edges
+    7. Refresh active-part orange overlay
+  See DESIGN_BACKLOG item 24 for why parent_global (not full global_location)
+  is the correct override: the result geometry is already in the node's local
+  frame, so only the parent chain transform is needed.
+
+ACTIVE PART vs. ACTIVE ASSEMBLY:
+  _active_assembly  -- Compound node that receives new parts/imports.
+                       Shown bold with >> prefix. Set via RMB on tree.
+  _active_part      -- Solid leaf node that fillet/shell/cut operate on.
+                       Shown with orange wireframe overlay in viewport.
+                       Set via RMB -> Set Active Part on tree.
+
+SHARED INSTANCES (see DESIGN_BACKLOG item 26):
+  STEP files may have multiple instances of the same shape (IsSame=True).
+  Modifying one instance replaces its _wrapped with a new TopoDS_Shape,
+  breaking the shared reference. The modified instance becomes an
+  independent copy; other instances are unaffected.
+
+USAGE:
+  uv run gui/main_app.py step/as1-oc-214.stp
 """
-
 import sys
 import os
 
@@ -853,43 +879,6 @@ class MainWindow(QWidget):
         it is no longer a shared instance. See DESIGN_BACKLOG item 26.
         """
         self._apply_shape_to_node(node, new_shape, operation="fillet")
-
-        self.viewport.context.ClearSelected(False)
-        old_ais = self.viewport._node_id_to_ais_shape.get(id(node))
-        original_color_rgb = None
-        if old_ais is not None:
-            info = self.viewport._ais_shape_to_node.get(id(old_ais))
-            if info:
-                original_color_rgb = info.get("color_rgb")
-            self.viewport.context.Deactivate(old_ais)
-            self.viewport.context.Remove(old_ais, False)
-            self.viewport._ais_shapes = [
-                s for s in self.viewport._ais_shapes if s is not old_ais
-            ]
-            self.viewport._ais_shape_to_node.pop(id(old_ais), None)
-            del self.viewport._node_id_to_ais_shape[id(node)]
-
-        self.viewport.display_node(node, f"/{node.label or 'part'}",
-                                   override_location=saved_global_location)
-
-        if original_color_rgb is not None:
-            new_ais = self.viewport._node_id_to_ais_shape.get(id(node))
-            if new_ais is not None:
-                from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
-                r, g, b = original_color_rgb
-                new_ais.SetColor(Quantity_Color(
-                    r, g, b, Quantity_TypeOfColor.Quantity_TOC_RGB))
-                self.viewport.context.Redisplay(new_ais, False)
-                self.viewport._apply_black_edges(new_ais)
-                info = self.viewport._ais_shape_to_node.get(id(new_ais))
-                if info:
-                    info["color_rgb"] = original_color_rgb
-
-        self.viewport._apply_black_edges()
-        self.viewport.context.UpdateCurrentViewer()
-        self.viewport.update()
-        self._on_active_part_changed(node)
-        print(f"Fillet complete: '{node.label}' updated.")
 
     def _on_shell_clicked(self):
         """Open the Shell dialog."""

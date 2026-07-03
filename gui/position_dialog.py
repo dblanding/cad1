@@ -1,45 +1,54 @@
 """
 position_dialog.py
 
-The Mate/Align positioning dialog, implementing the two techniques
-from the HP/CoCreate workflow documented in DESIGN_BACKLOG.md §1:
+THE POSITIONING DIALOG -- Mate/Align placement of parts and assemblies.
 
-    1. Mate/Align -- precision placement using face/edge/axis picks
-    2. Dynamic Move -- translate-only rough positioning (simple version)
+Implements a 3-2-1 constraint workflow inspired by HP/CoCreate:
 
-KEY DESIGN DECISIONS (from the PTC docs read this session):
+  SECTION: Mate / Align (3-2-1) -- three sequential steps:
+    Step 1 - Mate:        Pick face on moving part, pick face on fixed part.
+                          Rotates moving part until faces are flush (normals
+                          opposed). Use Reverse to toggle mate vs. align.
+    Step 2 - Align Face:  Pick face on moving part, pick face on fixed part.
+                          Rotates within mated plane + translates to wall.
+                          Face type auto-detected:
+                            flat face  -> wall/corner constraint
+                            cylinder   -> hole axis constraint
+    Step 3 - Complete:    Pick any face on moving, any face on fixed.
+                          Translates along the SINGLE remaining free direction
+                          (mated_normal x wall_normal). No other motion allowed.
 
-    - The node being MOVED is always selected via the TREE (not
-      viewport), because it may be an assembly container with no
-      single AIS_Shape of its own -- confirmed by Doug: "the
-      component being moved may be a part or an assembly."
+  SECTION: Align Axis -- single 4-DOF step aligning a cylinder axis.
 
-    - Each Mate/Align step commits IMMEDIATELY -- "the parts or
-      assemblies become constrained by each mate or align step"
-      (PTC docs, direct quote). No batching until Apply.
+  SECTION: Dynamic (AIS Manipulator) -- free-form drag with gizmo.
 
-    - Viewport picks within a step are for GEOMETRIC REFERENCE only
-      (which face/edge/axis to align). The move is always applied
-      to the tree-selected node, not to the specific sub-shape picked.
+STATE MACHINE PER STEP:
+  IDLE -> WAITING_PICK1 (step button clicked)
+  WAITING_PICK1 -> WAITING_PICK2 (first pick received, stored in _pick1)
+  WAITING_PICK2 -> IDLE (second pick received, move computed and applied)
+  Any state -> IDLE (Back button: undo last move)
 
-    - The dialog uses an EXPLICIT TWO-STEP PROMPT sequence per
-      constraint: "Pick reference on moving part" then "Pick reference
-      on fixed target" -- same pattern as CoCreate's dialog, which
-      makes the two roles unambiguous.
+STATE STORED BETWEEN STEPS:
+  _mated_normal   -- face plane normal from Step 1 (constrains Steps 2+3)
+  _wall_normal    -- Step 2 fixed face normal projected onto mated plane
+                     (constrains Step 3 to single translation DOF)
+  _step2_type     -- "wall" or "hole" (determines Step 3 behavior)
+  _step2_pivot    -- fixed hole center from Step 2 hole pick
+                     (rotation axis for Step 3 hole scenario)
 
-STATE MACHINE (per constraint step):
-    IDLE -> WAITING_PICK1 (user clicks "Mate" / "Align" / "Align Axis")
-    WAITING_PICK1 -> WAITING_PICK2 (first pick received, stored)
-    WAITING_PICK2 -> IDLE (second pick received, move computed + applied)
-    Any state -> IDLE (Back button: undo one step)
+MATH (see src/pose.py for implementations):
+  compute_step1_move()      -- rotate about intersection line of face planes
+  compute_step2_move()      -- rotate within mated plane + translate to wall
+  compute_step3_move()      -- translate along free_dir OR rotate about pivot
+  compute_align_axis_move() -- align cylinder axes
 
-INTEGRATION: this dialog connects to MainWindow via two signals:
-    - MainWindow provides the currently tree-selected node (the moving
-      part/assembly) whenever the dialog is open.
-    - MainWindow's viewport emits geometry_picked(shape, shape_type)
-      when in positioning mode -- a NEW signal added to
-      SyncedViewportWidget, separate from the existing part_selected
-      signal (which syncs the tree, not the position dialog).
+SIGNALS:
+  positioning_done()       -- Done button clicked, dialog closing
+  request_redisplay(node)  -- after each move, refresh the viewport
+
+KEY DESIGN: the node being moved is set via the TREE (not by clicking in
+the viewport), because the moving object may be an assembly with no single
+AIS_Shape. Viewport picks are for GEOMETRIC REFERENCE only.
 """
 
 import sys

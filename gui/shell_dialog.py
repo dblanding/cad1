@@ -1,24 +1,28 @@
 """
 shell_dialog.py
 
-Floating dialog that drives the "Select open faces → Shell" workflow.
+THE SHELL DIALOG -- hollows out a solid, leaving open faces.
 
-WORKFLOW
---------
-1.  User clicks "⬡ Shell..." button in main_app (only enabled when an
-    active part is set via RMB → Set Active Part).
-2.  This dialog opens and accepts face picks from the viewport.
-3.  User clicks the face(s) that should be OPEN (removed) in the shell.
-    For the bottle: just the top circular face.
-4.  User enters the wall thickness and clicks "Apply Shell".
-5.  BRepOffsetAPI_MakeThickSolid runs on the active part's wrapped shape.
-6.  Same replace-in-place pattern as Cut/Mill and Fillet.
+WORKFLOW:
+  1. RMB -> Set Active Part on a solid in the tree.
+  2. Click Shell... in the toolbar.
+  3. Click the face(s) to be left OPEN (removed) -- typically the top
+     face of a bottle, or the opening of a box.
+  4. Enter the wall thickness (mm, positive = inward offset).
+  5. Click Apply Shell.
+  6. BRepOffsetAPI_MakeThickSolid runs; the active part is replaced.
 
-SIGNALS
--------
-  shell_done(node, new_shape)  -- active part node + new TopoDS_Shape
+FACE MATCHING (world-space):
+  Same parallel-walk pattern as fillet_dialog.py: compare picked face
+  centers (world space) against face centers of work_shape walked in
+  parallel with world_shape = work_shape.Located(global_loc).
+
+LOCATION STRIPPING:
+  Same issue and fix as fillet_dialog.py. See DESIGN_BACKLOG item 24.
+
+SIGNALS:
+  shell_done(node, new_shape)  -- active part node + MakeThickSolid result
 """
-
 import sys
 import os
 

@@ -1,35 +1,39 @@
 """
 workplane_dialog.py
 
-Floating dialog that drives the "Create Workplane → Sketch → Extrude"
-workflow for making new parts.
+THE WORKPLANE / SKETCH / EXTRUDE DIALOG -- creates new solid parts.
 
-WORKFLOW
---------
-1.  User clicks "Create Part..." button in main_app.
-2.  This dialog opens and enters FACE PICK MODE -- the viewport's
-    existing geometry_picked signal routes face picks here.
-3.  User clicks a face in the viewport.  A WorkPlane is constructed
-    on that face and its border is displayed as a translucent blue
-    rectangle in the viewport.
-4.  The "Sketch" section becomes active.  For now this is
-    dimension-driven only (width × height rectangle, no freehand
-    sketching) -- the 90% use case per the design backlog.
-5.  User enters: width, height, extrusion depth, and a part name.
-6.  "Create Part" button calls _extrude():
-        - rect() + makeWire() on the WorkPlane
-        - BRepBuilderAPI_MakeFace + BRepPrimAPI_MakePrism → new solid
-        - Wrapped in a build123d Solid, then added to the assembly tree
-          and displayed in the viewport.
-7.  Dialog returns to idle.
+WORKFLOW:
+  1. User clicks a face in the 3D viewport to define the workplane.
+  2. A green translucent rectangle is displayed on that face.
+  3. The sketch toolbar (sketch_toolbar.py) becomes active.
+  4. User draws construction geometry and profile edges on the workplane.
+  5. Buttons at the bottom create a solid from the sketch:
+       [+] Create Part     -- extrude in +wDir, adds a new Solid node
+       [cut] Cut Into Active -- extrude in -wDir, boolean-cuts active part
+       [fuse] Add To Active  -- extrude in +wDir, boolean-fuses (pull/boss)
 
-SIGNALS (emitted to main_app)
-------------------------------
-  part_created(node)   -- new assembly leaf node, ready to display
-  request_pick_mode()  -- tell the viewport to activate face selection
-  cancel_pick_mode()   -- tell the viewport to cancel / restore normal mode
+WORKPLANE COORDINATE SYSTEM:
+  U axis = x direction of the 2D sketch (horizontal by default)
+  V axis = y direction of the 2D sketch (vertical by default)
+  W axis = face normal (extrusion direction)
+  Origin = face center
+
+PART CREATION PATTERN:
+  All three operations (Create/Cut/Add) use the same flow:
+    1. wp.makeWire() converts the sketch profile to a TopoDS_Wire
+    2. BRepBuilderAPI_MakeFace creates a planar face from the wire
+    3. BRepPrimAPI_MakePrism extrudes to a TopoDS_Shape
+    4. For Cut/Add: BRepAlgoAPI_Cut/Fuse operates on the active part
+    5. The result is stored as node._wrapped and displayed
+
+SIGNALS:
+  part_created(node)      -- new Solid node added to the assembly tree
+  part_cut(node, shape)   -- active part replaced with cut result
+  part_fused(node, shape) -- active part replaced with fused result
+  request_face_pick()     -- tell viewport to route face clicks here
+  cancel_face_pick()      -- restore normal viewport click behavior
 """
-
 import sys
 import os
 

@@ -1,52 +1,42 @@
 """
 sketch_toolbar.py
 
-A QToolBar that drives interactive 2D sketching on an active WorkPlane.
+THE SKETCH TOOLBAR -- 2D drawing tools for the active workplane.
 
-WORKFLOW
---------
-1.  A WorkPlane has been created (via workplane_dialog.py) and is
-    stored as self._workplane.
-2.  The user clicks a toolbar button (e.g. H Cline).
-3.  A small QInputDialog asks for the required value(s) (e.g. Y value).
-4.  The corresponding WorkPlane method is called (e.g. wp.hcl((0, y))).
-5.  The new geometry is displayed as AIS objects in the viewport.
-6.  Repeat until the profile is complete.
-7.  The existing "Create Part" button calls wp.makeWire() and extrudes.
+Lives inside WorkplaneDialog. Activated after a workplane face is picked.
+Each button calls a WorkPlane method (src/workplane.py) and displays the
+resulting geometry as AIS objects in the 3D viewport.
 
-TOOLS IMPLEMENTED
------------------
-Construction lines (clines):
-  hcl   -- horizontal cline at Y
-  vcl   -- vertical cline at X
-  hvcl  -- H + V clines through (X, Y)
-  acl   -- angled cline through (X, Y) at angle (degrees)
-  lbcl  -- linear bisector between two points
+TOOLS:
+  Construction geometry (magenta dashed, not part of extruded profile):
+    H Cline   -- horizontal construction line at Y
+    V Cline   -- vertical construction line at X
+    HV Clines -- H + V clines through a point
+    Ang Cline -- angled construction line
+    Lin Bisec -- linear bisector between two points
+    Ccirc     -- construction circle at center with radius
 
-Construction circles (ccirc):
-  ccirc -- circle at center (X, Y) with radius R
+  Profile geometry (white solid, forms the extruded cross-section):
+    Line      -- straight line segment
+    Rect      -- axis-aligned rectangle
+    Circle    -- full circle
+    Arc C2P   -- arc by center, start point, end point
+    Arc 3P    -- arc through three points
 
-Profile geometry:
-  line  -- line from (X1, Y1) to (X2, Y2)
-  rect  -- rectangle corner1 (X1, Y1) to corner2 (X2, Y2)
-  circ  -- circle at center (X, Y) with radius R
-  arcc2p -- arc: center (X,Y), start point, end point
-  arc3p  -- arc through three points
+  Intersection Snap (yellow dot markers):
+    Snaps clicks to cline/ccirc intersections. A click-before-tool snap
+    queue (_pending_uvs) lets the user snap to a point before selecting
+    which tool to use.
 
-Edit:
-  del_el -- delete last profile element
-  clear  -- clear all sketch geometry
+  Edit:
+    Del Last  -- removes the most recently added profile element
+    Clear     -- removes all sketch geometry and AIS objects
 
-AIS DISPLAY
------------
-Each element is displayed immediately after it is added:
-  - Construction lines: magenta dashed infinite lines clipped to
-    workplane border (same color as the U/V crosshairs).
-  - Construction circles: magenta dashed circles.
-  - Profile geometry: white solid edges.
-
-All sketch AIS objects are stored in self._sketch_ais so they can be
-erased cleanly when the workplane is reset or the dialog is closed.
+AIS LIFECYCLE:
+  All sketch AIS objects are stored in _sketch_ais and _isect_ais.
+  _erase_isect_ais() calls Deactivate() before Remove() on each marker --
+  required to prevent context.Select() crashes when vertex-mode AIS objects
+  are removed while still active in the selection index.
 """
 
 import os
@@ -573,11 +563,13 @@ class SketchToolBar(QToolBar):
             self._isect_pts = {}
             return
         ctx = self._viewport.context
-        # Use Remove() not Erase() -- fully deregisters from selection
-        # structures so the context doesn't crash when shapes are gone.
         ctx.ClearSelected(False)
         for ais in self._isect_ais:
             try:
+                # Deactivate ALL selection modes before Remove -- leaving
+                # activated AIS objects in the selection index after Remove
+                # causes context.Select() to crash on background clicks.
+                ctx.Deactivate(ais)
                 ctx.Remove(ais, False)
             except Exception:
                 pass

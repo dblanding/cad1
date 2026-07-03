@@ -1,27 +1,36 @@
 """
 assembly_tree_widget.py
 
-The assembly tree widget. Displays a build123d Compound assembly
-hierarchy with one row per node, checkboxes for show/hide, drag-and-
-drop reparenting, and a right-click context menu.
+THE ASSEMBLY TREE -- left panel of the cad1 application.
 
-CONTEXT MENU ACTIONS (RMB on any row):
-  - Set Active Assembly  -- makes this node the target for new parts/imports.
-                            Active node shown in bold with a ► prefix.
-  - New Sub-Assembly     -- adds an empty Compound child under this node.
-  - Delete               -- removes this node from the tree and assembly.
+Displays a build123d Compound assembly hierarchy as a QTreeWidget.
+Each node in the tree is one row; leaf nodes are solid parts, interior
+nodes are sub-assemblies (Compound containers).
 
-ACTIVE ASSEMBLY CONCEPT:
-  main_app tracks _active_node. New parts (extrude) and imported STEP
-  files are added as children of _active_node. If no active node is
-  set, they go under the root assembly. The active node is shown bold
-  with a ► prefix in the tree. Setting a new active node clears the
-  previous one.
+FEATURES:
+  - Checkboxes for show/hide each part in the 3D viewport.
+  - Drag-and-drop reparenting: drag any node onto a new parent.
+  - Right-click context menu on any row:
+      Set Active Assembly  -- new parts and imports go under this node
+      Set Active Part      -- fillet/shell/cut operate on this node
+      New Sub-Assembly     -- adds an empty Compound child
+      Rename               -- QInputDialog to rename the node
+      Delete               -- removes the node from tree and assembly
+  - Active assembly shown bold with >> prefix.
+  - Active part shown with * prefix (orange background in main_app).
 
-Usage (standalone):
-    uv run gui/assembly_tree_widget.py step/as1-oc-214.stp
+SIGNALS EMITTED (connected to MainWindow in main_app.py):
+  node_selected(node)              -- user clicked a row (tree-to-viewport sync)
+  visibility_changed(node, bool)   -- checkbox toggled
+  node_reparented(node, new_parent)-- drag-and-drop completed
+  active_assembly_changed(node)    -- Set Active Assembly chosen
+  active_part_changed(node)        -- Set Active Part chosen
+  node_deleted(node)               -- Delete chosen from context menu
+  new_sub_assembly_requested(node) -- New Sub-Assembly chosen
+
+STANDALONE USAGE:
+  uv run gui/assembly_tree_widget.py step/as1-oc-214.stp
 """
-
 import sys
 import os
 

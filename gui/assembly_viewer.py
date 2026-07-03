@@ -1,26 +1,47 @@
 """
 assembly_viewer.py
 
-Builds on the PROVEN-WORKING picking_smoke_test.py (hover-highlight
-and click-to-select both confirmed working) to display a REAL STEP
-assembly instead of a synthetic box -- one AIS_Shape per LEAF SOLID
-(not one big AIS_Shape for the whole assembly), so picking can answer
-"which part" as well as "which face."
+THE OCCT 3D VIEWPORT -- base class for the cad1 application window.
 
-Each leaf gets:
-    - Its own AIS_Shape (so a click resolves to a specific part)
-    - Shaded display mode (not the wireframe used in earlier scripts)
-    - Its real STEP color if import_step() recovered one, otherwise a
-      deterministic fallback color from a small palette, cycled by
-      tree position -- most STEP files (including the as1-oc-214.stp
-      sample used to first test this) carry no embedded color data,
-      so the fallback path is the common case in practice, not an
-      edge case.
+Wraps an OCCT V3d_View inside a Qt widget and provides:
+  - Load and display a build123d Compound assembly as individual AIS_Shape
+    objects, one per LEAF SOLID, so clicking a shape resolves to a specific
+    part (not just "somewhere in the assembly").
+  - Hover highlighting (context.MoveTo on every mouse move).
+  - Click-to-select with reporting: face center, face normal, part label,
+    path in the assembly tree.
+  - STEP color reading from node.color.wrapped (Quantity_ColorRGBA).
+    Falls back to a small deterministic palette when no color is stored.
+  - Black face boundary edges on all shaded parts (SetFaceBoundaryDraw).
+  - AIS ViewCube in the corner for orientation reference.
+  - Orbit/pan/zoom via left/middle/right mouse buttons.
+  - show/hide per part, highlight_node() for tree-to-viewport sync.
 
-Usage:
+SUBCLASSING PATTERN:
+  SyncedViewportWidget in main_app.py subclasses this to add:
+    - _node_id_to_ais_shape dict (for fast node-to-AIS lookup)
+    - Edge/vertex selection mode management
+    - Active-part orange overlay
+    - All signal connections to the tree widget and dialogs
+  This base class stays clean and independently runnable:
     uv run gui/assembly_viewer.py step/as1-oc-214.stp
-"""
 
+LOCATION INVARIANT (critical -- read before touching _display_leaf):
+  node._wrapped.Location() encodes this node's OWN local transform.
+  node.global_location is computed by build123d as the product of all
+  ancestor node.location values from root to this node. _display_leaf
+  positions the AIS_Shape via node.wrapped.Located(global_loc.wrapped),
+  which REPLACES (not compounds) the shape's location tag with the full
+  world transform.
+
+  Boolean operations (MakeFillet, BRepAlgoAPI_Cut, etc.) STRIP the
+  location from their result -- mk.Shape() always has IsIdentity=True.
+  After storing a stripped result as node._wrapped, node.global_location
+  computes incorrectly (missing the node's own rotation). Fix: capture
+  global_location and node.location BEFORE replacing _wrapped, then
+  display with override_location=parent_global. See _apply_shape_to_node
+  in main_app.py and DESIGN_BACKLOG item 24.
+"""
 import sys
 import os
 
