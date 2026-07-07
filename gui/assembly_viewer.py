@@ -7,9 +7,10 @@ Wraps an OCCT V3d_View inside a Qt widget and provides:
   - Load and display a build123d Compound assembly as individual AIS_Shape
     objects, one per LEAF SOLID, so clicking a shape resolves to a specific
     part (not just "somewhere in the assembly").
-  - Hover highlighting (context.MoveTo on every mouse move).
-  - Click-to-select with reporting: face center, face normal, part label,
-    path in the assembly tree.
+  - Hover highlighting and click-to-select via AIS_ViewController --
+    OCCT's own input serialization layer. Replaces direct MoveTo()/
+    Select() calls which caused C++ segfaults on rapid/double clicks.
+    See DESIGN_BACKLOG item 20.
   - STEP color reading from node.color.wrapped (Quantity_ColorRGBA).
     Falls back to a small deterministic palette when no color is stored.
   - Black face boundary edges on all shaded parts (SetFaceBoundaryDraw).
@@ -140,7 +141,12 @@ class OcctViewportWidget(QWidget):
         # the mouse moved between press and release.
         self._press_pos = None
         self._drag_distance = 0.0
-        self._click_drag_threshold_px = 4  # movement below this = treat as a click
+        self._click_drag_threshold_px = 4
+
+        # AIS_ViewController -- replaces direct context.MoveTo()/Select()
+        # calls. Serializes all mouse input to prevent re-entrancy crashes.
+        from OCP.AIS import AIS_ViewController
+        self._vc = AIS_ViewController()  # movement below this = treat as a click
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -422,23 +428,74 @@ class OcctViewportWidget(QWidget):
     # --- Mouse handling: orbit / pan / zoom / PICKING ---------------
     # Builds on the proven-working rotate/pan/zoom from
     # viewport_smoke_test.py, adding:
-    #   - MoveTo() on every mouse move -> hover-highlight under cursor
-    #   - Select() on a LEFT CLICK (press+release with minimal
-    #     movement) -> actually pick whatever's highlighted
-    # The existing LMB-drag-to-rotate behavior is preserved; click vs.
-    # drag is distinguished by total movement between press and
-    # release.
+    # ----------------------------------------------------------------
+    # Mouse event handling via AIS_ViewController
+    #
+    # AIS_ViewController serializes all mouse input internally, which
+    # prevents the context.MoveTo()/Select() re-entrancy crashes that
+    # occurred with direct OCCT calls. The pattern:
+    #   1. Qt mouse events feed data to the controller via
+    #      UpdateMousePosition() / UpdateMouseButtons() / UpdateMouseScroll()
+    #   2. FlushViewEvents(ctx, view, True) processes the buffered
+    #      events -- OCCT handles navigation (rotate/pan/zoom) AND
+    #      selection internally.
+    #   3. OnSelectionChanged() is called by OCCT when a selection
+    #      event completes; we override it to call _report_selection().
+    #
+    # Button constants (plain ints, not an enum in this OCP build):
+    #   Left   = Aspect_VKeyMouse_LeftButton   = 8192
+    #   Middle = Aspect_VKeyMouse_MiddleButton  = 16384
+    #   Right  = Aspect_VKeyMouse_RightButton   = 32768
+
+    def _qt_buttons_to_occt(self, qt_buttons):
+        """Convert Qt MouseButtons flags to OCCT VKeyMouse int."""
+        result = 0
+        if qt_buttons & Qt.MouseButton.LeftButton:
+            result |= 8192
+        if qt_buttons & Qt.MouseButton.MiddleButton:
+            result |= 16384
+        if qt_buttons & Qt.MouseButton.RightButton:
+            result |= 32768
+        return result
+
+    def _qt_pos_to_vec2i(self, pos):
+        """Convert Qt position to Graphic3d_Vec2i."""
+        from OCP.Graphic3d import Graphic3d_Vec2i
+        return Graphic3d_Vec2i(int(pos.x()), int(pos.y()))
 
     def mousePressEvent(self, event):
         self._last_mouse_pos = event.position()
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._press_pos = event.position()
-            self._drag_distance = 0.0
-            x, y = int(event.position().x()), int(event.position().y())
-            try:
-                self.view.StartRotation(x, y)
-            except Exception as e:
-                print(f"(StartRotation failed: {e})")
+        pt = self._qt_pos_to_vec2i(event.position())
+        btns = self._qt_buttons_to_occt(event.buttons())
+        self._vc.UpdateMouseButtons(pt, btns, 0, False)
+        self._flush()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        self._last_mouse_pos = pos
+        pt = self._qt_pos_to_vec2i(pos)
+        btns = self._qt_buttons_to_occt(event.buttons())
+        self._vc.UpdateMousePosition(pt, btns, 0, False)
+        self._flush()
+
+    def mouseReleaseEvent(self, event):
+        self._last_mouse_pos = event.position()
+        pt = self._qt_pos_to_vec2i(event.position())
+        # Release: buttons AFTER release (so released button is absent)
+        btns = self._qt_buttons_to_occt(event.buttons())
+        self._vc.UpdateMouseButtons(pt, btns, 0, False)
+        self._flush()
+
+        # RMB: show context menu (AIS_ViewController handles navigation,
+        # we handle the application-level menu ourselves)
+        if event.button() == Qt.MouseButton.RightButton:
+            self._show_context_menu(event.globalPosition().toPoint())
+
+    def mouseDoubleClickEvent(self, event):
+        # Swallow double-clicks -- the view cube handles its own
+        # animation; we don't want a double-click to trigger a second
+        # selection on top of the first.
+        event.accept()
 
     def _animate_view_cube(self):
         """Run the view cube camera animation to completion."""
@@ -450,79 +507,20 @@ class OcctViewportWidget(QWidget):
                 self._view_cube.UpdateAnimation(False)
                 self.context.UpdateCurrentViewer()
                 QCoreApplication.processEvents()
-            # FitAll after animation to ensure correct camera distance
-            # and clipping planes -- face clicks end too close otherwise.
             self.view.FitAll()
             self.view.ZFitAll()
         except Exception as e:
             print(f"(view cube animation: {e})")
-        self._press_pos = None  # prevent StartRotation state confusion
-        self._drag_distance = 0.0
         self.update()
 
-    def mouseMoveEvent(self, event):
-        pos = event.position()
-
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            try:
-                self.view.Rotation(int(pos.x()), int(pos.y()))
-            except Exception:
-                pass
-            if self._press_pos is not None:
-                dx = pos.x() - self._press_pos.x()
-                dy = pos.y() - self._press_pos.y()
-                self._drag_distance = (dx ** 2 + dy ** 2) ** 0.5
-        elif event.buttons() & Qt.MouseButton.MiddleButton and self._last_mouse_pos is not None:
-            dx = pos.x() - self._last_mouse_pos.x()
-            dy = pos.y() - self._last_mouse_pos.y()
-            self.view.Pan(int(dx), int(-dy))
-        else:
-            # No buttons held: this is a hover move. Ask OCCT what's
-            # under the cursor right now, so it can highlight it
-            # (visually, before any click commits a selection).
-            self.context.MoveTo(int(pos.x()), int(pos.y()), self.view, True)
-
-        self._last_mouse_pos = pos
-        self.update()  # redraw after every mouse-driven view change
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
-            if self._drag_distance < self._click_drag_threshold_px:
-                # It's a click -- check if it landed on the view cube.
-                # MoveTo in mouseMoveEvent already updated DetectedInteractive
-                # during hover, so we can read it here without calling
-                # MoveTo again (which would conflict with StartRotation state).
-                if self._view_cube is not None:
-                    try:
-                        detected = self.context.DetectedInteractive()
-                        if detected is not None and detected == self._view_cube:
-                            owner = self.context.DetectedOwner()
-                            if owner is not None:
-                                try:
-                                    from OCP.AIS import AIS_ViewCubeOwner
-                                    vc_owner = AIS_ViewCubeOwner.DownCast(owner)
-                                    if not vc_owner.IsNull():
-                                        orientation = vc_owner.MainOrientation()
-                                        self.view.SetProj(orientation)
-                                        self.view.FitAll()
-                                        self.view.ZFitAll()
-                                        self._press_pos = None
-                                        self._drag_distance = 0.0
-                                        self.update()
-                                        return
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-                # Normal click -- select whatever is highlighted.
-                self.context.Select(True)
-                self._report_selection()
-            self._press_pos = None
-            self._drag_distance = 0.0
-
-        elif event.button() == Qt.MouseButton.RightButton:
-            self._show_context_menu(event.globalPosition().toPoint())
-
+    def _flush(self):
+        """Process buffered OCCT view events and redraw."""
+        if self._occt_window is None:
+            return
+        try:
+            self._vc.FlushViewEvents(self.context, self.view, True)
+        except Exception:
+            pass
         self.update()
 
     def _show_context_menu(self, global_pos):
@@ -710,10 +708,20 @@ class OcctViewportWidget(QWidget):
             self.context.NextSelected()
 
     def wheelEvent(self, event):
-        delta = event.angleDelta().y()
-        factor = 1.1 if delta > 0 else (1 / 1.1)
-        self.view.SetZoom(factor)
-        self.update()
+        from OCP.Aspect import Aspect_ScrollDelta
+        from OCP.Graphic3d import Graphic3d_Vec2i
+        pt = Graphic3d_Vec2i(int(event.position().x()),
+                             int(event.position().y()))
+        delta = Aspect_ScrollDelta(pt, event.angleDelta().y() / 120.0)
+        self._vc.UpdateMouseScroll(delta)
+        self._flush()
+
+    def OnSelectionChanged(self, theCtx, theView):
+        """
+        Called by AIS_ViewController when a selection event completes.
+        Override to route into our _report_selection() logic.
+        """
+        self._report_selection()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

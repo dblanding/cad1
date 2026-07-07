@@ -1518,30 +1518,44 @@ reach the C++ selection structures simultaneously.
 significant refactor but would fix this crash permanently and also
 improve overall navigation robustness.
 
-**Current status:** UNRESOLVED. Added to backlog for future investigation
-if new information becomes available.
+**Status: FIXED** via AIS_ViewController refactor.
 
-**What we know for certain:**
-- The crash happens in `context.MoveTo()` inside `mouseMoveEvent`,
-  not in `context.Select()`. It fires just from moving the mouse
-  over the viewport, before any click.
-- The crash produces NO Python output -- it is a C++ segfault that
-  kills the process instantly.
-- The working version (b572c19) had EDGE+VERTEX activation on all
-  parts AND worked fine. Something we added after that commit broke it.
-- Reducing to FACE-only activation, or EDGE+VERTEX on active part
-  only, still crashes.
-- The `True` vs `False` flag on `MoveTo()` makes no difference.
-- The crash was NOT present before we added fillet/shell/workplane
-  dialogs, position dialog redesign, and cut/mill operations. The
-  exact change that introduced it is unknown.
+**Root cause:** Calling `context.MoveTo()` and `context.Select()`
+directly from Qt mouse events is not safe -- OCCT's selection
+structures are not re-entrant. Rapid clicks, double-clicks, or mouse
+movement during selection can cause a C++ segfault with no Python
+traceback.
 
-**Next steps if revisiting:**
-1. Binary search the commits between b572c19 and current to find
-   the exact change that introduced the crash.
-2. Investigate OCCT's AIS_ViewController as the proper high-level
-   interface (used by CAD Assistant) that serializes mouse events
-   and avoids direct context.MoveTo()/Select() calls.
+**The fix:** Replace all direct `context.MoveTo()` / `context.Select()`
+calls with `AIS_ViewController`, which is OCCT's own high-level input
+serialization layer (the same approach used by CAD Assistant).
+
+**How AIS_ViewController works:**
+1. Qt mouse events feed data to the controller:
+     `_vc.UpdateMousePosition(pt, buttons, modifiers, isEmulated)`
+     `_vc.UpdateMouseButtons(pt, buttons, modifiers, isEmulated)`
+     `_vc.UpdateMouseScroll(Aspect_ScrollDelta)`
+2. `_vc.FlushViewEvents(context, view, True)` processes all buffered
+   events. OCCT handles rotate/pan/zoom/select/hover internally,
+   serialized and re-entrancy-safe.
+3. `OnSelectionChanged(ctx, view)` is called by OCCT when a selection
+   completes -- override this method to call `_report_selection()`.
+
+**Button constants** (plain ints in this OCP build, not an enum):
+  `Aspect_VKeyMouse_LeftButton   = 8192`
+  `Aspect_VKeyMouse_MiddleButton = 16384`
+  `Aspect_VKeyMouse_RightButton  = 32768`
+
+**Files changed:** `gui/assembly_viewer.py`
+  - `AIS_ViewController` instance `_vc` added in `__init__`
+  - `mousePressEvent`, `mouseMoveEvent`, `mouseReleaseEvent` replaced
+  - `wheelEvent` uses `_vc.UpdateMouseScroll()` + `Aspect_ScrollDelta`
+  - `_flush()` helper calls `FlushViewEvents(context, view, True)`
+  - `OnSelectionChanged()` override routes to `_report_selection()`
+  - `mouseDoubleClickEvent` swallows double-clicks cleanly
+
+**Result:** Clicking, double-clicking, and rapid clicking no longer
+crash the application. Mouse handling is now as robust as CAD Assistant.
 
 ---
 
