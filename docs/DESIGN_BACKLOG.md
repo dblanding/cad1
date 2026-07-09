@@ -1907,9 +1907,98 @@ Root cause likely: after a Dynamic move the AIS shapes are in a
 state where certain faces are occluded or their AIS context state
 differs from what resolve_pick() expects.
 
-### Rename: cad1 -> Basicad
-Change the application name from "cad1" to "Basicad". Changes
-needed:
-  - Window title in main_app.py (currently "cad1 -- {step_path}")
-  - Project directory name (~/Desktop/cad1 -> ~/Desktop/basicad)
-  - Any references in DESIGN_BACKLOG.md and source comments
+---
+
+## 28. Viewport Crash Fix: AIS_ViewController Refactor (COMPLETE)
+
+**Status: COMPLETE.** See item 20 for full history. Fixed in this session.
+
+Replaced direct `context.MoveTo()` / `context.Select()` calls with
+`AIS_ViewController`, OCCT's own input serialization layer. All mouse
+events (move, press, release, scroll) are now fed to the controller
+via `UpdateMousePosition()`, `UpdateMouseButtons()`, `UpdateMouseScroll()`,
+then processed by `FlushViewEvents(context, view, True)`. OCCT handles
+rotate/pan/zoom/select/hover internally with no re-entrancy risk.
+
+`OnSelectionChanged()` override routes OCCT's selection callback to
+`_report_selection()`. Double-clicks are swallowed by
+`mouseDoubleClickEvent()`.
+
+Button constants (plain ints in this OCP build):
+  Aspect_VKeyMouse_LeftButton   = 8192
+  Aspect_VKeyMouse_MiddleButton = 16384
+  Aspect_VKeyMouse_RightButton  = 32768
+
+Result: clicking, double-clicking, and rapid clicking no longer crash
+the application. Mouse handling is now as robust as CAD Assistant.
+
+---
+
+## 29. App Renamed to Basicad; Starts Without STEP File (COMPLETE)
+
+**Status: COMPLETE.**
+
+### Rename
+Window title changed from `"cad1 -- {step_path}"` to `"Basicad"` /
+`"Basicad -- {step_path}"`. Future: rename project directory from
+`cad1/` to `basicad/` and update all internal references.
+
+### Start without STEP file
+`uv run gui/main_app.py` now works without a filename argument.
+When no file is specified:
+  - `load()` creates an empty root `Compound(label="/")` as the assembly.
+  - The tree shows a single `/` root node.
+  - The viewport initializes correctly (grey background, ViewCube visible).
+  - `view.MustBeResized()` is called explicitly to fill the viewport.
+  - Import STEP, Export STEP, Workplane, Fillet, Shell buttons all enabled.
+  - `_on_import_clicked` and `_on_export_clicked` use `Path.home()` as
+    the default directory when `self.step_path` is None.
+
+This matches the CoCreate/Creo startup behavior: blank canvas, ready
+for import or part creation.
+
+---
+
+## 30. Export/Import Cycle: Fix // Nesting Bug (COMPLETE)
+
+**Status: COMPLETE.**
+
+### Problem
+Starting with an empty `/` root and importing a STEP file added the
+imported assembly (e.g. `as1`) as a child of `/`. Exporting then wrote
+`/` as the top-level node in the STEP file. Re-importing that file
+added another `/` node under the existing `/`, giving `//as1`. Each
+export/import cycle added another `/` level.
+
+### Fix
+
+**Export (_on_export_clicked):**
+When the root has a single child, export that child directly instead
+of the `/` wrapper:
+```python
+children = list(self._assembly.children)
+if len(children) == 1:
+    export_step(children[0], out_path)
+else:
+    export_step(self._assembly, out_path)
+```
+The exported STEP file now contains `as1` at the root, not `/`.
+
+**Import (_on_import_clicked):**
+If the imported node's label is `/` (an old exported file that still
+has the wrapper), unwrap it and add its children directly:
+```python
+if new_node.label == '/':
+    for child in list(new_node.children):
+        add_node(child, target)
+        self.viewport.display_subtree(child, ...)
+        self.tree.add_node_to_tree(child, parent_node=target)
+else:
+    add_node(new_node, target)
+    ...
+```
+
+### Result
+Export/import cycle is now idempotent. The app can be closed and
+reopened, the exported STEP file re-imported, and the session resumes
+exactly where it left off with no extra hierarchy levels.

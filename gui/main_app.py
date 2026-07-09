@@ -484,7 +484,9 @@ class SyncedViewportWidget(OcctViewportWidget):
 class MainWindow(QWidget):
     def __init__(self, step_path):
         super().__init__()
-        self.setWindowTitle(f"cad1 -- {step_path}")
+        self.setWindowTitle(f"Basicad -- {step_path}" if step_path else "Basicad")
+
+
         self.resize(1400, 800)
 
         outer_layout = QVBoxLayout(self)
@@ -629,15 +631,34 @@ class MainWindow(QWidget):
         self._assembly = None  # set by load()
 
     def load(self):
-        print(f"Loading {self.step_path} ...")
-        self._assembly = self.viewport.load_and_display_assembly(self.step_path)
-        self.tree.load_assembly_into_tree(self._assembly)
+        if self.step_path is None:
+            from build123d import Compound
+            self._assembly = Compound(label="/")
+            self.tree.load_assembly_into_tree(self._assembly)
+        else:
+            print(f"Loading {self.step_path} ...")
+            self._assembly = self.viewport.load_and_display_assembly(
+                self.step_path)
+            self.tree.load_assembly_into_tree(self._assembly)
+            print("Loaded into both tree and viewport.")
+
         self._export_btn.setEnabled(True)
         self._import_btn.setEnabled(True)
         self._create_part_btn.setEnabled(True)
         self._fillet_btn.setEnabled(True)
         self._shell_btn.setEnabled(True)
-        print("Loaded into both tree and viewport.")
+
+        # Force OCCT to resize its internal window to match the Qt widget.
+        # Without this, the viewport only fills a corner of its allocated
+        # space when started without a STEP file (no FitAll triggers resize).
+        try:
+            self.viewport.view.MustBeResized()
+            if self.step_path is not None:
+                self.viewport.view.FitAll()
+            self.viewport.update()
+        except Exception:
+            pass
+
 
     def _on_part_selected_in_viewport(self, node_info):
         """
@@ -1040,6 +1061,8 @@ class MainWindow(QWidget):
 
     def _on_import_clicked(self):
         """Import a STEP file and add it to the current assembly."""
+        # If the imported node is labeled '/', merge its children into the
+        # current root instead of adding the '/' node as a child.
         if self._assembly is None:
             return
 
@@ -1049,7 +1072,7 @@ class MainWindow(QWidget):
         in_path, _ = QFileDialog.getOpenFileName(
             self,
             "Import STEP File",
-            str(Path(self.step_path).parent),
+            str(Path(self.step_path).parent) if self.step_path else str(Path.home()),
             "STEP Files (*.step *.stp);;All Files (*)"
         )
         if not in_path:
@@ -1067,8 +1090,20 @@ class MainWindow(QWidget):
 
             # Add under the active assembly (or root if none set).
             target = self.tree.get_target_node()
-            add_node(new_node, target)
-            print(f"Added '{new_node.label}' under '{target.label}'.")
+
+            # If imported file has a '/' root wrapper, unwrap it
+            if new_node.label == '/':
+                children_to_add = list(new_node.children)
+                for child in children_to_add:
+                    add_node(child, target)
+                    self.viewport.display_subtree(child, f"/{child.label}")
+                    self.tree.add_node_to_tree(child, parent_node=target)
+                    print(f"Added '{child.label}' under '{target.label}'.")
+            else:
+                add_node(new_node, target)
+                self.viewport.display_subtree(new_node, f"/{new_node.label}")
+                self.tree.add_node_to_tree(new_node, parent_node=target)
+                print(f"Added '{new_node.label}' under '{target.label}'.")
 
             # Display the new geometry in the viewport.
             self.viewport.display_subtree(new_node, f"/{new_node.label}")
@@ -1099,10 +1134,13 @@ class MainWindow(QWidget):
         from PySide6.QtWidgets import QFileDialog, QMessageBox
 
         # Default to a sensible filename alongside the input file.
-        input_path = Path(self.step_path)
-        default_out = str(input_path.with_name(
-            input_path.stem + "_exported" + input_path.suffix
+        if self.step_path:
+            input_path = Path(self.step_path)
+            default_out = str(input_path.with_name(
+                input_path.stem + "_exported" + input_path.suffix
         ))
+        else:
+            default_out = str(Path.home() / "assembly_exported.step")
 
         out_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1117,7 +1155,16 @@ class MainWindow(QWidget):
             import sys, os
             sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
             from step_export_fix import export_step
-            export_step(self._assembly, out_path)
+            # Export only the real content under root, not the '/' wrapper itself.
+
+            children = list(self._assembly.children)
+            if len(children) == 1:
+                # Single child -- export it directly (most common case)
+                export_step(children[0], out_path)
+            else:
+                # Multiple children -- export the whole root wrapper
+                export_step(self._assembly, out_path)
+            
             print(f"Exported to {out_path}")
             QMessageBox.information(
                 self,
@@ -1323,21 +1370,11 @@ class MainWindow(QWidget):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: main_app.py <path/to/assembly.step>")
-        sys.exit(1)
-
-    step_path = sys.argv[1]
-
+    step_path = sys.argv[1] if len(sys.argv) >= 2 else None
     app = QApplication(sys.argv)
     window = MainWindow(step_path)
     window.show()
-
-    # Same deferred-load pattern proven in assembly_viewer.py: queue
-    # to run after the current event loop iteration, so the window's
-    # real size/native handles exist before OCCT touches them.
     QTimer.singleShot(0, window.load)
-
     sys.exit(app.exec())
 
 
