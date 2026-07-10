@@ -2002,3 +2002,29 @@ else:
 Export/import cycle is now idempotent. The app can be closed and
 reopened, the exported STEP file re-imported, and the session resumes
 exactly where it left off with no extra hierarchy levels.
+
+### Addendum to item 28: OnSelectionChanged virtual method limitation
+
+After the initial AIS_ViewController refactor, fillet/shell/position
+dialogs stopped receiving picks -- clicking edges and faces was no
+longer reported to the application.
+
+**Root cause:** `OnSelectionChanged()` is a C++ virtual method on
+`AIS_ViewController`. OCP's Python bindings do not support overriding
+C++ virtual methods via Python subclassing -- the override was silently
+ignored and `_report_selection()` was never called.
+
+**Fix:** Remove `OnSelectionChanged()` entirely. Instead, restore
+manual click detection in the mouse event handlers:
+  - `mousePressEvent` records `_press_pos` and resets `_drag_distance`
+  - `mouseMoveEvent` accumulates `_drag_distance`
+  - `mouseReleaseEvent` calls `_report_selection()` directly when
+    `_drag_distance < _click_drag_threshold_px`
+
+`FlushViewEvents` still runs `SelectDetected` internally before
+`_report_selection()` is called, so the context selection state is
+always current. Navigation (rotate/pan/zoom/hover) continues to go
+entirely through `AIS_ViewController` -- no crashes.
+
+**Lesson:** When subclassing OCP C++ classes in Python, virtual method
+overrides are not reliable. Use explicit Python-side logic instead.

@@ -465,6 +465,9 @@ class OcctViewportWidget(QWidget):
 
     def mousePressEvent(self, event):
         self._last_mouse_pos = event.position()
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position()
+            self._drag_distance = 0.0
         pt = self._qt_pos_to_vec2i(event.position())
         btns = self._qt_buttons_to_occt(event.buttons())
         self._vc.UpdateMouseButtons(pt, btns, 0, False)
@@ -473,6 +476,10 @@ class OcctViewportWidget(QWidget):
     def mouseMoveEvent(self, event):
         pos = event.position()
         self._last_mouse_pos = pos
+        if self._press_pos is not None:
+            dx = pos.x() - self._press_pos.x()
+            dy = pos.y() - self._press_pos.y()
+            self._drag_distance = (dx**2 + dy**2) ** 0.5
         pt = self._qt_pos_to_vec2i(pos)
         btns = self._qt_buttons_to_occt(event.buttons())
         self._vc.UpdateMousePosition(pt, btns, 0, False)
@@ -481,14 +488,21 @@ class OcctViewportWidget(QWidget):
     def mouseReleaseEvent(self, event):
         self._last_mouse_pos = event.position()
         pt = self._qt_pos_to_vec2i(event.position())
-        # Release: buttons AFTER release (so released button is absent)
         btns = self._qt_buttons_to_occt(event.buttons())
         self._vc.UpdateMouseButtons(pt, btns, 0, False)
         self._flush()
 
-        # RMB: show context menu (AIS_ViewController handles navigation,
-        # we handle the application-level menu ourselves)
-        if event.button() == Qt.MouseButton.RightButton:
+        if event.button() == Qt.MouseButton.LeftButton:
+            if (self._press_pos is not None and
+                    self._drag_distance < self._click_drag_threshold_px):
+                # It was a click not a drag -- report the selection.
+                # FlushViewEvents already called SelectDetected internally
+                # so the context selection state is current.
+                self._report_selection()
+            self._press_pos = None
+            self._drag_distance = 0.0
+
+        elif event.button() == Qt.MouseButton.RightButton:
             self._show_context_menu(event.globalPosition().toPoint())
 
     def mouseDoubleClickEvent(self, event):
@@ -715,13 +729,6 @@ class OcctViewportWidget(QWidget):
         delta = Aspect_ScrollDelta(pt, event.angleDelta().y() / 120.0)
         self._vc.UpdateMouseScroll(delta)
         self._flush()
-
-    def OnSelectionChanged(self, theCtx, theView):
-        """
-        Called by AIS_ViewController when a selection event completes.
-        Override to route into our _report_selection() logic.
-        """
-        self._report_selection()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
