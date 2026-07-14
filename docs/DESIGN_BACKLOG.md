@@ -1888,14 +1888,15 @@ direction (4 DOF). It leaves two DOFs unconstrained:
 After aligning the axis, the user needs two more steps to fully
 constrain the part. Currently these are missing.
 
-### Fix: Dynamic Move -- only active part moves, not whole assembly
+### Fix: Dynamic Move -- only active part moves, not whole assembly (FIXED, see item 31)
 When using the Dynamic (AIS Manipulator) section to move a
 sub-assembly (e.g. nut_bolt_assembly), only the active PART (bolt)
-moves visually during the drag. Clicking Done shows the whole
+moved visually during the drag. Clicking Done showed the whole
 assembly was moved correctly in the data model, but the display
-during dragging is misleading and confusing.
-Root cause likely: the AIS Manipulator is attached to the active
-part's AIS_Shape, not to all leaf shapes of the sub-assembly.
+during dragging was misleading and confusing.
+Root cause was the AIS Manipulator being attached to the active
+part's AIS_Shape only, not to all leaf shapes of the sub-assembly.
+See item 31 for the fix.
 
 ### Fix: Mate/Align fails after Dynamic Move mis-alignment
 After using Dynamic Move to mis-align a sub-assembly:
@@ -2028,3 +2029,65 @@ entirely through `AIS_ViewController` -- no crashes.
 
 **Lesson:** When subclassing OCP C++ classes in Python, virtual method
 overrides are not reliable. Use explicit Python-side logic instead.
+
+---
+
+## 31. Import STEP Double-Display Bug + Dynamic Move Live-Drag Fix (COMPLETE)
+
+**Status: COMPLETE.**
+
+### Bug 1: Importing a STEP file displayed it twice, only one movable
+
+`_on_import_clicked` called `self.viewport.display_subtree(...)` and
+`self.tree.add_node_to_tree(...)` inside the `if/else` branch that
+handles the imported node (once per child for the `'/'`-unwrap case,
+once for the single-node case) -- and then called both again,
+unconditionally, right after the `if/else` block. Every non-root
+import therefore created two full sets of AIS shapes and two tree
+rows for the same node.
+
+Because `_node_id_to_ais_shape` is keyed by `id(node)`, the second
+`display_subtree()` call overwrote the mapping with its new AIS
+shapes. The first batch remained visible in the viewport (superimposed
+on the second) but was now orphaned -- nothing pointed to it anymore,
+so `attach_manipulator()` could never find it, which is why only one
+of the two superimposed copies could be moved.
+
+**Fix:** Deleted the redundant trailing `display_subtree()` /
+`add_node_to_tree()` calls after the `if/else` block. Each branch
+already performs both calls exactly once.
+
+### Bug 2: Dynamic Move -- only the active part moved during drag
+
+See item 27's "Fix: Dynamic Move" entry for the original symptom.
+`AIS_Manipulator.Attach()` only accepts a single AIS_Shape, so OCCT
+only live-updated that one shape's `LocalTransformation()` during
+drag; the rest of the sub-assembly's true positions were only
+computed once, on Done, via `get_manipulator_transform()` ->
+`node.move(local_move)` -> full redisplay -- hence the "snap."
+
+**Fix (`SyncedViewportWidget` in `gui/main_app.py`):**
+- `attach_manipulator()` now also collects every leaf AIS_Shape under
+  the node into `self._manip_leaf_shapes`, not just the one
+  representative shape the gizmo attaches to.
+- `mousePressEvent()`, at `StartTransform`, snapshots each leaf
+  shape's current `LocalTransformation()` into
+  `self._manip_start_trsfs`.
+- `mouseMoveEvent()`, after the gizmo moves its one attached shape,
+  computes the incremental delta (`new_target * start_target.Inverted()`)
+  and applies that same delta to every other leaf shape
+  (`delta * start_leaf`), redisplaying them each frame. All leaf
+  shapes now move live together, in sync with the gizmo.
+- `detach_manipulator()` clears the new tracking state.
+
+The commit path on Done (`get_manipulator_transform()` ->
+`node.move(local_move)` -> `request_redisplay`) is unchanged -- it
+still rebuilds everything cleanly from the model, so the temporary
+per-frame `SetLocalTransformation` calls during drag are fully
+overwritten and leave no residue.
+
+**Known related gap (not fixed, not a regression):** if the Position
+dialog is closed via the window's X button while a Dynamic Move drag
+is in progress, there's no cleanup path that calls
+`detach_manipulator()` or commits the move. True both before and
+after this fix.

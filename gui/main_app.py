@@ -116,6 +116,15 @@ class SyncedViewportWidget(OcctViewportWidget):
         # AIS_Manipulator state -- None when not in dynamic move mode.
         self._manipulator = None
         self._manip_dragging = False
+        # All leaf AIS_Shapes under the node the manipulator is attached
+        # to (target_ais is one of these). Needed so the WHOLE sub-
+        # assembly moves live during drag, not just the one shape the
+        # manipulator is actually Attach()-ed to.
+        self._manip_leaf_shapes = []
+        # id(ais) -> gp_Trsf captured at StartTransform time, for every
+        # shape in _manip_leaf_shapes. Used each mouseMoveEvent to work
+        # out the incremental delta and re-apply it to the siblings.
+        self._manip_start_trsfs = {}
 
         # Make the SELECTED highlight (as opposed to the DYNAMIC/hover
         # highlight, which was already plenty visible) more visually
@@ -173,6 +182,22 @@ class SyncedViewportWidget(OcctViewportWidget):
             print(f"[manipulator] No AIS_Shape found for node {node.label!r}")
             return False
 
+        # Collect every leaf AIS_Shape under this node (including the
+        # target itself) -- these all need to move together live during
+        # the drag, not just target_ais which the gizmo is Attach()-ed to.
+        leaf_shapes = []
+        self_ais = self._node_id_to_ais_shape.get(id(node))
+        if self_ais is not None:
+            leaf_shapes.append(self_ais)
+        else:
+            for child in node.descendants:
+                child_ais = self._node_id_to_ais_shape.get(id(child))
+                if child_ais is not None:
+                    leaf_shapes.append(child_ais)
+        if not leaf_shapes:
+            leaf_shapes = [target_ais]
+        self._manip_leaf_shapes = leaf_shapes
+
         try:
             manip = AIS_Manipulator()
             manip.SetModeActivationOnDetection(True)
@@ -212,6 +237,8 @@ class SyncedViewportWidget(OcctViewportWidget):
             print(f"[manipulator] detach failed: {e}")
         self._manipulator = None
         self._manip_dragging = False
+        self._manip_leaf_shapes = []
+        self._manip_start_trsfs = {}
 
     def get_manipulator_transform(self):
         """
@@ -258,6 +285,13 @@ class SyncedViewportWidget(OcctViewportWidget):
                     try:
                         self._manipulator.StartTransform(x, y, self.view)
                         self._manip_dragging = True
+                        # Snapshot the CURRENT transform of every leaf
+                        # shape (not just the one the gizmo is attached
+                        # to) so mouseMoveEvent can compute deltas.
+                        self._manip_start_trsfs = {
+                            id(ais): ais.LocalTransformation()
+                            for ais in self._manip_leaf_shapes
+                        }
                         return
                     except Exception as e:
                         print(f"[manipulator] StartTransform failed: {e}")
@@ -275,6 +309,28 @@ class SyncedViewportWidget(OcctViewportWidget):
             x, y = int(event.position().x()), int(event.position().y())
             try:
                 self._manipulator.Transform(x, y, self.view)
+
+                # The gizmo only updated its ONE attached (target) shape.
+                # Work out how much that shape moved since StartTransform,
+                # and apply the SAME incremental delta to every other leaf
+                # shape in the sub-assembly so the whole thing moves live.
+                target_obj = self._manipulator.Object()
+                if target_obj is not None and self._manip_start_trsfs:
+                    start_target = self._manip_start_trsfs.get(id(target_obj))
+                    if start_target is not None:
+                        new_target = target_obj.LocalTransformation()
+                        # delta (world-space) = new * inverse(start)
+                        delta = new_target.Multiplied(start_target.Inverted())
+                        for ais in self._manip_leaf_shapes:
+                            if ais is target_obj:
+                                continue  # gizmo already moved this one
+                            start = self._manip_start_trsfs.get(id(ais))
+                            if start is None:
+                                continue
+                            new_trsf = delta.Multiplied(start)
+                            ais.SetLocalTransformation(new_trsf)
+                            self.context.Redisplay(ais, False)
+
                 self.context.UpdateCurrentViewer()
                 self.update()
                 return  # suppress orbit/pan
@@ -1104,12 +1160,6 @@ class MainWindow(QWidget):
                 self.viewport.display_subtree(new_node, f"/{new_node.label}")
                 self.tree.add_node_to_tree(new_node, parent_node=target)
                 print(f"Added '{new_node.label}' under '{target.label}'.")
-
-            # Display the new geometry in the viewport.
-            self.viewport.display_subtree(new_node, f"/{new_node.label}")
-
-            # Add to the tree widget under the target node.
-            self.tree.add_node_to_tree(new_node, parent_node=target)
 
             print(f"Import complete: '{new_node.label}' is now in the tree.")
             print("Drag it to re-parent, then use Position to place it.")
