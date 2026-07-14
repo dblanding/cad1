@@ -1880,13 +1880,13 @@ reposition the copy independently.
   as in PyurCAD -- snap to endpoints, midpoints, intersections,
   centers. Currently only cline/ccirc intersection snap is supported.
 
-### Fix: Align Axis -- missing axial and radial positioning steps
-The Align Axis section in PositionDialog only aligns the axis
-direction (4 DOF). It leaves two DOFs unconstrained:
+### Fix: Align Axis -- missing axial and radial positioning steps (FIXED, see item 32)
+The Align Axis section in PositionDialog only aligned the axis
+direction (4 DOF). It left two DOFs unconstrained:
   - Axial position (slide along the axis)
   - Radial/angular position (spin around the axis)
-After aligning the axis, the user needs two more steps to fully
-constrain the part. Currently these are missing.
+After aligning the axis, the user needed two more steps to fully
+constrain the part. See item 32 for the fix.
 
 ### Fix: Dynamic Move -- only active part moves, not whole assembly (FIXED, see item 31)
 When using the Dynamic (AIS Manipulator) section to move a
@@ -2091,3 +2091,66 @@ dialog is closed via the window's X button while a Dynamic Move drag
 is in progress, there's no cleanup path that calls
 `detach_manipulator()` or commits the move. True both before and
 after this fix.
+
+---
+
+## 32. Align Axis: Added Steps 2 (Axial Position) and 3 (Rotational
+Position) (COMPLETE)
+
+**Status: COMPLETE.**
+
+### Problem
+
+Align Axis Step 1 (`compute_align_axis_move`) only aligns the
+direction and position of a cylinder/circle axis -- 4 of 6 DOF. The
+remaining 2 DOF were unconstrained and had no UI to set them:
+- Axial position (translation along the now-shared axis)
+- Rotational position (spin about the axis)
+
+### Fix (`gui/position_dialog.py` only -- `src/pose.py` untouched)
+
+**UI:** Section 2 ("Align Axis") now has three buttons instead of
+one: Step 1 (unchanged), Step 2 -- Axial Position, Step 3 --
+Rotational Position. Steps 2/3 are disabled until Step 1 has run
+(mirroring how Section 1's Steps 2/3 are gated on `_mated_normal`).
+
+**State:** `_axis_point` / `_axis_dir` capture the FIXED target
+axis's point/direction (from `pick2`, unaffected by the move applied
+to the moving part) after Step 1 succeeds. `_axis_step2_mate` tracks
+the last mate/align choice for Step 2, toggled by Reverse. All three
+reset on Back-to-empty-history and on Done, same as `_mated_normal`.
+
+**`compute_axis_step2_move(pick1, pick2, axis_point, axis_dir, mate)`**
+-- constrains the axial-translation DOF: pick a face on the moving
+part and a parallel face on the fixed part; translates along the
+Step-1 axis until they're coplanar.
+
+Key insight: for a pure single-axis translation between two parallel
+planes, "mate" (opposed normals) and "align" (same-direction normals)
+produce the mathematically IDENTICAL translation -- verified by
+deriving that `compute_mate_move`'s translation term is invariant to
+flipping `target_z`'s sign. So mate/align can't be selected by
+adjusting the translation. Instead: if the moving part's CURRENT face
+relationship doesn't already match the requested mate/align state,
+first flip the part 180 degrees about an axis PERPENDICULAR to the
+main axis (through `axis_point`) -- the same "mate alignment /
+anti-alignment flip" real CAD tools use for concentric mates -- which
+reverses the effective face direction along the axis while preserving
+the Step-1 axis coincidence (a 180-degree rotation about any line
+through `axis_point` perpendicular to `axis_dir` maps the axis line
+onto itself). Then translate along the axis to close the gap. Reverse
+toggles `_axis_step2_mate` and recomputes.
+
+**`compute_axis_step3_move(pick1, pick2, axis_point, axis_dir)`** --
+constrains the final spin DOF: pick a face on the moving part and a
+face on the fixed part; rotates about the Step-1 axis until both
+normals, projected onto the plane perpendicular to the axis, are
+parallel and point the SAME direction. Unlike `compute_step3_move`'s
+"hole" case, there's no smaller-angle ambiguity to resolve -- the
+target is always same-direction, per the step's definition.
+
+### Result
+
+Align Axis is now a full 6-DOF, 3-step workflow (4 + 1 + 1),
+consistent with the existing Mate/Align 3-2-1 section's step
+structure and Reverse/Back semantics.
