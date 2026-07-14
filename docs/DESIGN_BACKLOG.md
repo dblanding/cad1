@@ -2154,3 +2154,97 @@ target is always same-direction, per the step's definition.
 Align Axis is now a full 6-DOF, 3-step workflow (4 + 1 + 1),
 consistent with the existing Mate/Align 3-2-1 section's step
 structure and Reverse/Back semantics.
+
+---
+
+## 33. UI Revision: Adopt KodaCAD-Style Menu/Toolbar Architecture
+
+**Status: Phase 1 COMPLETE. Phases 2-4 planned, not started.**
+
+### Motivation
+
+BasiCAD's UI has grown bulky: e.g. the Workplane/Sketch/Extrude dialog
+combines three distinct workflows (place a workplane, sketch a
+profile, extrude/cut) into one hulking QDialog. KodaCAD (same PySide6
++ OCP stack, doing the same job) instead uses a QMainWindow with a
+real menu bar, small toolbars per tool group, and a status-bar line
+edit for numeric entry (optionally fed by an RPN calculator). Decided
+to move BasiCAD toward that architecture, in phases, rather than a
+risky one-shot rewrite.
+
+Also motivated by a concrete missing feature: KodaCAD's workplanes
+have clickable intersection points (`WorkPlane.intersectPts()` in
+kodacad's `workplane.py`, displayed + activated for `TopAbs_VERTEX`
+selection in `mainwindow.py`'s `draw_wp()`) for use by sketch tools.
+BasiCAD has no equivalent yet -- this is a Phase 2 deliverable.
+
+### Planned phases
+
+1. **Chrome swap (COMPLETE, this item).** Promote `MainWindow` from
+   `QWidget` to `QMainWindow`; add a real menu bar (File / Position /
+   Create / Modify / Utility) whose actions call the SAME handler
+   methods the existing side-panel buttons already call (additive
+   only -- buttons are untouched, so nothing that worked before can
+   regress); add a status bar with a shared line edit + units label;
+   port KodaCAD's RPN calculator.
+2. **Workplane + sketch engine.** Port `workplane.py`'s geometry math
+   (framework-agnostic, portable as-is) and `m2d.py`'s per-tool
+   pattern, adapted to build123d conventions. Add a Workplane menu (At
+   Origin / On Face / By 3 Points) and a sketch toolbar (Line,
+   Rectangle, Circle, Arc, construction lines). Port `intersectPts()`
+   + the `context.Activate(ais_pnt, TopAbs_VERTEX)` display logic --
+   this delivers the clickable-intersection-points feature.
+3. **Split the mega-dialog.** Once sketching lives on its own
+   toolbar, Extrude becomes a small standalone action instead of a
+   3-step wizard dialog.
+4. **Fold in remaining "Modify Part" tools** (Fillet, Shell, Revolve)
+   as individual menu actions in the same style.
+
+Position dialog is deliberately being LEFT as a dialog throughout --
+it's a genuinely different interaction shape (multi-step with
+Back/Reverse/Done across three sections), it's new and well-tested,
+and KodaCAD has no equivalent to model it on anyway.
+
+### Phase 1 implementation (this commit)
+
+**`gui/main_app.py`:**
+- `MainWindow(QWidget)` -> `MainWindow(QMainWindow)`. The existing
+  splitter layout now lives in a `central` `QWidget` set via
+  `setCentralWidget()` -- no other change to that layout or any
+  dialog/signal wiring.
+- `_build_menu_bar()`: File (Import/Export STEP), Position (Position
+  selected...), Create (Workplane/Sketch/Extrude...), Modify (Fillet,
+  Shell), Utility (Calculator). Every action calls the existing
+  handler method the corresponding button already calls.
+- `_build_status_bar()`: shared `self.lineEdit` + `self.unitsLabel`
+  ("Units: mm"), following KodaCAD's `statusBar().addPermanentWidget`
+  pattern. `self.units` is stored but not yet wired into any
+  dialog's math -- that's for a later phase once sketch tools need
+  it.
+- `launch_calculator()` / `valueFromCalc(value)`: launches the
+  calculator (lazily, singleton-ish like KodaCAD's `self.calculator`)
+  and receives values from its T/Z/Y/X register buttons.
+
+**`gui/rpn_calculator.py` (new file):** port of KodaCAD's
+`rpnCalculator.py`. Two adaptations from the original:
+- Register buttons send to `caller.valueFromCalc(value)`, which in
+  BasiCAD targets **whichever QLineEdit currently has keyboard
+  focus** (falling back to the status-bar line edit) -- rather than
+  KodaCAD's dedicated `lineEditStack`/`registerCallback` command
+  system. This makes the calculator immediately useful with every
+  existing dialog's fields (e.g. the Depth field) with zero changes
+  to those dialogs, since BasiCAD's dialogs take input directly in
+  their own fields rather than through a shared command stack.
+- The "Dist"/"Len" buttons call pick-based measurement tools that
+  don't exist in BasiCAD yet (`distPtPt`/`edgeLen` in KodaCAD).
+  `measure()` degrades gracefully -- shows a status-bar message
+  instead of crashing -- until Phase 2 adds them.
+
+**Not yet tested against a running Qt/OCCT display** (no GUI
+available in the environment this was written in) -- both files pass
+`py_compile`, and every menu action was checked to reference an
+existing, already-wired handler method, but please smoke-test locally
+before relying on it: launch the app, exercise each new menu item,
+and open the calculator (Utility -> Calculator) with focus on e.g. the
+Workplane dialog's Depth field to confirm a register button
+(T/Z/Y/X) writes into it correctly.

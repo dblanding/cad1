@@ -4,7 +4,15 @@ main_app.py
 THE MAIN APPLICATION -- wires together all components of cad1.
 
 ARCHITECTURE:
-  MainWindow (QWidget)
+  MainWindow (QMainWindow)
+    |- menuBar()             -- File / Position / Create / Modify / Utility
+    |                            (PHASE 1 of the UI revision, see
+    |                            DESIGN_BACKLOG item 33 -- additive only,
+    |                            mirrors existing button handlers)
+    |- statusBar()           -- shared QLineEdit + units label
+    |- Calculator            (rpn_calculator.py)      -- RPN calculator,
+    |                            ported from KodaCAD; sends values to
+    |                            whichever QLineEdit has focus
     |- SyncedViewportWidget  (subclass of assembly_viewer.SyncedViewportWidget)
     |    Adds: _node_id_to_ais_shape, _apply_shape_to_node(),
     |          active-part orange overlay, edge/vertex mode management
@@ -61,7 +69,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QSplitter,
     QLabel,
+    QMainWindow,
+    QLineEdit,
+    QFrame,
 )
+from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt, Signal, QTimer
 
 from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX
@@ -75,6 +87,7 @@ from position_dialog import PositionDialog  # noqa: E402
 from workplane_dialog import WorkplaneDialog  # noqa: E402
 from fillet_dialog import FilletDialog  # noqa: E402
 from shell_dialog import ShellDialog  # noqa: E402
+from rpn_calculator import Calculator  # noqa: E402
 
 
 class SyncedViewportWidget(OcctViewportWidget):
@@ -537,31 +550,24 @@ class SyncedViewportWidget(OcctViewportWidget):
         self.update()
 
 
-class MainWindow(QWidget):
+class MainWindow(QMainWindow):
     def __init__(self, step_path):
         super().__init__()
         self.setWindowTitle(f"Basicad -- {step_path}" if step_path else "Basicad")
 
-
         self.resize(1400, 800)
 
-        outer_layout = QVBoxLayout(self)
+        # --- Central widget hosts the existing splitter layout, unchanged.
+        # (PHASE 1 of the UI revision -- see DESIGN_BACKLOG item 33: promote
+        # to QMainWindow so a real menu bar / status bar / dock widgets are
+        # available, without touching any existing dialog or button wiring.)
+        central = QWidget()
+        self.setCentralWidget(central)
+        outer_layout = QVBoxLayout(central)
         outer_layout.setContentsMargins(0, 0, 0, 0)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         outer_layout.addWidget(splitter)
-
-        from PySide6.QtWidgets import QMainWindow, QDockWidget
-        # MainWindow needs to be a QMainWindow to support dock widgets --
-        # but we're currently a QWidget. Promote to QMainWindow by
-        # re-parenting the existing layout into a central widget.
-        # (This is a one-time change; all existing child widgets stay
-        # the same, just hosted differently.)
-        # Actually -- simplest approach: float the PositionDialog as a
-        # regular QDialog window rather than a true dock, since we're
-        # already a QWidget and converting to QMainWindow mid-project
-        # would touch too much at once. The PositionDialog is already
-        # a QDockWidget but can float standalone just fine.
 
         # --- Left: tree, in its own panel with buttons -----------------
         tree_panel = QWidget()
@@ -685,6 +691,95 @@ class MainWindow(QWidget):
 
         self.step_path = step_path
         self._assembly = None  # set by load()
+
+        # --- Menu bar (PHASE 1 of the UI revision, DESIGN_BACKLOG item 33)
+        # Additive only: every action here calls the SAME handler methods
+        # the side-panel buttons already call. Nothing is removed, so
+        # existing behavior can't regress -- this just gives a second,
+        # less "bulky" way to reach the same commands, KodaCAD-style.
+        self._build_menu_bar()
+
+        # --- Status bar with a shared line edit + units label, and the
+        # RPN calculator (ported from KodaCAD's rpnCalculator.py). The
+        # calculator's register buttons (T/Z/Y/X) send their value to
+        # whichever QLineEdit currently has keyboard focus -- this works
+        # with Depth/Name/etc. fields in the existing dialogs as-is, with
+        # no changes needed to those dialogs. If no line edit has focus,
+        # the value goes to this shared status-bar line edit instead.
+        self._build_status_bar()
+        self.calculator = None
+
+    def _build_menu_bar(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&File")
+        self._add_action(file_menu, "Import STEP...", self._on_import_clicked)
+        self._add_action(file_menu, "Export STEP...", self._on_export_clicked)
+
+        position_menu = menubar.addMenu("&Position")
+        self._add_action(position_menu, "Position selected...",
+                         self._on_position_clicked)
+
+        create_menu = menubar.addMenu("&Create")
+        self._add_action(create_menu, "Workplane / Sketch / Extrude...",
+                         self._on_create_part_clicked)
+
+        modify_menu = menubar.addMenu("&Modify")
+        self._add_action(modify_menu, "Fillet...", self._on_fillet_clicked)
+        self._add_action(modify_menu, "Shell...", self._on_shell_clicked)
+
+        utility_menu = menubar.addMenu("&Utility")
+        self._add_action(utility_menu, "Calculator", self.launch_calculator)
+
+    def _add_action(self, menu, text, handler):
+        """Small helper matching KodaCAD's add_function_to_menu pattern."""
+        action = QAction(text, self)
+        action.setMenuRole(QAction.MenuRole.NoRole)
+        action.triggered.connect(handler)
+        menu.addAction(action)
+        return action
+
+    def _build_status_bar(self):
+        status = self.statusBar()
+        status.setSizeGripEnabled(False)
+
+        self.lineEdit = QLineEdit()
+        self.lineEdit.setMaximumWidth(160)
+        status.addPermanentWidget(self.lineEdit)
+
+        self.units = "mm"
+        self.unitsLabel = QLabel(f"Units: {self.units} ")
+        self.unitsLabel.setFrameStyle(
+            QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        status.addPermanentWidget(self.unitsLabel)
+
+        status.showMessage("Ready", 5000)
+
+    # -----------------------------------------------------------------------
+    # RPN Calculator (ported from KodaCAD's rpnCalculator.py)
+    # -----------------------------------------------------------------------
+
+    def launch_calculator(self):
+        if not self.calculator:
+            self.calculator = Calculator(self)
+        self.calculator.show()
+        self.calculator.raise_()
+        self.calculator.activateWindow()
+
+    def valueFromCalc(self, value):
+        """
+        Receive a value pushed from the calculator (T/Z/Y/X register
+        buttons). Targets whichever QLineEdit currently has keyboard
+        focus -- e.g. the Depth field in the Workplane dialog -- so the
+        calculator is immediately useful with every existing dialog's
+        input fields, with no per-dialog wiring required. Falls back to
+        the shared status-bar line edit if nothing else has focus.
+        """
+        target = QApplication.focusWidget()
+        if not isinstance(target, QLineEdit):
+            target = self.lineEdit
+        target.setText(str(value))
+        target.setFocus()
 
     def load(self):
         if self.step_path is None:
