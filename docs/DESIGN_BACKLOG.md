@@ -3135,3 +3135,45 @@ Only **`PositionDialog`** remains. Every other former dialog
 menu + status-bar flows across items 33/35/36/37.
 
 **Not yet tested against a running Qt/OCCT display.**
+
+## 38. Bug: Circle/Rect's stickiness let a stray extra shape silently break Extrude/Revolve/Mill/Pull
+
+Reported: Pull failed on a bottle-neck sketch with
+`BRepBuilderAPI_DisconnectedWire`. Added diagnostic output (item 33's
+`makeWire()` fix) confirmed the smoking gun immediately: the active
+workplane's `edgeList` held TWO full circle edges at different
+locations, not one -- `makeWire()` correctly refused to join two
+separate closed loops into one wire.
+
+**Root cause:** Circle (and Rect, Constr Circle) are sticky (per
+earlier direct request, item 33's follow-up), staying armed
+indefinitely after completing. Unlike Line/Arc/construction lines --
+where placing several in a row IS the normal workflow for building up
+one multi-segment profile -- Circle and Rect each produce a COMPLETE,
+already-closed shape on their own. The app can currently only build a
+single-wire profile anyway (no multi-loop support, e.g. a washer's
+outer+inner circle), so a second Circle/Rect landing in the same
+sketch can never be legitimate. Most likely explanation here: after
+the intended neck circle completed, the tool stayed armed, and a
+later pick -- quite possibly an attempted "let me redo that" -- was
+silently interpreted as a second circle rather than a correction,
+with no obvious visual sign anything had changed.
+
+**Immediate unblock given:** Delete Last (or Clear All + redraw) to
+remove the stray shape before retrying Pull.
+
+**Root-cause fix (`gui/sketch_toolbar.py`):** added
+`_NON_STICKY_TOOLS = {"circ", "ccirc", "rect"}`. `_start_tool()` and
+`_retry_active_tool()` now check it after a successful completion --
+these three tools clear `_active_tool` immediately (status message
+becomes "...  (done.)" instead of the sticky "...  (placed -- pick/
+type another...)"), ending the repeat automatically. Every other tool
+(Line, Arc, H/V/Angled Cline, Linear Bisector) is unaffected and stays
+sticky exactly as before -- multi-segment profiles/construction
+scaffolds are still one-click-then-repeat.
+
+**Not yet tested against a running Qt/OCCT display.** Please confirm:
+draw a circle, and Circle should now automatically un-arm after it
+completes (status bar shows "(done.)"), with a second pick doing
+nothing unless the Circle button is clicked again. Line/Arc should
+still stay armed for repeated placement as before.

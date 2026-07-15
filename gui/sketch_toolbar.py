@@ -324,6 +324,26 @@ class SketchToolBar(QToolBar):
         self._active_tool = name
         self.tool_armed.emit(name or "")
 
+    # Tools that produce a COMPLETE, closed shape in one shot (a full
+    # circle or rectangle) rather than one segment of a larger profile.
+    # These do NOT stay sticky after completing (BUG FIX,
+    # DESIGN_BACKLOG item 33): a profile can currently only be a single
+    # closed wire (no multi-loop support, e.g. a washer's outer+inner
+    # circle), so a second Circle/Rect placed into the same sketch can
+    # never be legitimate -- it just leaves two disconnected loops in
+    # wp.edgeList, which makeWire() then rejects with
+    # BRepBuilderAPI_DisconnectedWire the next time ANY profile
+    # operation (Extrude/Revolve/Mill/Pull) is attempted, with no
+    # obvious link back to the stray extra shape that caused it.
+    # Reported exactly this way: Pull failed on a bottle-neck sketch
+    # whose edgeList turned out to contain two separate circles, most
+    # likely from Circle staying armed after the intended one and a
+    # later click (perhaps an attempted "redo") silently adding a
+    # second one instead of replacing the first. Line/Arc/construction-
+    # line tools are NOT in this set -- building up several segments by
+    # design IS the normal workflow for those, so they stay sticky.
+    _NON_STICKY_TOOLS = {"circ", "ccirc", "rect"}
+
     def _start_tool(self, name, prompt):
         """
         Entry point for every _do_xxx tool method (PHASE 2 FIX,
@@ -340,12 +360,12 @@ class SketchToolBar(QToolBar):
         interactive; picks and typed/calculator values arrive later,
         asynchronously, via _retry_active_tool().
 
-        STICKY: the tool STAYS armed after it completes (whether
-        immediately here or later via _retry_active_tool), so placing
-        several circles/lines/etc. in a row doesn't need re-clicking
-        the toolbar button each time -- only Cancel Tool / End
-        Operation, Clear All, or clicking a DIFFERENT tool button ends
-        the repeat.
+        STICKY (except _NON_STICKY_TOOLS, see above): the tool STAYS
+        armed after it completes (whether immediately here or later
+        via _retry_active_tool), so placing several lines/clines/etc.
+        in a row doesn't need re-clicking the toolbar button each time
+        -- only Cancel Tool / End Operation, Clear All, or clicking a
+        DIFFERENT tool button ends the repeat.
 
         BUG FIX (DESIGN_BACKLOG item 33): distPtPt()/edgeLen() already
         cancel an active sketch tool when armed, but nothing did the
@@ -369,20 +389,31 @@ class SketchToolBar(QToolBar):
         self._set_active_tool(name)
         self._active_prompt = prompt
         if self._try_complete(name):
-            self._notify_status(f"{prompt}  (placed -- pick/type another, "
-                                f"or Cancel Tool to stop.)")
+            if name in self._NON_STICKY_TOOLS:
+                self._set_active_tool(None)
+                self._notify_status(f"{prompt}  (done.)")
+            else:
+                self._notify_status(f"{prompt}  (placed -- pick/type "
+                                    f"another, or Cancel Tool to stop.)")
             return
         self._notify_status(prompt)
 
     def _retry_active_tool(self):
         """Called after a new pick or numeric value is queued. If a
         tool is currently waiting and now has enough input, complete
-        it -- and STAY armed for another repeat (see _start_tool)."""
+        it -- and STAY armed for another repeat, UNLESS it's one of
+        _NON_STICKY_TOOLS (see _start_tool)."""
         if self._active_tool is None:
             return
-        if self._try_complete(self._active_tool):
-            self._notify_status(f"{self._active_prompt}  (placed -- "
-                                f"pick/type another, or Cancel Tool to stop.)")
+        name = self._active_tool
+        if self._try_complete(name):
+            if name in self._NON_STICKY_TOOLS:
+                self._set_active_tool(None)
+                self._notify_status(f"{self._active_prompt}  (done.)")
+            else:
+                self._notify_status(f"{self._active_prompt}  (placed -- "
+                                    f"pick/type another, or Cancel Tool "
+                                    f"to stop.)")
 
     def _do_cancel_tool(self):
         """Abandon whichever tool is currently waiting for input, and
