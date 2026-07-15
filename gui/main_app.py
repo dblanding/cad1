@@ -72,6 +72,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QLineEdit,
     QFrame,
+    QToolButton,
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt, Signal, QTimer
@@ -88,6 +89,10 @@ from workplane_dialog import WorkplaneDialog  # noqa: E402
 from fillet_dialog import FilletDialog  # noqa: E402
 from shell_dialog import ShellDialog  # noqa: E402
 from rpn_calculator import Calculator  # noqa: E402
+from sketch_toolbar import SketchToolBar  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from workplane import WorkPlane  # noqa: E402
 
 
 class SyncedViewportWidget(OcctViewportWidget):
@@ -656,6 +661,15 @@ class MainWindow(QMainWindow):
 
         splitter.setSizes([350, 1050])
 
+        # --- Sketch toolbar (PHASE 2 of the UI revision, DESIGN_BACKLOG
+        # item 33) -- KodaCAD-style: a real, persistent QToolBar docked
+        # on the main window, rather than embedded inside a modal dialog.
+        # Enabled/disabled and pointed at the active WorkPlane by
+        # WorkplaneDialog (which still owns the Extrude/Cut/Add controls)
+        # and by the direct At-Origin/By-3-Points flows below.
+        self._sketch_toolbar = SketchToolBar(self)
+        self.addToolBar(Qt.ToolBarArea.RightToolBarArea, self._sketch_toolbar)
+
         # --- Position dialog (floating dock) -------------------------
         self._position_dialog = PositionDialog(self, viewport=self.viewport)
         self._position_dialog.hide()
@@ -663,7 +677,8 @@ class MainWindow(QMainWindow):
         self._position_dialog.positioning_done.connect(self._on_positioning_done)
 
         # --- Workplane / Create Part dialog (floating dock) ----------
-        self._workplane_dialog = WorkplaneDialog(self, viewport=self.viewport)
+        self._workplane_dialog = WorkplaneDialog(
+            self, viewport=self.viewport, sketch_toolbar=self._sketch_toolbar)
         self._workplane_dialog.hide()
         self._workplane_dialog.part_created.connect(self._on_part_created)
         self._workplane_dialog.part_cut.connect(self._on_part_cut)
@@ -691,6 +706,11 @@ class MainWindow(QMainWindow):
 
         self.step_path = step_path
         self._assembly = None  # set by load()
+
+        # By-3-Points workplane creation state (PHASE 2, DESIGN_BACKLOG
+        # item 33) -- mirrors KodaCAD's win.ptStack for wpBy3Pts.
+        self._wp3pts_picking = False
+        self._wp3pts_points = []
 
         # --- Menu bar (PHASE 1 of the UI revision, DESIGN_BACKLOG item 33)
         # Additive only: every action here calls the SAME handler methods
@@ -720,6 +740,14 @@ class MainWindow(QMainWindow):
         self._add_action(position_menu, "Position selected...",
                          self._on_position_clicked)
 
+        workplane_menu = menubar.addMenu("&Workplane")
+        self._add_action(workplane_menu, "At Origin, XY Plane",
+                         self._on_workplane_at_origin)
+        self._add_action(workplane_menu, "On Face...",
+                         self._on_create_part_clicked)
+        self._add_action(workplane_menu, "By 3 Points...",
+                         self._on_workplane_by_3pts)
+
         create_menu = menubar.addMenu("&Create")
         self._add_action(create_menu, "Workplane / Sketch / Extrude...",
                          self._on_create_part_clicked)
@@ -745,7 +773,30 @@ class MainWindow(QMainWindow):
 
         self.lineEdit = QLineEdit()
         self.lineEdit.setMaximumWidth(160)
+        self.lineEdit.returnPressed.connect(self._on_lineedit_return)
         status.addPermanentWidget(self.lineEdit)
+
+        # "Current Operation" label + "End Operation" button (PHASE 2
+        # follow-up, DESIGN_BACKLOG item 33) -- KodaCAD has these
+        # always visible in the status bar (mainwindow.py's
+        # currOpLabel / endOpButton, tied to registerCallback /
+        # clearCallback). The sketch toolbar's own "Cancel Tool"
+        # toolbar button does the same thing for sketch tools
+        # specifically, but it's just an icon buried in a long
+        # vertical toolbar -- easy to miss, and doesn't cover the
+        # By-3-Points or On-Face picking modes. This is the general,
+        # always-visible equivalent, covering all three.
+        self.currOpLabel = QLabel("Current Operation: None")
+        self.currOpLabel.setFrameStyle(
+            QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        status.addPermanentWidget(self.currOpLabel)
+
+        self.endOpButton = QToolButton()
+        self.endOpButton.setText("End Operation")
+        self.endOpButton.clicked.connect(self._on_end_operation)
+        status.addPermanentWidget(self.endOpButton)
+
+        self._sketch_toolbar.tool_armed.connect(self._on_tool_armed_changed)
 
         self.units = "mm"
         self.unitsLabel = QLabel(f"Units: {self.units} ")
@@ -754,6 +805,51 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.unitsLabel)
 
         status.showMessage("Ready", 5000)
+
+    def _on_tool_armed_changed(self, name):
+        """SketchToolBar.tool_armed fired -- update the Current
+        Operation label. Empty string means no tool is armed."""
+        self.currOpLabel.setText(f"Current Operation: {name or 'None'}")
+
+    def _on_end_operation(self):
+        """
+        The status bar's "End Operation" button -- cancels whichever
+        operation is currently in progress, checked in the same
+        priority order as _on_geometry_picked's routing:
+          1. An armed sketch tool (Circle, Line, etc.)
+          2. By-3-Points workplane picking
+          3. On-Face workplane picking
+        """
+        if self._sketch_toolbar.isEnabled() and \
+                self._sketch_toolbar._active_tool is not None:
+            self._sketch_toolbar._do_cancel_tool()
+            return
+        if self._wp3pts_picking:
+            self._wp3pts_picking = False
+            self._wp3pts_points = []
+            self.statusBar().showMessage("By 3 Points cancelled.", 4000)
+            return
+        if self._workplane_dialog.is_in_pick_mode():
+            self._workplane_dialog._cancel_pick_mode()
+            self.statusBar().showMessage("Face pick cancelled.", 4000)
+            return
+        self.statusBar().showMessage("Nothing to cancel.", 3000)
+
+    def _on_lineedit_return(self):
+        """
+        Enter pressed in the shared status-bar line edit. If a number
+        was typed, queue it for whichever sketch tool needs a numeric
+        parameter next (e.g. Circle's radius) -- see
+        SketchToolBar.push_pending_float() and _retry_active_tool().
+        """
+        text = self.lineEdit.text()
+        self.lineEdit.clear()
+        try:
+            value = float(text)
+        except ValueError:
+            return
+        if self._sketch_toolbar.isEnabled():
+            self._sketch_toolbar.push_pending_float(value)
 
     # -----------------------------------------------------------------------
     # RPN Calculator (ported from KodaCAD's rpnCalculator.py)
@@ -769,12 +865,38 @@ class MainWindow(QMainWindow):
     def valueFromCalc(self, value):
         """
         Receive a value pushed from the calculator (T/Z/Y/X register
-        buttons). Targets whichever QLineEdit currently has keyboard
-        focus -- e.g. the Depth field in the Workplane dialog -- so the
-        calculator is immediately useful with every existing dialog's
-        input fields, with no per-dialog wiring required. Falls back to
-        the shared status-bar line edit if nothing else has focus.
+        buttons).
+
+        If a sketch tool is currently armed and waiting for input (see
+        SketchToolBar._active_tool), the value goes STRAIGHT into its
+        numeric queue -- no separate Enter press needed, matching
+        KodaCAD's calculator -> lineEditStack -> callback flow (see
+        rpnCalculator.py / mainwindow.py's valueFromCalc).
+
+        FIX: this used to check `QApplication.focusWidget() is
+        self.lineEdit` instead of checking the armed tool directly.
+        That's unreliable across two separate top-level windows -- the
+        calculator is its own QDialog, so clicking one of its buttons
+        leaves IT as the OS-focused window, not MainWindow; the
+        status-bar line edit was essentially never actually focused at
+        the instant a register button was clicked, so the value fell
+        through to the "just set text" fallback below (looked like it
+        "sat there") and the follow-up Enter press didn't land on it
+        either, since keyboard input was still going to the calculator
+        window. Checking the armed tool instead sidesteps window-focus
+        entirely.
+
+        Otherwise (no tool armed), targets whichever QLineEdit
+        currently has keyboard focus -- e.g. the Depth field in the
+        Workplane dialog -- so the calculator is immediately useful
+        with every existing dialog's input fields, with no per-dialog
+        wiring required. Falls back to the shared status-bar line edit
+        if nothing else has focus.
         """
+        if self._sketch_toolbar.isEnabled() and \
+                self._sketch_toolbar._active_tool is not None:
+            self._sketch_toolbar.push_pending_float(value)
+            return
         target = QApplication.focusWidget()
         if not isinstance(target, QLineEdit):
             target = self.lineEdit
@@ -943,30 +1065,138 @@ class MainWindow(QMainWindow):
     def _on_geometry_picked(self, raw_shape, shape_type):
         """
         Route a viewport pick to whichever dialog/toolbar is active.
-        Priority:
-          1. Workplane dialog face-pick mode
-          2. Sketch toolbar vertex pick (intersection point snap)
-          3. Position dialog positioning mode
+        Priority (each handler can decline by returning/leaving
+        `consumed` False, letting the pick fall through to the next
+        one -- see WorkplaneDialog.receive_pick's self-heal for why
+        this isn't a plain if/elif chain):
+          1. Workplane dialog face-pick mode (On Face)
+          2. By-3-Points workplane vertex-pick mode
+          3. Sketch toolbar vertex pick (intersection point snap)
+          4. Fillet / Shell dialogs
+          5. Position dialog positioning mode
         """
         from OCP.TopAbs import TopAbs_VERTEX
 
+        type_name = {TopAbs_VERTEX: "VERTEX"}.get(shape_type, str(shape_type))
+        consumed = False
+
         if self._workplane_dialog.isVisible() and \
                 self._workplane_dialog.is_in_pick_mode():
-            self._workplane_dialog.receive_pick(raw_shape, shape_type)
-        elif (self._workplane_dialog.isVisible() and
-              shape_type == TopAbs_VERTEX):
-            toolbar = self._workplane_dialog._sketch_toolbar
-            if toolbar.isEnabled():
-                toolbar.receive_vertex_pick(raw_shape)
-        elif (self._fillet_dialog.isVisible() and
-              shape_type == TopAbs_EDGE):
+            print(f"[route] {type_name} pick -> WorkplaneDialog.receive_pick "
+                  f"(face-pick mode)")
+            consumed = self._workplane_dialog.receive_pick(raw_shape, shape_type)
+
+        if not consumed and self._wp3pts_picking and shape_type == TopAbs_VERTEX:
+            print(f"[route] {type_name} pick -> By-3-Points")
+            self._on_wp3pts_vertex_picked(raw_shape)
+            consumed = True
+
+        if not consumed and shape_type == TopAbs_VERTEX and \
+                self._sketch_toolbar.isEnabled():
+            print(f"[route] {type_name} pick -> SketchToolBar.receive_vertex_pick")
+            consumed = self._sketch_toolbar.receive_vertex_pick(raw_shape)
+
+        if not consumed and self._fillet_dialog.isVisible() and \
+                shape_type == TopAbs_EDGE:
             self._fillet_dialog.receive_edge_pick(raw_shape, shape_type)
-        elif (self._shell_dialog.isVisible() and
-              shape_type == TopAbs_FACE):
+            consumed = True
+
+        if not consumed and self._shell_dialog.isVisible() and \
+                shape_type == TopAbs_FACE:
             self._shell_dialog.receive_face_pick(raw_shape, shape_type)
-        elif self._position_dialog.isVisible() and \
+            consumed = True
+
+        if not consumed and self._position_dialog.isVisible() and \
                 self._position_dialog.is_in_positioning_mode():
             self._position_dialog.receive_pick(raw_shape, shape_type)
+            consumed = True
+
+        if not consumed:
+            print(f"[route] {type_name} pick matched no active handler -- "
+                  f"workplane_dialog visible={self._workplane_dialog.isVisible()} "
+                  f"pick_mode={self._workplane_dialog.is_in_pick_mode()} "
+                  f"sketch_toolbar enabled={self._sketch_toolbar.isEnabled()}")
+
+    # -----------------------------------------------------------------------
+    # Workplane menu handlers (PHASE 2 of the UI revision, DESIGN_BACKLOG
+    # item 33). "On Face..." reuses the existing _on_create_part_clicked
+    # flow unchanged. The two below are new.
+    # -----------------------------------------------------------------------
+
+    def _on_workplane_at_origin(self):
+        """Default workplane located in the X-Y plane at the origin."""
+        if self._assembly is None:
+            return
+        wp = WorkPlane(size=80)
+        self._workplane_dialog.show()
+        self._workplane_dialog.raise_()
+        self._workplane_dialog.set_active_part(self.tree.get_active_part())
+        self._workplane_dialog.set_workplane(wp)
+        self.statusBar().showMessage(
+            "Workplane created at origin, XY plane.", 4000)
+
+    def _on_workplane_by_3pts(self):
+        """
+        Direction from pt1 to pt2 sets the workplane's W direction
+        (normal); pt2 becomes the origin. Direction from pt2 to pt3
+        sets the U direction. Mirrors KodaCAD's wpBy3Pts.
+        """
+        if self._assembly is None:
+            return
+        self._wp3pts_picking = True
+        self._wp3pts_points = []
+        from OCP.AIS import AIS_Shape
+        ctx = self.viewport.context
+        for ais in self.viewport._ais_shapes:
+            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_VERTEX))
+        ctx.UpdateCurrentViewer()
+        self.statusBar().showMessage(
+            "By 3 Points: pick point 1 (with point 2, sets the W/normal "
+            "direction).")
+
+    def _on_wp3pts_vertex_picked(self, raw_shape):
+        from OCP.BRep import BRep_Tool
+        from OCP.TopoDS import TopoDS
+        try:
+            vertex = TopoDS.Vertex_s(raw_shape)
+            pnt = BRep_Tool.Pnt_s(vertex)
+        except Exception as e:
+            print(f"[By3Pts] Could not resolve picked vertex: {e}")
+            return
+
+        self._wp3pts_points.append(pnt)
+        n = len(self._wp3pts_points)
+        if n == 1:
+            self.statusBar().showMessage(
+                "By 3 Points: pick point 2 (becomes the workplane origin).")
+        elif n == 2:
+            self.statusBar().showMessage(
+                "By 3 Points: pick point 3 (sets the U direction).")
+        elif n == 3:
+            self._finish_workplane_by_3pts()
+
+    def _finish_workplane_by_3pts(self):
+        from OCP.gp import gp_Vec, gp_Dir, gp_Ax3
+        p1, p2, p3 = self._wp3pts_points
+        self._wp3pts_picking = False
+        self._wp3pts_points = []
+
+        try:
+            wDir = gp_Dir(gp_Vec(p1, p2))
+            uDir = gp_Dir(gp_Vec(p2, p3))
+            axis3 = gp_Ax3(p2, wDir, uDir)
+            wp = WorkPlane(size=80, ax3=axis3)
+        except Exception as e:
+            self.statusBar().showMessage(
+                f"Could not build a workplane from those 3 points "
+                f"(are they collinear?): {e}", 6000)
+            return
+
+        self._workplane_dialog.show()
+        self._workplane_dialog.raise_()
+        self._workplane_dialog.set_active_part(self.tree.get_active_part())
+        self._workplane_dialog.set_workplane(wp)
+        self.statusBar().showMessage("Workplane created by 3 points.", 4000)
 
     def _on_fillet_clicked(self):
         """Open the Fillet dialog."""

@@ -2159,7 +2159,16 @@ structure and Reverse/Back semantics.
 
 ## 33. UI Revision: Adopt KodaCAD-Style Menu/Toolbar Architecture
 
-**Status: Phase 1 COMPLETE. Phases 2-4 planned, not started.**
+**Status: Phases 1-2 COMPLETE and confirmed working via live testing
+(menu bar/status bar/calculator, toolbar relocation, all 3 workplane
+creation routes, Circle's full input model, sticky tools, stuck-pick
+self-heal, On Face 2-pick flow). Phases 3-4 planned, not started.**
+
+**Not yet individually exercised (same underlying mechanisms as
+Circle, which was tested end to end -- lower risk, but untested):**
+Line, Rectangle, both Arc tools, H/V/Angled Cline's typed-value paths,
+Cancel Tool, By 3 Points, Create Part / Cut Into Active / Add To
+Active. Worth a quick pass before building Phase 3 on top.
 
 ### Motivation
 
@@ -2248,3 +2257,333 @@ before relying on it: launch the app, exercise each new menu item,
 and open the calculator (Utility -> Calculator) with focus on e.g. the
 Workplane dialog's Depth field to confirm a register button
 (T/Z/Y/X) writes into it correctly.
+
+### Phase 2 implementation
+
+Discovered while starting this phase: `src/workplane.py` and
+`gui/sketch_toolbar.py` already existed (a prior, substantially
+complete port of KodaCAD's `workplane.py` -- construction lines,
+profile geometry, `intersectPts()` -- and a `SketchToolBar` QToolBar
+with real OCCT vertex-mode intersection-point markers), embedded
+inside `WorkplaneDialog`'s Step 2. So Phase 2 turned out to be: fix
+one real bug, then relocate + extend existing infrastructure, rather
+than porting from scratch.
+
+**Root cause of "intersection points aren't clickable" (`gui/sketch_toolbar.py`):**
+`WorkPlane.__init__` already adds H+V construction lines through the
+origin via `self.hvcl((0, 0))`, and `intersectPts()` already computes
+their intersection -- but nothing ever displayed them. `_display_clines()`
+(which renders clines AND calls `_display_intersections()`) was only
+called from the toolbar's own construction-line buttons, AFTER the
+user added one manually. A freshly-activated workplane showed no
+construction geometry and no clickable markers at all, with no
+indication that adding a construction line first was required.
+**Fix:** `set_workplane()` now calls `self._display_clines()`
+immediately, so the origin's clines and intersection marker are
+visible and clickable as soon as a workplane is activated by any
+route (On Face / At Origin / By 3 Points).
+
+**Toolbar relocation (`gui/main_app.py`, `gui/workplane_dialog.py`):**
+`SketchToolBar` is now created once on `MainWindow` and docked via
+`self.addToolBar(Qt.ToolBarArea.RightToolBarArea, self._sketch_toolbar)`
+-- a real, persistent toolbar, KodaCAD-style, rather than a QGroupBox
+embedded in the modal `WorkplaneDialog`. `WorkplaneDialog.__init__`
+now takes a `sketch_toolbar` param instead of constructing its own;
+its Step 2 group box was removed (replaced with a one-line pointer to
+the toolbar's new location), shrinking the dialog to Step 1 (pick
+face, still used by "On Face") + the renumbered Step 2 (Extrude/Cut/
+Add). `receive_pick()`'s tail (display + enable + hand off to the
+toolbar) was extracted into a new public `set_workplane(wp)` method so
+every workplane-creation route shares one activation path.
+`main_app.py._on_geometry_picked` now routes vertex picks to
+`self._sketch_toolbar` directly instead of reaching through
+`self._workplane_dialog._sketch_toolbar`, and no longer requires the
+dialog to be visible for intersection-point snapping to work.
+
+**New Workplane menu (`gui/main_app.py`), reaching parity with KodaCAD's:**
+- **At Origin, XY Plane** -- `WorkPlane(size=80)`, activated immediately,
+  no picking required.
+- **On Face...** -- unchanged, aliases the existing `_on_create_part_clicked`.
+- **By 3 Points...** -- new. Activates `TopAbs_VERTEX` selection on all
+  displayed AIS shapes (same pattern `_start_pick_mode` already uses
+  for `TopAbs_FACE`, left active afterward rather than explicitly
+  deactivated -- consistent with that existing precedent, not a new
+  inconsistency), collects 3 picks via `_on_geometry_picked`, then
+  builds `gp_Ax3(p2, gp_Dir(gp_Vec(p1,p2)), gp_Dir(gp_Vec(p2,p3)))`
+  -- direction p1->p2 sets the W/normal direction, p2 becomes the
+  origin, direction p2->p3 sets the U direction -- exactly mirroring
+  KodaCAD's `wpBy3Pts`/`wpBy3PtsC` in `kodacad.py`. Feeds the result
+  into `WorkPlane(size=80, ax3=axis3)` (Mode 3, already supported by
+  `src/workplane.py`).
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+Phase 1 -- please smoke-test: On Face still creates a usable workplane
+with the toolbar now on the right edge of the window; At Origin
+creates one with no picking; By 3 Points prompts for 3 picks and
+builds a plane through them; and on any of the three, intersection
+markers (yellow dots at construction-line crossings, including the
+origin) should be visible and clickable immediately, feeding sketch
+tools via the existing snap-queue (`_pending_uvs`) without needing to
+add a construction line first.
+
+### Phase 2 follow-up fixes (from live testing)
+
+**Intersection markers too easy to miss (`gui/sketch_toolbar.py`):**
+reported as "clicking the h & v c-lines doesn't work" -- root cause:
+the construction LINES are intentionally deactivated/non-selectable
+(so they don't block picks on things behind them); only the small
+yellow dot AT the intersection is clickable, and it had no explicit
+`SetSelectionSensitivity` (OCCT's default vertex tolerance is only a
+couple of pixels). Fixed: markers now get a 10px sensitivity (matching
+what's already used for active-part vertex picking), and
+`_display_intersections()` / `receive_vertex_pick()` now print
+diagnostic counts so a future "still not working" report can
+distinguish "no markers were ever created" from "click reached a
+vertex but it wasn't a marker" from "genuinely worked."
+
+**Circle only supported typed X/Y/radius via blocking popups:**
+KodaCAD's circle tool supports three input paths -- typed X/Y/radius,
+pick center + pick a point on the circle (radius = distance), or
+values sent from the calculator. BasiCAD's only had the first. Added:
+- `SketchToolBar._pending_floats` -- a numeric counterpart to the
+  existing `_pending_uvs` point queue, with `push_pending_float()` /
+  `pop_pending_float()`. `_get_float()` now checks it before falling
+  back to `QInputDialog.getDouble()`.
+- `_do_circ()` / `_do_ccirc()` now check for 2 queued points FIRST --
+  if both center and a point-on-circle were clicked before the tool
+  button, radius = `WorkPlane.p2p_dist(p1, p2)`, no popup at all.
+  Otherwise falls through to center pick + radius (queued or popup).
+- `main_app.py`: the shared status-bar line edit's Enter key now
+  queues a typed number via `push_pending_float()`
+  (`_on_lineedit_return`). `valueFromCalc()` now special-cases the
+  status-bar line edit: if IT has focus and the sketch toolbar is
+  active, a calculator register value goes straight into the pending-
+  floats queue (no extra Enter press needed) -- matching KodaCAD's
+  calculator -> `lineEditStack` -> callback flow. Focus on any other
+  QLineEdit (e.g. a dialog field) keeps the original Phase 1 behavior
+  unchanged.
+
+Only Circle/ConstrCircle were updated to the 3-path model this round,
+not every sketch tool -- Line/Rect/Arc still use point-queue-or-popup
+only (no numeric parameters to queue for those anyway). The
+`_pending_floats` plumbing is general, so any future tool needing a
+typed parameter (e.g. an angle for Angled Cline) can adopt it the same
+way.
+
+**Vertex picks silently swallowed by a stuck face-pick mode
+(`gui/workplane_dialog.py`):** reported as "the modal Circle-center
+popup blocks everything, and picking the origin marker did nothing
+useful even though it registered." Root cause: if the dialog's "On
+Face" pick mode (`_picking_face = True`) was ever left active from an
+earlier attempt -- e.g. the user tried "On Face" first, or an earlier
+session used the old "Workplane..." button -- and never explicitly
+completed or cancelled it, `receive_pick()` silently rejects every
+non-face pick (just updates a status label) WITHOUT ever clearing
+`_picking_face`. Every subsequent pick, including vertex picks meant
+for the sketch toolbar's intersection markers, was being intercepted
+and swallowed here forever, regardless of which workplane-creation
+route was used afterward. The base viewer's independent selection
+print ("Selected #1: VERTEX | unknown part" -- from
+`assembly_viewer.py`'s `_report_selection`) still fired either way,
+which is why the pick APPEARED to register while never actually
+reaching `_pending_uvs`.
+
+**Fix:** `WorkplaneDialog.set_workplane()` -- the shared activation
+path for all three workplane-creation routes -- now force-cancels any
+lingering face-pick mode before activating, guaranteeing clean
+routing state regardless of prior UI history. Also added a `[route]`
+diagnostic print in `main_app.py._on_geometry_picked()` showing
+exactly which handler (or none) consumed each pick, so a future
+"picks aren't working" report can be diagnosed from one line of
+console output instead of re-deriving the whole routing chain.
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+before.
+
+### Phase 2 follow-up: eliminated blocking popups entirely
+
+Reported: the "Circle — center" X-value popup is application-modal --
+while it's open, nothing else works. Can't pick, can't type in the
+status-bar box, can't use the calculator. This existed for every
+sketch tool with insufficient queued input, not just Circle -- any
+tool fell into the same trap.
+
+**Root cause:** `_get_point()`/`_get_float()` were designed as
+"pop from queue, else block with `QInputDialog`" -- a reasonable
+fallback in isolation, but a `QInputDialog` freezes the entire Qt
+event loop until answered, which defeats the entire point of
+clickable intersection markers and the calculator: you can't use
+either to answer the popup that's blocking you from using them.
+
+**Fix (`gui/sketch_toolbar.py`, comprehensive rewrite of the tool
+dispatch, no tool's behavior changes for the "already have enough
+queued" case):** every `_do_xxx()` now calls a shared `_start_tool
+(name, prompt)`. It tries to complete immediately from whatever's
+already queued (unchanged "click points before clicking the tool"
+convention) -- but if that's not enough, it arms `name` as
+`self._active_tool`, shows `prompt` in the status bar, and returns.
+**No `QInputDialog` is ever shown for point/numeric entry again** --
+`QInputDialog` import removed entirely. The app stays fully
+interactive: pick more points, type a number and press Enter, or send
+one from the calculator. Each of those now calls a new
+`_retry_active_tool()`, which re-attempts completion via a
+`_try_complete_*` method for whichever tool is armed, and clears
+`_active_tool` on success.
+
+Added a `_try_complete_*` method per tool (hcl, vcl, hvcl, acl, lbcl,
+circle [shared by circ/ccirc], line, rect, arcc2p, arc3p), each atomic
+(pops exactly what it needs and succeeds, or touches nothing and
+returns False) -- e.g. H/V Cline now accept EITHER a picked point OR a
+typed/calculator value (Y or X respectively); Angled Cline accepts a
+point + a 2nd point (direction) OR a point + a typed angle; Circle/
+Constr Circle keep last round's 2-points-or-point+radius logic.
+
+Added a **Cancel Tool** toolbar button (`_do_cancel_tool`) -- the
+non-blocking equivalent of the old popup's Cancel button: abandons
+whichever tool is currently armed and clears both queues. `Clear All`,
+`set_workplane()` (new workplane activated), and `deactivate()`
+(dialog closed) all reset `_active_tool` too, so switching workplanes
+or closing the dialog can't leave a tool stuck armed in the background.
+
+**Not yet tested against a running Qt/OCCT display** -- please
+smoke-test this one in particular, since it changes the fundamental
+interaction model for every sketch tool: clicking a tool button with
+nothing queued should now show a status-bar prompt and leave the
+viewport, calculator, and status-bar input box all fully usable, with
+no popup at all.
+
+### Phase 2 follow-up: Step 1's face-pick button stays live during sketching
+
+Spotted from a screenshot: `WorkplaneDialog`'s Step 1 ("Click face in
+viewport...") stays visible and clickable for the entire sketching
+session, not just before a workplane exists. If it's ever clicked
+again after a workplane is already active -- easy to do by accident,
+since it's right there the whole time -- it arms face-pick mode, and
+the very next pick (almost certainly an intersection marker, not a
+face) gets rejected by `receive_pick()`'s `shape_type != TopAbs_FACE`
+branch, which never cleared `_picking_face`. This is the same bug
+class fixed earlier in `set_workplane()`, but reachable a second way
+that fix couldn't catch: `set_workplane()` only resets state when a
+NEW workplane is created, not when the button is re-clicked mid-sketch
+on the SAME still-active workplane.
+
+**Fix:** `receive_pick()` now returns `True`/`False` (consumed or
+not), and self-heals: if a non-face pick arrives while a workplane
+already exists, it cancels face-pick mode itself and returns `False`
+instead of getting stuck -- so the pick correctly falls through to the
+sketch toolbar instead of vanishing. `main_app.py._on_geometry_picked`
+was restructured from an if/elif chain to a `consumed` flag checked
+before each handler, so a decline from one handler actually lets the
+next one try. (Not removing the button entirely, since re-picking a
+face for a fresh workplane is still occasionally useful -- just making
+a wrong click there recoverable instead of a silent trap.)
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+before.
+
+### Phase 2 follow-up: sticky tools + calculator-to-radius bug
+
+**Requested: keep the current tool active instead of re-clicking the
+toolbar button for every placement.** `gui/sketch_toolbar.py`: tools
+are now "sticky" -- `_start_tool()` and `_retry_active_tool()` no
+longer clear `_active_tool` on success. A tool stays armed
+indefinitely after completing, showing the same status-bar prompt
+("placed -- pick/type another, or Cancel Tool to stop."), so e.g.
+several circles can be placed in a row with only the first click on
+the Circle button. Added `_active_prompt` alongside `_active_tool` so
+the original prompt text can be re-shown on each repeat. Ended by
+Cancel Tool, Clear All, clicking a different tool button, or a new
+workplane activating.
+
+**Bug: calculator value for radius "sat in the box" and Enter did
+nothing.** Root cause (`gui/main_app.py`'s `valueFromCalc`): the code
+gated the "push straight into the sketch tool's queue" behavior on
+`QApplication.focusWidget() is self.lineEdit` -- but the calculator is
+its own separate top-level `QDialog`. Clicking one of ITS register
+buttons leaves the calculator as the OS-focused window, not
+MainWindow, so the status-bar line edit was essentially never actually
+focused at the instant a register button was clicked. The value fell
+through to the generic "just set the text" fallback (looked like it
+"sat there" since nothing was queued), and the follow-up physical
+Enter keypress didn't land on `self.lineEdit` either, since keyboard
+input was still going to the calculator window -- so `returnPressed`
+never fired and the circle was never completed.
+
+**Fix:** `valueFromCalc` now checks whether a sketch tool is currently
+armed (`self._sketch_toolbar._active_tool is not None`) instead of
+checking focus at all -- a far more reliable signal of intent than
+window-level keyboard focus, and sidesteps the cross-window focus
+issue entirely. If a tool is armed, the value goes straight into its
+queue and retries it immediately, regardless of which window
+technically has OS focus. Falls back to the original
+focus-a-QLineEdit behavior (for dialog fields like Depth/Name) only
+when no tool is armed.
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+before.
+
+### Phase 2 follow-up: On Face now takes 2 face picks (plane + U direction)
+
+Requested: match KodaCAD's `wpOnFace` exactly -- the first face pick
+sets the workplane's plane (its normal becomes the W/extrusion
+direction), the SECOND face pick sets the U direction, rather than
+auto-computing U from an arbitrary world-axis reference as before.
+`WorkPlane.__init__` in `src/workplane.py` already supported this via
+its `faceU` parameter -- only the picking UI in
+`gui/workplane_dialog.py` needed to collect a second face.
+
+**Changes:**
+- Added `self._face_stack` (mirrors KodaCAD's `win.faceStack`),
+  reset in `_start_pick_mode()` / `_cancel_pick_mode()`.
+- `receive_pick()`'s face branch now: on the 1st face, stores it and
+  stays in pick mode (status: "Now click a second face to set the U
+  direction"); on the 2nd, builds
+  `WorkPlane(size=80, face=face_stack[0], faceU=face_stack[1])` and
+  proceeds as before.
+- Step 1's group box title, button tooltip, and the module docstring
+  updated to describe the 2-pick requirement.
+- The existing self-heal logic (non-face pick while a workplane is
+  already active -> cancel pick mode, let it fall through) is
+  unaffected -- it only triggers on non-FACE picks, not on the
+  1st-vs-2nd-face distinction.
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+before -- in particular, worth confirming the resulting U direction
+(and therefore sketch X axis) matches the second face's normal as
+expected, on a real part.
+
+### Phase 2 follow-up: added KodaCAD's "Current Operation" / "End Operation"
+
+Spotted as missing: KodaCAD keeps a "Current Operation" label and an
+"End Operation" button permanently visible in the status bar (see
+mainwindow.py's `currOpLabel`/`endOpButton`, tied to
+`registerCallback`/`clearCallback`). BasiCAD only had the sketch
+toolbar's own "Cancel Tool" button, which is icon-only, buried at the
+end of a long vertical toolbar, and only cancels sketch tools -- not
+By-3-Points or On-Face picking.
+
+**Added (`gui/sketch_toolbar.py`):** `tool_armed(str)` signal, emitted
+via a new `_set_active_tool()` helper (now the single place
+`_active_tool` changes) -- carries the armed tool's name, or `""` for
+none. All prior direct `self._active_tool = ...` assignments (in
+`_start_tool`, `_do_cancel_tool`, `set_workplane`, `clear_sketch`,
+`deactivate`) now route through it, except the initial `__init__`
+value (no listeners exist yet at that point).
+
+**Added (`gui/main_app.py`):** `currOpLabel` + `endOpButton` in the
+status bar, positioned between the line edit and the units label,
+matching KodaCAD's layout. `_on_tool_armed_changed()` keeps the label
+in sync with the sketch toolbar's signal. `_on_end_operation()` --
+the button's handler -- cancels whichever operation is actually in
+progress, checked in the same priority order as
+`_on_geometry_picked`'s routing: an armed sketch tool first, then
+By-3-Points picking, then On-Face picking; shows "Nothing to cancel."
+if none are active.
+
+The toolbar's own "Cancel Tool" button is left in place (still useful
+as a quick in-context cancel while your hand is already up there) --
+this is an additional, more visible, more general path to the same
+kind of cancel, not a replacement.
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+before.

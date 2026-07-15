@@ -24,13 +24,27 @@ TOOLS:
     Arc 3P    -- arc through three points
 
   Intersection Snap (yellow dot markers):
-    Snaps clicks to cline/ccirc intersections. A click-before-tool snap
-    queue (_pending_uvs) lets the user snap to a point before selecting
-    which tool to use.
+    Snaps clicks to cline/ccirc intersections, queued in _pending_uvs.
+    Typed/calculator numeric values queue in _pending_floats.
 
   Edit:
-    Del Last  -- removes the most recently added profile element
-    Clear     -- removes all sketch geometry and AIS objects
+    Del Last    -- removes the most recently added profile element
+    Clear All   -- removes all sketch geometry and AIS objects
+    Cancel Tool -- abandons whichever tool is currently waiting for input
+
+INPUT MODEL (PHASE 2 FIX, DESIGN_BACKLOG item 33 -- no tool EVER pops a
+blocking dialog; a modal popup freezes the whole app until answered,
+so the user can't pick a point, type a value, or use the calculator to
+get past it):
+  Every _do_xxx() tool method calls _start_tool(name, prompt), which
+  tries to complete immediately from whatever's already queued
+  (_pending_uvs / _pending_floats -- preserves "click points before
+  clicking the tool"). If that's not enough, it arms `name` as
+  self._active_tool and prompts via the status bar, then RETURNS --
+  the app stays fully interactive. Each subsequent pick
+  (receive_vertex_pick) or numeric value (push_pending_float) calls
+  _retry_active_tool(), which re-attempts completion. "Cancel Tool"
+  abandons an armed tool and clears both queues.
 
 AIS LIFECYCLE:
   All sketch AIS objects are stored in _sketch_ais and _isect_ais.
@@ -42,9 +56,9 @@ AIS LIFECYCLE:
 import os
 import math
 
-from PySide6.QtWidgets import QToolBar, QInputDialog, QMessageBox
+from PySide6.QtWidgets import QToolBar, QMessageBox
 from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 from OCP.AIS import AIS_Shape, AIS_DisplayMode
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
@@ -79,6 +93,11 @@ class SketchToolBar(QToolBar):
     Must be given a workplane and viewport before use via set_workplane().
     """
 
+    # Emits the armed tool's name (e.g. "circ") whenever it changes, or
+    # "" when no tool is armed. MainWindow listens to this to drive the
+    # status-bar "Current Operation" label, KodaCAD-style.
+    tool_armed = Signal(str)
+
     def __init__(self, parent=None):
         super().__init__("Sketch", parent)
         self.setOrientation(Qt.Orientation.Vertical)
@@ -89,6 +108,18 @@ class SketchToolBar(QToolBar):
         self._isect_ais = []     # AIS objects for intersection point markers
         self._isect_pts = {}     # id(AIS_Shape) -> (u, v) workplane coords
         self._pending_uvs = []   # queue of snapped (u,v) points
+        self._pending_floats = []  # queue of typed/calculator numeric values
+        # Name of the tool currently waiting for more input (e.g. "circ"),
+        # or None. See _start_tool()/_retry_active_tool() -- this is what
+        # lets a tool button be clicked FIRST and picks/typed values come
+        # AFTER, non-blockingly, instead of popping a modal dialog that
+        # freezes the whole app until answered. STAYS armed after each
+        # successful completion ("sticky tool") -- see _start_tool()/
+        # _retry_active_tool() -- so the user can place several circles
+        # (etc.) in a row without re-clicking the toolbar button each
+        # time. Only cleared by Cancel Tool or starting a different tool.
+        self._active_tool = None
+        self._active_prompt = None   # prompt text to re-show after each repeat
 
         self._build_toolbar()
         self.setEnabled(False)   # disabled until a workplane is set
@@ -98,16 +129,39 @@ class SketchToolBar(QToolBar):
     # ------------------------------------------------------------------
 
     def set_workplane(self, workplane, viewport):
-        """Activate the toolbar for a given WorkPlane and viewport."""
+        """
+        Activate the toolbar for a given WorkPlane and viewport.
+
+        FIX (was the root cause of "intersection points aren't
+        clickable"): WorkPlane.__init__ already adds H+V construction
+        lines through the origin via self.hvcl((0, 0)), but nothing
+        displayed them (or the intersection point they define) until
+        the user manually added their OWN construction line via one
+        of the toolbar buttons, at which point _display_clines() was
+        called for the first time. A freshly-activated workplane had
+        no visible geometry and no clickable markers at all, and there
+        was no indication that adding a construction line first was
+        required. Calling _display_clines() here renders the initial
+        clines/markers immediately, matching what the user actually
+        sees when they open the sketch toolbar.
+        """
         self._workplane = workplane
         self._viewport = viewport
+        self._set_active_tool(None)
+        self._active_prompt = None
+        self._pending_uvs = []
+        self._pending_floats = []
         self.setEnabled(True)
+        self._display_clines()
 
     def clear_sketch(self):
         """Erase all sketch AIS objects and reset the WorkPlane geometry."""
         self._erase_sketch_ais()
         self._erase_isect_ais()
         self._pending_uvs = []
+        self._pending_floats = []
+        self._set_active_tool(None)
+        self._active_prompt = None
         if self._workplane is not None:
             self._workplane.edgeList = []
             self._workplane.wire = None
@@ -119,6 +173,9 @@ class SketchToolBar(QToolBar):
         self._workplane = None
         self._viewport = None
         self._pending_uvs = []
+        self._pending_floats = []
+        self._set_active_tool(None)
+        self._active_prompt = None
         self.setEnabled(False)
 
     def receive_vertex_pick(self, raw_shape):
@@ -156,7 +213,13 @@ class SketchToolBar(QToolBar):
             self._pending_uvs.append(best_uv)
             print(f"[SketchToolBar] Snapped: U={best_uv[0]:.3f}, "
                   f"V={best_uv[1]:.3f}  ({len(self._pending_uvs)} queued)")
+            self._retry_active_tool()
             return True
+        print(f"[SketchToolBar] receive_vertex_pick: got a vertex pick at "
+              f"{pnt.X():.3f},{pnt.Y():.3f},{pnt.Z():.3f} but it didn't "
+              f"match any of the {len(self._isect_pts)} known intersection "
+              f"point(s) within {best_dist:.3f}mm -- likely picked a "
+              f"different vertex (e.g. on a part), not an intersection marker.")
         return False
 
     def check_intersection_snap(self, screen_x, screen_y, view):
@@ -168,6 +231,249 @@ class SketchToolBar(QToolBar):
         if self._pending_uvs:
             return self._pending_uvs.pop(0)
         return None
+
+    def push_pending_float(self, value):
+        """
+        Queue a numeric value entered via the shared status-bar line
+        edit or sent directly from the RPN calculator's register
+        buttons (see MainWindow.valueFromCalc in main_app.py). Consumed
+        by whichever tool is currently waiting (see _active_tool /
+        _retry_active_tool), or held for the next tool button click if
+        none is currently waiting.
+        """
+        self._pending_floats.append(value)
+        print(f"[SketchToolBar] Queued value: {value}  "
+              f"({len(self._pending_floats)} queued)")
+        self._retry_active_tool()
+
+    def pop_pending_float(self):
+        """Pop the next queued numeric value, or None if empty."""
+        if self._pending_floats:
+            return self._pending_floats.pop(0)
+        return None
+
+    def _notify_status(self, text):
+        """Show a prompt in the main window's status bar, and echo to
+        the console (useful when no display is available to see it)."""
+        print(f"[SketchToolBar] {text}")
+        win = self.window()
+        if hasattr(win, "statusBar"):
+            win.statusBar().showMessage(text)
+
+    def _set_active_tool(self, name):
+        """
+        Set self._active_tool and emit tool_armed(name or "") -- the
+        single place that changes it, so MainWindow's "Current
+        Operation" status-bar label (the KodaCAD-style "End Operation"
+        button's companion) always stays in sync.
+        """
+        self._active_tool = name
+        self.tool_armed.emit(name or "")
+
+    def _start_tool(self, name, prompt):
+        """
+        Entry point for every _do_xxx tool method (PHASE 2 FIX,
+        DESIGN_BACKLOG item 33): tries to complete immediately from
+        whatever is already queued (preserves the existing "pick
+        points before clicking the tool" convention). If that's not
+        enough, arms `name` as the active tool and prompts via the
+        status bar -- and stops there. It does NOT fall back to a
+        blocking QInputDialog. That blocking fallback was the actual
+        bug being fixed: a modal popup steals the whole app's input
+        focus, so the user can't pick a point, type a value, or use
+        the calculator to get past it -- the tool becomes genuinely
+        stuck. Now, clicking a tool button always leaves the app fully
+        interactive; picks and typed/calculator values arrive later,
+        asynchronously, via _retry_active_tool().
+
+        STICKY: the tool STAYS armed after it completes (whether
+        immediately here or later via _retry_active_tool), so placing
+        several circles/lines/etc. in a row doesn't need re-clicking
+        the toolbar button each time -- only Cancel Tool / End
+        Operation, Clear All, or clicking a DIFFERENT tool button ends
+        the repeat.
+        """
+        self._set_active_tool(name)
+        self._active_prompt = prompt
+        if self._try_complete(name):
+            self._notify_status(f"{prompt}  (placed -- pick/type another, "
+                                f"or Cancel Tool to stop.)")
+            return
+        self._notify_status(prompt)
+
+    def _retry_active_tool(self):
+        """Called after a new pick or numeric value is queued. If a
+        tool is currently waiting and now has enough input, complete
+        it -- and STAY armed for another repeat (see _start_tool)."""
+        if self._active_tool is None:
+            return
+        if self._try_complete(self._active_tool):
+            self._notify_status(f"{self._active_prompt}  (placed -- "
+                                f"pick/type another, or Cancel Tool to stop.)")
+
+    def _do_cancel_tool(self):
+        """Abandon whichever tool is currently waiting for input, and
+        clear anything queued for it -- the non-blocking equivalent of
+        clicking Cancel on the old popup dialogs, and what MainWindow's
+        status-bar "End Operation" button calls when a sketch tool is
+        the active operation."""
+        self._set_active_tool(None)
+        self._active_prompt = None
+        self._pending_uvs = []
+        self._pending_floats = []
+        self._notify_status("Tool cancelled.")
+
+    def _try_complete(self, name):
+        """Dispatch to the matching _try_complete_* method. Each of
+        those pops exactly what it needs from the pending queues and
+        returns True ONLY if it actually completed the tool -- they
+        never partially consume a queue and then fail."""
+        return {
+            "hcl": self._try_complete_hcl,
+            "vcl": self._try_complete_vcl,
+            "hvcl": self._try_complete_hvcl,
+            "acl": self._try_complete_acl,
+            "lbcl": self._try_complete_lbcl,
+            "ccirc": lambda: self._try_complete_circle(constr=True),
+            "circ": lambda: self._try_complete_circle(constr=False),
+            "line": self._try_complete_line,
+            "rect": self._try_complete_rect,
+            "arcc2p": self._try_complete_arcc2p,
+            "arc3p": self._try_complete_arc3p,
+        }.get(name, lambda: False)()
+
+    # ------------------------------------------------------------------
+    # Tool completion -- each pops exactly what it needs and returns
+    # True, or leaves the queues untouched and returns False.
+    # ------------------------------------------------------------------
+
+    def _try_complete_hcl(self):
+        """H Cline needs 1 point (click), or 1 float (typed/calc Y value)."""
+        if self._pending_uvs:
+            pt = self._pending_uvs.pop(0)
+            self._workplane.hcl(pt)
+        elif self._pending_floats:
+            y = self._pending_floats.pop(0)
+            self._workplane.hcl((0, y))
+        else:
+            return False
+        self._display_clines()
+        return True
+
+    def _try_complete_vcl(self):
+        """V Cline needs 1 point (click), or 1 float (typed/calc X value)."""
+        if self._pending_uvs:
+            pt = self._pending_uvs.pop(0)
+            self._workplane.vcl(pt)
+        elif self._pending_floats:
+            x = self._pending_floats.pop(0)
+            self._workplane.vcl((x, 0))
+        else:
+            return False
+        self._display_clines()
+        return True
+
+    def _try_complete_hvcl(self):
+        """H+V Cline needs 1 point (click only -- a single typed number
+        can't unambiguously give both X and Y)."""
+        if not self._pending_uvs:
+            return False
+        pt = self._pending_uvs.pop(0)
+        self._workplane.hvcl(pt)
+        self._display_clines()
+        return True
+
+    def _try_complete_acl(self):
+        """Angled Cline needs 1 point + EITHER a 2nd point (direction)
+        OR a float (angle in degrees)."""
+        if len(self._pending_uvs) >= 2:
+            p1 = self._pending_uvs.pop(0)
+            p2 = self._pending_uvs.pop(0)
+            self._workplane.acl(p1, pnt2=p2)
+        elif self._pending_uvs and self._pending_floats:
+            p1 = self._pending_uvs.pop(0)
+            ang = self._pending_floats.pop(0)
+            self._workplane.acl(p1, ang=ang)
+        else:
+            return False
+        self._display_clines()
+        return True
+
+    def _try_complete_lbcl(self):
+        """Linear Bisector needs 2 points (click only)."""
+        if len(self._pending_uvs) < 2:
+            return False
+        p1 = self._pending_uvs.pop(0)
+        p2 = self._pending_uvs.pop(0)
+        self._workplane.lbcl(p1, p2)
+        self._display_clines()
+        return True
+
+    def _try_complete_circle(self, constr):
+        """
+        Circle / Constr Circle: TWO ways to specify it (mirrors
+        KodaCAD) -- 2 points (center + point-on-circle, radius by
+        distance), or 1 point + a float (center + typed/calculator
+        radius).
+        """
+        if len(self._pending_uvs) >= 2:
+            p1 = self._pending_uvs.pop(0)
+            p2 = self._pending_uvs.pop(0)
+            r = self._workplane.p2p_dist(p1, p2)
+            self._workplane.circle(p1, r, constr=constr)
+        elif self._pending_uvs and self._pending_floats:
+            p1 = self._pending_uvs.pop(0)
+            r = self._pending_floats.pop(0)
+            self._workplane.circle(p1, r, constr=constr)
+        else:
+            return False
+        if constr:
+            self._display_clines()
+        else:
+            self._display_profile(n_new=1)
+        return True
+
+    def _try_complete_line(self):
+        """Line needs 2 points (click only)."""
+        if len(self._pending_uvs) < 2:
+            return False
+        p1 = self._pending_uvs.pop(0)
+        p2 = self._pending_uvs.pop(0)
+        self._workplane.line(p1, p2)
+        self._display_profile(n_new=1)
+        return True
+
+    def _try_complete_rect(self):
+        """Rectangle needs 2 points (click only)."""
+        if len(self._pending_uvs) < 2:
+            return False
+        p1 = self._pending_uvs.pop(0)
+        p2 = self._pending_uvs.pop(0)
+        self._workplane.rect(p1, p2)
+        self._display_profile(n_new=4)
+        return True
+
+    def _try_complete_arcc2p(self):
+        """Arc Ctr-2Pts needs 3 points: center, start, end (click only)."""
+        if len(self._pending_uvs) < 3:
+            return False
+        center = self._pending_uvs.pop(0)
+        p1 = self._pending_uvs.pop(0)
+        p2 = self._pending_uvs.pop(0)
+        self._workplane.arcc2p(center, p1, p2)
+        self._display_profile(n_new=1)
+        return True
+
+    def _try_complete_arc3p(self):
+        """Arc 3Pts needs 3 points (click only)."""
+        if len(self._pending_uvs) < 3:
+            return False
+        p1 = self._pending_uvs.pop(0)
+        p2 = self._pending_uvs.pop(0)
+        p3 = self._pending_uvs.pop(0)
+        self._workplane.arc3p(p1, p2, p3)
+        self._display_profile(n_new=1)
+        return True
 
     # ------------------------------------------------------------------
     # Toolbar construction
@@ -190,47 +496,8 @@ class SketchToolBar(QToolBar):
         self.addSeparator()
         self.addAction(_icon("del_el"),"Delete Last",      self._do_del_el)
         self.addAction(_icon("del_g"), "Clear All",        self._do_clear)
-
-    # ------------------------------------------------------------------
-    # Input helpers
-    # ------------------------------------------------------------------
-
-    def _get_float(self, title, label, default=0.0):
-        """Prompt for a single float. Returns (value, ok)."""
-        val, ok = QInputDialog.getDouble(
-            self, title, label, default, decimals=3
-        )
-        return val, ok
-
-    def _get_point(self, title):
-        """
-        Get a 2D point for a sketch tool. Pops from the snap queue first;
-        falls back to QInputDialog if queue is empty.
-
-        SNAP WORKFLOW (click points BEFORE clicking the tool button):
-          - 1-point tools (circle center, cline):
-              click 1 marker → click tool button
-          - 2-point tools (line, rect):
-              click start marker → click end marker → click tool button
-          - 3-point tools (arc3p):
-              click pt1 → click pt2 → click pt3 → click tool button
-
-        Any mix works: snapped points are consumed in order; unsnapped
-        points fall through to the normal input dialog.
-        """
-        uv = self.pop_pending_uv()
-        if uv is not None:
-            print(f"[SketchToolBar] Using snapped point: "
-                  f"U={uv[0]:.3f}, V={uv[1]:.3f}")
-            return uv, True
-
-        x, ok = QInputDialog.getDouble(self, title, "X:", 0.0, decimals=3)
-        if not ok:
-            return None, False
-        y, ok = QInputDialog.getDouble(self, title, "Y:", 0.0, decimals=3)
-        if not ok:
-            return None, False
-        return (x, y), True
+        self.addSeparator()
+        self.addAction(_icon("del_c"), "Cancel Tool",      self._do_cancel_tool)
 
     def _guard(self):
         """Return False and warn if no workplane is set."""
@@ -245,155 +512,98 @@ class SketchToolBar(QToolBar):
     # ------------------------------------------------------------------
 
     def _do_hcl(self):
-        """Horizontal construction line at Y."""
+        """Horizontal construction line through a point (or typed Y)."""
         if not self._guard():
             return
-        y, ok = self._get_float("H Cline", "Y value (mm):")
-        if not ok:
-            return
-        self._workplane.hcl((0, y))
-        self._display_clines()
+        self._start_tool(
+            "hcl", "H Cline: pick a point, or type a Y value and press "
+            "Enter (or send one from the calculator).")
 
     def _do_vcl(self):
-        """Vertical construction line at X."""
+        """Vertical construction line through a point (or typed X)."""
         if not self._guard():
             return
-        x, ok = self._get_float("V Cline", "X value (mm):")
-        if not ok:
-            return
-        self._workplane.vcl((x, 0))
-        self._display_clines()
+        self._start_tool(
+            "vcl", "V Cline: pick a point, or type an X value and press "
+            "Enter (or send one from the calculator).")
 
     def _do_hvcl(self):
-        """H + V construction lines through (X, Y)."""
+        """H + V construction lines through a picked point."""
         if not self._guard():
             return
-        pt, ok = self._get_point("H+V Cline")
-        if not ok:
-            return
-        self._workplane.hvcl(pt)
-        self._display_clines()
+        self._start_tool("hvcl", "H+V Cline: pick a point.")
 
     def _do_acl(self):
-        """Angled construction line through (X, Y) at angle (degrees)."""
+        """Angled construction line through a point, toward a 2nd point
+        or at a typed angle."""
         if not self._guard():
             return
-        pt, ok = self._get_point("Angled Cline — point")
-        if not ok:
-            return
-        ang, ok = self._get_float("Angled Cline", "Angle (degrees):", 45.0)
-        if not ok:
-            return
-        self._workplane.acl(pt, ang=ang)
-        self._display_clines()
+        self._start_tool(
+            "acl", "Angled Cline: pick a point, then either pick a 2nd "
+            "point (sets direction) or type an angle in degrees and "
+            "press Enter.")
 
     def _do_lbcl(self):
-        """Linear bisector construction line between two points."""
+        """Linear bisector construction line between two picked points."""
         if not self._guard():
             return
-        p1, ok = self._get_point("Linear Bisector — point 1")
-        if not ok:
-            return
-        p2, ok = self._get_point("Linear Bisector — point 2")
-        if not ok:
-            return
-        self._workplane.lbcl(p1, p2)
-        self._display_clines()
+        self._start_tool(
+            "lbcl", "Linear Bisector: pick point 1, then point 2.")
 
     def _do_ccirc(self):
-        """Construction circle at center (X, Y) with radius R."""
+        """
+        Construction circle. Two ways to specify it (mirrors KodaCAD):
+          1. Pick center, then pick a point on the circle -- radius =
+             distance between them.
+          2. Pick center, then type a radius and press Enter (or send
+             one from the calculator).
+        """
         if not self._guard():
             return
-        center, ok = self._get_point("Constr Circle — center")
-        if not ok:
-            return
-        r, ok = self._get_float("Constr Circle", "Radius (mm):", 10.0)
-        if not ok:
-            return
-        self._workplane.circle(center, r, constr=True)
-        self._display_clines()
+        self._start_tool(
+            "ccirc", "Constr Circle: pick a center, then pick a point "
+            "on the circle, or type a radius and press Enter.")
 
     # ------------------------------------------------------------------
     # Profile geometry tools
     # ------------------------------------------------------------------
 
     def _do_line(self):
-        """
-        Profile line from (X1, Y1) to (X2, Y2).
-        Snap workflow: click start + marker, click end + marker, then
-        click Line button. Or click Line button and type coordinates.
-        For sequential snapping of 2 points, the pending_uv holds the
-        LAST snapped point -- so snap end first if you want both snapped,
-        or use the dialog for whichever point isn't snapped.
-        """
+        """Profile line between two picked points."""
         if not self._guard():
             return
-        p1, ok = self._get_point("Line — start point")
-        if not ok:
-            return
-        p2, ok = self._get_point("Line — end point")
-        if not ok:
-            return
-        self._workplane.line(p1, p2)
-        self._display_profile(n_new=1)
+        self._start_tool(
+            "line", "Line: pick the start point, then the end point.")
 
     def _do_rect(self):
-        """Profile rectangle: corner1 (X1,Y1) to corner2 (X2,Y2)."""
+        """Profile rectangle between two picked corner points."""
         if not self._guard():
             return
-        p1, ok = self._get_point("Rectangle — corner 1")
-        if not ok:
-            return
-        p2, ok = self._get_point("Rectangle — corner 2")
-        if not ok:
-            return
-        self._workplane.rect(p1, p2)
-        self._display_profile(n_new=4)
+        self._start_tool(
+            "rect", "Rectangle: pick corner 1, then corner 2.")
 
     def _do_circ(self):
-        """Profile circle at center (X,Y) with radius R."""
+        """Profile circle. Same two entry paths as _do_ccirc above."""
         if not self._guard():
             return
-        center, ok = self._get_point("Circle — center")
-        if not ok:
-            return
-        r, ok = self._get_float("Circle", "Radius (mm):", 10.0)
-        if not ok:
-            return
-        self._workplane.circle(center, r, constr=False)
-        self._display_profile(n_new=1)
+        self._start_tool(
+            "circ", "Circle: pick a center, then pick a point on the "
+            "circle, or type a radius and press Enter.")
 
     def _do_arcc2p(self):
-        """Arc: center (X,Y), start point, end point."""
+        """Arc: pick center, then start point, then end point."""
         if not self._guard():
             return
-        center, ok = self._get_point("Arc Ctr-2Pts — center")
-        if not ok:
-            return
-        p1, ok = self._get_point("Arc Ctr-2Pts — start point")
-        if not ok:
-            return
-        p2, ok = self._get_point("Arc Ctr-2Pts — end point")
-        if not ok:
-            return
-        self._workplane.arcc2p(center, p1, p2)
-        self._display_profile(n_new=1)
+        self._start_tool(
+            "arcc2p", "Arc Ctr-2Pts: pick center, then start point, "
+            "then end point.")
 
     def _do_arc3p(self):
-        """Arc through three points."""
+        """Arc through three picked points."""
         if not self._guard():
             return
-        p1, ok = self._get_point("Arc 3Pts — point 1")
-        if not ok:
-            return
-        p2, ok = self._get_point("Arc 3Pts — point 2 (on arc)")
-        if not ok:
-            return
-        p3, ok = self._get_point("Arc 3Pts — point 3")
-        if not ok:
-            return
-        self._workplane.arc3p(p1, p2, p3)
-        self._display_profile(n_new=1)
+        self._start_tool(
+            "arc3p", "Arc 3Pts: pick point 1, point 2, then point 3.")
 
     # ------------------------------------------------------------------
     # Edit tools
@@ -489,6 +699,8 @@ class SketchToolBar(QToolBar):
 
         pts = wp.intersectPts()
         if not pts:
+            print("[SketchToolBar] _display_intersections: no intersection "
+                  "points found (no construction geometry yet?).")
             return
 
         from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
@@ -498,6 +710,7 @@ class SketchToolBar(QToolBar):
         ctx = self._viewport.context
         yellow = Quantity_Color(1.0, 1.0, 0.0,
                                 Quantity_TypeOfColor.Quantity_TOC_RGB)
+        vertex_mode = AIS_Shape.SelectionMode_s(TopAbs_VERTEX)
 
         for pnt in pts:
             # Compute (u, v) by inverse-transforming back to workplane coords
@@ -513,14 +726,20 @@ class SketchToolBar(QToolBar):
 
             ctx.Display(ais, False)
             # Activate for vertex selection -- gives hover highlight and
-            # fires geometry_picked on click.
-            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_VERTEX))
+            # fires geometry_picked on click. Widen the hit-test radius
+            # (OCCT's default vertex sensitivity is only a couple of
+            # pixels, easy to miss) -- matches the sensitivity already
+            # used for active-part vertex picking in main_app.py.
+            ctx.Activate(ais, vertex_mode)
+            ctx.SetSelectionSensitivity(ais, vertex_mode, 10)
 
             self._isect_ais.append(ais)
             self._isect_pts[id(ais)] = uv
 
         ctx.UpdateCurrentViewer()
         self._viewport.update()
+        print(f"[SketchToolBar] _display_intersections: displayed "
+              f"{len(pts)} clickable intersection marker(s).")
 
     def find_nearest_intersection_uv(self, screen_x, screen_y, view,
                                      snap_radius_px=15):

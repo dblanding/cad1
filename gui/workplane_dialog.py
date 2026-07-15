@@ -4,9 +4,15 @@ workplane_dialog.py
 THE WORKPLANE / SKETCH / EXTRUDE DIALOG -- creates new solid parts.
 
 WORKFLOW:
-  1. User clicks a face in the 3D viewport to define the workplane.
+  1. User clicks a face in the 3D viewport to set the workplane's
+     plane, then a second face to set the U direction (or uses
+     "At Origin" / "By 3 Points" from the Workplane menu in
+     main_app.py -- see DESIGN_BACKLOG item 33, Phase 2).
   2. A green translucent rectangle is displayed on that face.
-  3. The sketch toolbar (sketch_toolbar.py) becomes active.
+  3. The sketch toolbar (sketch_toolbar.py) becomes active. It now
+     lives on MainWindow as a persistent QToolBar (KodaCAD-style) --
+     this dialog is just handed a reference to it (constructor param
+     `sketch_toolbar`) rather than owning/embedding it.
   4. User draws construction geometry and profile edges on the workplane.
   5. Buttons at the bottom create a solid from the sketch:
        [+] Create Part     -- extrude in +wDir, adds a new Solid node
@@ -54,10 +60,6 @@ from OCP.TopAbs import TopAbs_FACE
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from workplane import WorkPlane  # noqa: E402
 
-# Import sketch toolbar (same directory as this file)
-sys.path.insert(0, os.path.dirname(__file__))
-from sketch_toolbar import SketchToolBar  # noqa: E402
-
 
 # CoCreate-inspired green for the workplane border display
 _WP_COLOR = Quantity_Color(0.3, 0.75, 0.4, Quantity_TypeOfColor.Quantity_TOC_RGB)
@@ -81,21 +83,32 @@ class WorkplaneDialog(QDialog):
     # Carries (node, new_TopoDS_Shape).
     part_cut = Signal(object, object)
 
-    def __init__(self, parent=None, viewport=None):
+    def __init__(self, parent=None, viewport=None, sketch_toolbar=None):
         super().__init__(parent)
         self.setWindowTitle("Workplane / Sketch / Extrude")
         self.setWindowFlags(
             Qt.WindowType.Window |
             Qt.WindowType.WindowStaysOnTopHint
         )
-        self.resize(320, 560)
+        self.resize(320, 420)
         self.setMinimumWidth(280)
 
         self._viewport = viewport       # OcctViewportWidget (or subclass)
         self._workplane = None          # WorkPlane instance, set after face pick
         self._wp_ais = None             # AIS_Shape for the workplane border
         self._picking_face = False      # True while waiting for a face click
+        # On Face now takes 2 picks, matching KodaCAD's wpOnFace: the
+        # first face sets the workplane's plane, the second sets the
+        # U direction. Collected here, in pick order.
+        self._face_stack = []
         self._active_part = None        # Part node to cut into (set by main_app)
+        # PHASE 2 OF THE UI REVISION (DESIGN_BACKLOG item 33): the sketch
+        # toolbar used to be built and embedded here (Step 2, a QGroupBox
+        # inside this dialog). It now lives on MainWindow as a real,
+        # persistent QToolBar (KodaCAD-style), and is just handed to us so
+        # this dialog's remaining Extrude/Cut/Add controls (Step 3, now
+        # renumbered Step 2 below) can enable/disable and query it.
+        self._sketch_toolbar = sketch_toolbar
 
         self._build_ui()
 
@@ -108,8 +121,8 @@ class WorkplaneDialog(QDialog):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # ---- Step 1: pick a face -------------------------------------
-        step1 = QGroupBox("Step 1 — Pick a face")
+        # ---- Step 1: pick 2 faces (plane, then U direction) ----------
+        step1 = QGroupBox("Step 1 — Pick 2 faces (plane, then U dir.)")
         s1_layout = QVBoxLayout(step1)
 
         self._pick_status = QLabel("No face selected yet.")
@@ -118,20 +131,24 @@ class WorkplaneDialog(QDialog):
 
         self._pick_btn = QPushButton("Click face in viewport…")
         self._pick_btn.setCheckable(True)
+        self._pick_btn.setToolTip(
+            "Click a face to set the workplane's plane, then click a\n"
+            "second face to set the U direction.")
         self._pick_btn.clicked.connect(self._on_pick_btn_clicked)
         s1_layout.addWidget(self._pick_btn)
 
         layout.addWidget(step1)
 
-        # ---- Step 2: sketch toolbar ----------------------------------
-        step2 = QGroupBox("Step 2 — Sketch")
-        s2_layout = QVBoxLayout(step2)
-
-        self._sketch_toolbar = SketchToolBar(self)
-        self._sketch_toolbar.setEnabled(False)
-        s2_layout.addWidget(self._sketch_toolbar)
-
-        layout.addWidget(step2)
+        # ---- Step 2: sketch on the toolbar ----------------------------
+        # (The sketch toolbar itself now lives on MainWindow -- see
+        # DESIGN_BACKLOG item 33, Phase 2. This dialog just points at it.)
+        hint2 = QLabel(
+            "Step 2 — Sketch using the toolbar on the right edge\n"
+            "of the main window."
+        )
+        hint2.setWordWrap(True)
+        hint2.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(hint2)
 
         # ---- Step 3: extrude depth + name + create -------------------
         step3 = QGroupBox("Step 3 — Extrude / Cut")
@@ -187,7 +204,8 @@ class WorkplaneDialog(QDialog):
 
     def _set_sketch_enabled(self, enabled):
         """Enable/disable step 2+3 controls depending on whether we have a WP."""
-        self._sketch_toolbar.setEnabled(enabled)
+        if self._sketch_toolbar is not None:
+            self._sketch_toolbar.setEnabled(enabled)
         for w in [self._depth_edit, self._name_edit, self._create_btn]:
             w.setEnabled(enabled)
         # Cut and Pull buttons only enabled if there's also an active part
@@ -228,8 +246,10 @@ class WorkplaneDialog(QDialog):
     def _start_pick_mode(self):
         """Activate face-selection mode in the viewport."""
         self._picking_face = True
+        self._face_stack = []
         self._pick_btn.setText("Cancel pick…")
-        self._pick_status.setText("Click a face in the viewport.")
+        self._pick_status.setText(
+            "Click a face to set the workplane's plane.")
         print("[WorkplaneDialog] Pick mode ON")
         if self._viewport is not None:
             from OCP.TopAbs import TopAbs_FACE
@@ -240,6 +260,7 @@ class WorkplaneDialog(QDialog):
 
     def _cancel_pick_mode(self):
         self._picking_face = False
+        self._face_stack = []
         self._pick_btn.setChecked(False)
         self._pick_btn.setText("Click face in viewport…")
         self._pick_status.setText("No face selected yet.")
@@ -247,34 +268,112 @@ class WorkplaneDialog(QDialog):
     def receive_pick(self, raw_shape, shape_type):
         """
         Called by main_app when a viewport pick fires while this dialog
-        is open and in pick mode.  Only face picks are consumed here.
-        """
-        print(f"[WorkplaneDialog] receive_pick called: picking_face={self._picking_face}, shape_type={shape_type}")
-        if not self._picking_face:
-            return
-        if shape_type != TopAbs_FACE:
-            self._pick_status.setText("That wasn't a face — try again.")
-            return
+        is open and in pick mode. Only face picks are consumed here.
 
+        On Face takes TWO face picks, matching KodaCAD's wpOnFace: the
+        first face sets the workplane's plane (its normal becomes the
+        W/extrusion direction), the second sets the U direction --
+        rather than the plane pick alone with an auto-computed U
+        direction. See WorkPlane.__init__'s existing face/faceU modes
+        in src/workplane.py, which already supported this; only the
+        picking UI here needed to collect a second face.
+
+        Returns True if this pick was consumed (main_app should NOT try
+        routing it anywhere else), False if it should fall through to
+        the next handler (e.g. the sketch toolbar).
+        """
+        print(f"[WorkplaneDialog] receive_pick called: picking_face={self._picking_face}, "
+              f"shape_type={shape_type}, faces_so_far={len(self._face_stack)}")
+        if not self._picking_face:
+            return False
+        if shape_type != TopAbs_FACE:
+            if self._workplane is not None:
+                # SELF-HEAL: a workplane already exists, so this is
+                # almost certainly a sketch pick (e.g. an intersection
+                # marker) -- the user very likely didn't mean to
+                # re-pick a face, they just have Step 1's button still
+                # sitting there, live, the whole time they're
+                # sketching. Without this, the wrong-type pick would
+                # get silently absorbed here and _picking_face would
+                # stay stuck True, swallowing every future pick too
+                # (the same bug class already fixed once in
+                # set_workplane() -- this closes the other way to hit
+                # it: clicking "Click face in viewport..." again
+                # mid-sketch, which set_workplane()'s guard can't catch
+                # since it only runs when a NEW workplane is created).
+                self._cancel_pick_mode()
+                self._pick_status.setText("✓ Face selected.  Workplane created.")
+                print("[WorkplaneDialog] receive_pick: non-face pick while a "
+                      "workplane is already active -- self-healing (cancelling "
+                      "pick mode) and letting it fall through to the sketch "
+                      "toolbar instead of getting stuck.")
+                return False
+            self._pick_status.setText("That wasn't a face — try again.")
+            return True
+
+        self._face_stack.append(raw_shape)
+
+        if len(self._face_stack) == 1:
+            # First face -- defines the plane. Wait for a second face
+            # to set the U direction (still picking; don't clear
+            # _picking_face or the pick button yet).
+            self._pick_status.setText(
+                "✓ Plane face selected.  Now click a second face to "
+                "set the U direction.")
+            return True
+
+        # Second face -- defines the U direction. Build the workplane.
+        face_w = self._face_stack[0]
+        face_u = self._face_stack[1]
         self._picking_face = False
+        self._face_stack = []
         self._pick_btn.setChecked(False)
         self._pick_btn.setText("Re-pick face…")
 
-        # Build the WorkPlane on the picked face
         try:
-            self._workplane = WorkPlane(size=80, face=raw_shape)
+            wp = WorkPlane(size=80, face=face_w, faceU=face_u)
         except Exception as e:
             QMessageBox.critical(self, "WorkPlane error",
-                                 f"Could not create workplane on that face:\n{e}")
-            self._pick_status.setText("Error — try another face.")
-            return
+                                 f"Could not create workplane from those "
+                                 f"two faces:\n{e}")
+            self._pick_status.setText("Error — try again (click the "
+                                      "pick button to restart).")
+            return True
 
-        self._pick_status.setText("✓ Face selected.  Workplane created.")
+        self._pick_status.setText(
+            "✓ Both faces selected.  Workplane created.")
+        self.set_workplane(wp)
+        return True
+
+    def set_workplane(self, wp):
+        """
+        Public entry point: activate this dialog for an already-built
+        WorkPlane, regardless of how it was created (On Face via
+        receive_pick() above, or At Origin / By 3 Points via the
+        Workplane menu in main_app.py -- see DESIGN_BACKLOG item 33,
+        Phase 2). Displays the workplane, enables Step 2's controls,
+        and hands the workplane to the sketch toolbar.
+
+        FIX: force-cancel any lingering face-pick mode first. If the
+        user had previously started an "On Face" pick (this dialog's
+        own button, or a prior menu action) and never completed or
+        explicitly cancelled it, _picking_face stayed True --
+        receive_pick() silently rejects non-face picks without ever
+        clearing that flag, so EVERY subsequent pick (including vertex
+        picks meant for the sketch toolbar's intersection markers) was
+        being swallowed here instead of reaching the toolbar at all.
+        Confirmed as the real cause of a report where a vertex pick
+        showed up in the terminal (from the base viewer's independent
+        selection print) but never reached the sketch toolbar's queue.
+        """
+        if self._picking_face:
+            self._cancel_pick_mode()
+        self._workplane = wp
         self._display_workplane()
         self._set_sketch_enabled(True)
         self._create_btn.setEnabled(True)
-        # Activate sketch toolbar with the new workplane
-        self._sketch_toolbar.set_workplane(self._workplane, self._viewport)
+        if self._sketch_toolbar is not None:
+            self._sketch_toolbar.set_workplane(self._workplane, self._viewport)
 
     # ------------------------------------------------------------------
     # Workplane display
