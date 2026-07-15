@@ -110,6 +110,13 @@ class WorkplaneDialog(QDialog):
         # renumbered Step 2 below) can enable/disable and query it.
         self._sketch_toolbar = sketch_toolbar
 
+        # PHASE 3 (DESIGN_BACKLOG item 33): Revolve. Mirrors KodaCAD's
+        # win.ptStack collection for its revolve()/revolveC() -- pick 2
+        # points to define the revolve axis (p1 -> p2 = axis direction,
+        # p1 = axis origin).
+        self._revolve_picking = False
+        self._revolve_points = []
+
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -174,6 +181,21 @@ class WorkplaneDialog(QDialog):
         self._create_btn.clicked.connect(self._on_create_clicked)
         s3_layout.addWidget(self._create_btn)
 
+        self._revolve_btn = QPushButton("↻  Revolve...")
+        self._revolve_btn.setEnabled(False)
+        self._revolve_btn.setCheckable(True)
+        self._revolve_btn.setToolTip(
+            "Revolve the sketch profile 360° about an axis.\n"
+            "Click, then pick 2 points in the viewport to set the axis\n"
+            "(uses the Name field above; Depth is ignored).")
+        self._revolve_btn.clicked.connect(self._on_revolve_clicked)
+        s3_layout.addWidget(self._revolve_btn)
+
+        self._revolve_status = QLabel("")
+        self._revolve_status.setWordWrap(True)
+        self._revolve_status.setStyleSheet("color: gray; font-style: italic;")
+        s3_layout.addWidget(self._revolve_status)
+
         # Active part label -- shows which part will be cut into
         self._active_part_label = QLabel("Active part: (none)")
         self._active_part_label.setWordWrap(True)
@@ -206,7 +228,8 @@ class WorkplaneDialog(QDialog):
         """Enable/disable step 2+3 controls depending on whether we have a WP."""
         if self._sketch_toolbar is not None:
             self._sketch_toolbar.setEnabled(enabled)
-        for w in [self._depth_edit, self._name_edit, self._create_btn]:
+        for w in [self._depth_edit, self._name_edit, self._create_btn,
+                 self._revolve_btn]:
             w.setEnabled(enabled)
         # Cut and Pull buttons only enabled if there's also an active part
         has_part = self._active_part is not None
@@ -495,6 +518,129 @@ class WorkplaneDialog(QDialog):
         # Tell main_app about the new node
         self.part_created.emit(node)
 
+    def _on_revolve_clicked(self):
+        """
+        Arm revolve-axis picking (2 points), or cancel if already
+        armed (the button is checkable, mirroring the face-pick
+        button's Click/Cancel toggle).
+        """
+        if self._workplane is None:
+            self._revolve_btn.setChecked(False)
+            QMessageBox.warning(self, "No workplane", "Please pick a face first.")
+            return
+
+        if self._revolve_picking:
+            self._cancel_revolve_pick()
+            return
+
+        self._revolve_picking = True
+        self._revolve_points = []
+        self._revolve_btn.setText("Cancel revolve pick…")
+        self._revolve_status.setText(
+            "Pick point 1 of the revolve axis.")
+        if self._viewport is not None:
+            from OCP.AIS import AIS_Shape
+            from OCP.TopAbs import TopAbs_VERTEX
+            ctx = self._viewport.context
+            for ais in self._viewport._ais_shapes:
+                ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_VERTEX))
+            ctx.UpdateCurrentViewer()
+
+    def _cancel_revolve_pick(self):
+        self._revolve_picking = False
+        self._revolve_points = []
+        self._revolve_btn.setChecked(False)
+        self._revolve_btn.setText("↻  Revolve...")
+        self._revolve_status.setText("")
+
+    def receive_axis_pick(self, raw_shape):
+        """
+        Called by main_app when a VERTEX pick fires while revolve-axis
+        picking is armed. Collects 2 points, then builds the revolved
+        solid via _revolve() and emits part_created -- same downstream
+        path as Extrude.
+        """
+        from OCP.BRep import BRep_Tool
+        from OCP.TopoDS import TopoDS
+        try:
+            vertex = TopoDS.Vertex_s(raw_shape)
+            pnt = BRep_Tool.Pnt_s(vertex)
+        except Exception as e:
+            print(f"[WorkplaneDialog] Could not resolve picked axis vertex: {e}")
+            return
+
+        self._revolve_points.append(pnt)
+        if len(self._revolve_points) == 1:
+            self._revolve_status.setText(
+                "✓ Point 1 set.  Pick point 2 of the revolve axis.")
+            return
+
+        p1, p2 = self._revolve_points
+        name = self._name_edit.text().strip() or "new_part"
+        self._cancel_revolve_pick()
+
+        try:
+            node = self._revolve(p1, p2, name)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Revolve failed",
+                                 f"Could not revolve part:\n{e}")
+            return
+
+        # Clean up sketch and workplane display (same as Create Part)
+        self._sketch_toolbar.deactivate()
+        self._erase_workplane()
+        self._workplane = None
+        self._set_sketch_enabled(False)
+        self._create_btn.setEnabled(False)
+        self._pick_status.setText(
+            "Part created (revolve)!  Pick another face to continue.")
+        self._pick_btn.setText("Click face in viewport…")
+
+        self.part_created.emit(node)
+
+    def _register_raw_shape(self, raw_shape, name):
+        """
+        Round-trip a raw TopoDS_Shape through STEP to get a build123d
+        Solid that is fully XDE-registered (same as shapes from
+        import_step), so export_step() will include it correctly.
+        Without this, export_step()'s _create_xde() silently skips
+        freshly constructed Solid nodes. Shared by _extrude() and
+        _revolve() (PHASE 3, DESIGN_BACKLOG item 33) -- previously
+        duplicated inline in _extrude() only.
+        """
+        import tempfile, os
+        from build123d import import_step
+        from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+        from OCP.IFSelect import IFSelect_RetDone
+
+        tmp = tempfile.NamedTemporaryFile(suffix='.step', delete=False)
+        tmp.close()
+        try:
+            writer = STEPControl_Writer()
+            writer.Transfer(raw_shape, STEPControl_AsIs)
+            status = writer.Write(tmp.name)
+            if status != IFSelect_RetDone:
+                raise RuntimeError(f"Temp STEP write failed: {status}")
+            # Re-import to get XDE-registered shape
+            imported = import_step(tmp.name)
+            # import_step returns a Solid with a spurious parent Compound
+            # (same bug as documented in step_export_fix.py). The solid
+            # may be the imported object itself or its first child.
+            children = list(imported.children)
+            b3d_solid = children[0] if children else imported
+            # Sever the spurious parent -- required so export_step()
+            # doesn't skip it (same fix as step_export_fix.py applies
+            # to the root assembly node).
+            if b3d_solid.parent is not None:
+                b3d_solid.parent = None
+        finally:
+            os.unlink(tmp.name)
+
+        b3d_solid.label = name
+        return b3d_solid
+
     def _extrude(self, depth, name):
         """
         Extrude the current sketch profile along the workplane normal (+wDir).
@@ -502,7 +648,6 @@ class WorkplaneDialog(QDialog):
         Returns a build123d Solid node ready to join the assembly tree.
         Raises RuntimeError if no profile exists or makeWire() fails.
         """
-        from build123d import Solid, Shape
         from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
         from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
         from OCP.gp import gp_Vec
@@ -532,45 +677,66 @@ class WorkplaneDialog(QDialog):
         extrude_vec = gp_Vec(wp.wDir) * depth
         prism_shape = BRepPrimAPI_MakePrism(face_bldr.Shape(), extrude_vec).Shape()
 
-        # Round-trip through STEP to get a build123d Solid that is fully
-        # XDE-registered (same as shapes from import_step), so export_step()
-        # will include it correctly. Without this, export_step()'s _create_xde()
-        # silently skips freshly constructed Solid nodes.
-        import tempfile, os
-        from build123d import Solid, export_step as b3d_export, import_step
-        from OCP.BRepTools import BRepTools
-        from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
-        from OCP.IFSelect import IFSelect_RetDone
+        return self._register_raw_shape(prism_shape, name)
 
-        # Write raw shape to a temp STEP file
-        tmp = tempfile.NamedTemporaryFile(suffix='.step', delete=False)
-        tmp.close()
-        try:
-            writer = STEPControl_Writer()
-            writer.Transfer(prism_shape, STEPControl_AsIs)
-            status = writer.Write(tmp.name)
-            if status != IFSelect_RetDone:
-                raise RuntimeError(f"Temp STEP write failed: {status}")
-            # Re-import to get XDE-registered shape
-            imported = import_step(tmp.name)
-            # import_step returns a Solid with a spurious parent Compound
-            # (same bug as documented in step_export_fix.py). The solid
-            # may be the imported object itself or its first child.
-            children = list(imported.children)
-            if children:
-                b3d_solid = children[0]
-            else:
-                b3d_solid = imported
-            # Sever the spurious parent -- required so export_step()
-            # doesn't skip it (same fix as step_export_fix.py applies
-            # to the root assembly node).
-            if b3d_solid.parent is not None:
-                b3d_solid.parent = None
-        finally:
-            os.unlink(tmp.name)
+    def _revolve(self, p1, p2, name, angle_deg=360.0):
+        """
+        Revolve the current sketch profile about an axis defined by two
+        picked 3D points (p1 -> p2 gives the axis direction, p1 is the
+        axis origin). Mirrors KodaCAD's revolve() in kodacad.py, with
+        one correction: KodaCAD's version references an undefined
+        `loc` variable (`loc.Transformation()`) that was clearly meant
+        to be `loc = get_inv_loc_of_active_asy()`, copied from its
+        sibling extrude() function but never actually added to
+        revolve() -- a NameError, confirmed by testing it directly in
+        KodaCAD. That transform places a new part into KodaCAD's
+        currently-active ASSEMBLY's local frame, a concept BasiCAD's
+        own _extrude() above doesn't need either (it works correctly
+        with no equivalent step), so _revolve() doesn't need it.
 
-        b3d_solid.label = name
-        return b3d_solid
+        Returns a build123d Solid node ready to join the assembly tree.
+        Raises RuntimeError if no profile exists, makeWire() fails, or
+        the axis points are coincident/degenerate.
+        """
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeRevol
+        from OCP.gp import gp_Ax1, gp_Dir, gp_Vec
+        import math
+
+        wp = self._workplane
+
+        if not wp.edgeList:
+            raise RuntimeError(
+                "No sketch profile found.\n\n"
+                "Use the sketch toolbar (Step 2) to draw a profile to "
+                "revolve before clicking Revolve."
+            )
+
+        if not wp.makeWire():
+            raise RuntimeError(
+                "makeWire() failed -- the profile may not be closed.\n\n"
+                "Tip: a rectangle (Rect tool) or circle (Circle tool) "
+                "always forms a closed profile. Lines must form a "
+                "closed loop."
+            )
+
+        face_bldr = BRepBuilderAPI_MakeFace(wp.wire)
+        if not face_bldr.IsDone():
+            raise RuntimeError("MakeFace failed.")
+
+        axis_vec = gp_Vec(p1, p2)
+        if axis_vec.Magnitude() < 1e-9:
+            raise RuntimeError(
+                "The two axis points are coincident -- pick two "
+                "distinct points to define the revolve axis."
+            )
+        revolve_axis = gp_Ax1(p1, gp_Dir(axis_vec))
+        angle_rad = math.radians(angle_deg)
+
+        revolved_shape = BRepPrimAPI_MakeRevol(
+            face_bldr.Shape(), revolve_axis, angle_rad).Shape()
+
+        return self._register_raw_shape(revolved_shape, name)
 
     def _on_cut_clicked(self):
         """Cut the sketched profile into the active part."""
@@ -784,6 +950,7 @@ class WorkplaneDialog(QDialog):
 
     def _on_cancel(self):
         self._cancel_pick_mode()
+        self._cancel_revolve_pick()
         self._sketch_toolbar.deactivate()
         self._erase_workplane()
         self._workplane = None
@@ -793,9 +960,13 @@ class WorkplaneDialog(QDialog):
 
     def closeEvent(self, event):
         self._cancel_pick_mode()
+        self._cancel_revolve_pick()
         self._sketch_toolbar.deactivate()
         self._erase_workplane()
         super().closeEvent(event)
 
     def is_in_pick_mode(self):
         return self._picking_face
+
+    def is_in_revolve_pick_mode(self):
+        return self._revolve_picking

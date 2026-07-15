@@ -2700,3 +2700,77 @@ priority chain as sketch tools / By-3-Points / On-Face picking.
 
 **Not yet tested against a running Qt/OCCT display**, same caveat as
 before.
+
+## 34. Phase 3: Revolve (DESIGN_BACKLOG item 33's Phase 3 -- Extrude + Revolve)
+
+**Status: Revolve COMPLETE. Extrude unchanged (already lightweight
+enough after Phase 2's reductions -- see note below).**
+
+### Scope note
+
+Phase 3 was originally scoped as "split the mega-dialog... Extrude
+becomes a small standalone action." By the end of Phase 2,
+`WorkplaneDialog` was already down to just Step 1 (pick face, only
+used by the On Face route) + Step 2/3 (Extrude/Cut/Add controls) --
+the At Origin and By 3 Points routes already bypass Step 1 entirely
+and go straight to the Extrude controls. Given that, and per direction
+received ("It looks like this should be pretty simple. Just Extrude
+and Revolve"), this round's work was adding Revolve alongside the
+already-adequate Extrude, rather than a further structural rewrite.
+
+### Revolve implementation (`gui/workplane_dialog.py`, `gui/main_app.py`)
+
+Investigated KodaCAD's `revolve()` in `kodacad.py` first (reported as
+broken there too -- `NameError: name 'loc' is not defined`). Root
+cause, confirmed by comparing against its sibling `extrude()`:
+`extrude()` defines `loc = get_inv_loc_of_active_asy()` at the top
+(places the new part into KodaCAD's currently-active ASSEMBLY's local
+frame) and uses it via `BRepBuilderAPI_Transform(new_part,
+loc.Transformation())`; `revolve()` calls the exact same
+`loc.Transformation()` pattern but is simply missing the `loc =
+get_inv_loc_of_active_asy()` line -- a copy-paste omission, not a
+deeper design issue. BasiCAD's own `_extrude()` doesn't have an
+equivalent transform step at all (and works correctly without one), so
+`_revolve()` doesn't need one either -- confirmed by the fact that
+`wp.wire`'s edges are already built in world coordinates (`self.Trsf`
+applied at edge-creation time in `src/workplane.py`), same as
+`_extrude()` relies on.
+
+**`_register_raw_shape(raw_shape, name)`** -- extracted from
+`_extrude()`'s inline STEP-round-trip block (XDE registration, so
+`export_step()` includes freshly-built solids) into a shared helper,
+now used by both `_extrude()` and the new `_revolve()`.
+
+**`_revolve(p1, p2, name, angle_deg=360.0)`** -- builds the profile
+face the same way `_extrude()` does (`wp.makeWire()` ->
+`BRepBuilderAPI_MakeFace`), then `BRepPrimAPI_MakeRevol(face,
+gp_Ax1(p1, gp_Dir(gp_Vec(p1, p2))), radians(angle_deg))`. Raises on a
+degenerate axis (coincident points) in addition to the existing
+no-profile / makeWire-failed checks.
+
+**UI:** new "↻ Revolve..." button next to "Create Part" in Step 3,
+checkable (Click/Cancel toggle, matching the face-pick button's
+pattern). Clicking arms 2-point axis picking
+(`_revolve_picking`/`_revolve_points`, mirroring By-3-Points'
+state shape); `receive_axis_pick()` collects the 2 points and, on the
+2nd, builds and emits the part via the same `part_created` signal path
+Extrude uses. Reuses the existing Name field (Depth is ignored for
+Revolve, noted in the tooltip); default angle is a full 360° (no UI
+for a partial-angle revolve yet -- `_revolve()`'s `angle_deg` param
+supports it, just not exposed).
+
+**Routing:** `_on_geometry_picked` gets a new branch (checked right
+after On-Face's own pick mode, before By-3-Points/measurement/sketch
+toolbar -- an explicitly armed Revolve pick takes priority).
+`_on_end_operation` and `WorkplaneDialog._on_cancel()`/`closeEvent()`
+all now also cancel revolve-axis picking, closing the same
+stuck-pick-mode class of bug already fixed twice before for face
+picking (On Face's own self-heal, and the End Operation button).
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+before -- in particular worth confirming the revolved solid's
+orientation/handedness looks right (BasiCAD's own axis-pick order --
+p1 as origin, p1->p2 as direction -- was chosen to match what
+`gp_Ax1` needs directly, differs slightly from KodaCAD's identical
+`p1, p2 = win.ptStack.pop(), win.ptStack.pop()` pop order but should
+produce the same result).

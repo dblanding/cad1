@@ -824,13 +824,18 @@ class MainWindow(QMainWindow):
         operation is currently in progress, checked in the same
         priority order as _on_geometry_picked's routing:
           1. An armed sketch tool (Circle, Line, etc.)
-          2. By-3-Points workplane picking
-          3. Calculator measurement mode (Dist/Len)
-          4. On-Face workplane picking
+          2. Workplane dialog revolve-axis picking
+          3. By-3-Points workplane picking
+          4. Calculator measurement mode (Dist/Len)
+          5. On-Face workplane picking
         """
         if self._sketch_toolbar.isEnabled() and \
                 self._sketch_toolbar._active_tool is not None:
             self._sketch_toolbar._do_cancel_tool()
+            return
+        if self._workplane_dialog.is_in_revolve_pick_mode():
+            self._workplane_dialog._cancel_revolve_pick()
+            self.statusBar().showMessage("Revolve cancelled.", 4000)
             return
         if self._wp3pts_picking:
             self._wp3pts_picking = False
@@ -1083,11 +1088,12 @@ class MainWindow(QMainWindow):
         one -- see WorkplaneDialog.receive_pick's self-heal for why
         this isn't a plain if/elif chain):
           1. Workplane dialog face-pick mode (On Face)
-          2. By-3-Points workplane vertex-pick mode
-          3. Calculator measurement mode (Dist/Len)
-          4. Sketch toolbar vertex pick (intersection point snap)
-          5. Fillet / Shell dialogs
-          6. Position dialog positioning mode
+          2. Workplane dialog revolve-axis-pick mode (Revolve)
+          3. By-3-Points workplane vertex-pick mode
+          4. Calculator measurement mode (Dist/Len)
+          5. Sketch toolbar vertex pick (intersection point snap)
+          6. Fillet / Shell dialogs
+          7. Position dialog positioning mode
         """
         from OCP.TopAbs import TopAbs_VERTEX
 
@@ -1099,6 +1105,13 @@ class MainWindow(QMainWindow):
             print(f"[route] {type_name} pick -> WorkplaneDialog.receive_pick "
                   f"(face-pick mode)")
             consumed = self._workplane_dialog.receive_pick(raw_shape, shape_type)
+
+        if not consumed and self._workplane_dialog.is_in_revolve_pick_mode() \
+                and shape_type == TopAbs_VERTEX:
+            print(f"[route] {type_name} pick -> WorkplaneDialog.receive_axis_pick "
+                  f"(revolve-axis mode)")
+            self._workplane_dialog.receive_axis_pick(raw_shape)
+            consumed = True
 
         if not consumed and self._wp3pts_picking and shape_type == TopAbs_VERTEX:
             print(f"[route] {type_name} pick -> By-3-Points")
