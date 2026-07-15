@@ -2652,3 +2652,51 @@ before -- in particular, worth re-attempting the exact "workplane on
 face of just-created part, with that part also set active" sequence
 that surfaced the occlusion issue, to confirm the suspend/restore
 fix actually resolves it.
+
+### Phase 2 follow-up: implemented the calculator's Dist/Len measurement buttons
+
+Reported: "the bottom row buttons on the calculator aren't working
+yet: getting measurements of things in the model." These were stubbed
+in Phase 1 to degrade gracefully (`SketchToolBar`... no, `Calculator.
+measure()` in `gui/rpn_calculator.py`, calling `caller.distPtPt`/
+`caller.edgeLen` if present, else a status-bar message) specifically
+pending this implementation.
+
+Worth noting: checked KodaCAD's own source first -- Rad and Ang are
+`self.noop` even upstream (`rpnCalculator.py` never wires them to
+anything real), so only Dist/Len needed implementing; leaving Rad/Ang
+as no-ops isn't a regression.
+
+**Added to `gui/main_app.py`**, mirroring KodaCAD's `distPtPt`/
+`edgeLen` in `mainwindow.py` (these exact method names are what
+`rpn_calculator.py`'s `measure()` already looks up via `getattr`, so
+no calculator-side changes were needed):
+
+- **`distPtPt()`** -- arms point-distance measurement: activates
+  `TopAbs_VERTEX` selection on all displayed AIS shapes (global, not
+  workplane-scoped -- matches KodaCAD, works on any model geometry),
+  prompts via the status bar. `_on_measure_vertex_picked()` collects 2
+  picks, computes distance via `gp_Vec(p1, p2).Magnitude()`, and pushes
+  it straight into the open calculator's X register via
+  `self.calculator.putx(dist)`.
+- **`edgeLen()`** -- arms edge-length measurement: activates
+  `TopAbs_EDGE` selection, prompts via the status bar.
+  `_on_measure_edge_picked()` computes length via
+  `CPnts_AbscissaPoint.Length_s(BRepAdaptor_Curve(edge))` and pushes it
+  the same way.
+
+Both are **sticky** (consistent with the sketch tools' established
+pattern) -- stay armed after each measurement for another one, until
+End Operation or a different operation starts. Both also cancel any
+currently-armed sketch tool when invoked, to avoid an ambiguous
+simultaneous-armed state (a VERTEX pick would otherwise be unclear
+whether it belongs to a sketch tool or a measurement).
+
+**Routing (`_on_geometry_picked`):** measurement mode checked after
+By-3-Points, before the sketch toolbar -- an explicitly-armed
+measurement takes priority. **`_on_end_operation`** (the status bar's
+End Operation button) now also cancels measurement mode, in the same
+priority chain as sketch tools / By-3-Points / On-Face picking.
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+before.

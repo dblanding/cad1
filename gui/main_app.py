@@ -712,6 +712,13 @@ class MainWindow(QMainWindow):
         self._wp3pts_picking = False
         self._wp3pts_points = []
 
+        # Calculator measurement state (PHASE 2 follow-up, DESIGN_BACKLOG
+        # item 33) -- mirrors KodaCAD's distPtPt/edgeLen. None, "dist",
+        # or "len". Armed by the calculator's Dist/Len buttons via
+        # rpn_calculator.py's measure() -> self.distPtPt()/self.edgeLen().
+        self._measure_mode = None
+        self._measure_points = []   # collected gp_Pnt for "dist" mode
+
         # --- Menu bar (PHASE 1 of the UI revision, DESIGN_BACKLOG item 33)
         # Additive only: every action here calls the SAME handler methods
         # the side-panel buttons already call. Nothing is removed, so
@@ -818,7 +825,8 @@ class MainWindow(QMainWindow):
         priority order as _on_geometry_picked's routing:
           1. An armed sketch tool (Circle, Line, etc.)
           2. By-3-Points workplane picking
-          3. On-Face workplane picking
+          3. Calculator measurement mode (Dist/Len)
+          4. On-Face workplane picking
         """
         if self._sketch_toolbar.isEnabled() and \
                 self._sketch_toolbar._active_tool is not None:
@@ -828,6 +836,11 @@ class MainWindow(QMainWindow):
             self._wp3pts_picking = False
             self._wp3pts_points = []
             self.statusBar().showMessage("By 3 Points cancelled.", 4000)
+            return
+        if self._measure_mode is not None:
+            self._measure_mode = None
+            self._measure_points = []
+            self.statusBar().showMessage("Measurement cancelled.", 4000)
             return
         if self._workplane_dialog.is_in_pick_mode():
             self._workplane_dialog._cancel_pick_mode()
@@ -1071,9 +1084,10 @@ class MainWindow(QMainWindow):
         this isn't a plain if/elif chain):
           1. Workplane dialog face-pick mode (On Face)
           2. By-3-Points workplane vertex-pick mode
-          3. Sketch toolbar vertex pick (intersection point snap)
-          4. Fillet / Shell dialogs
-          5. Position dialog positioning mode
+          3. Calculator measurement mode (Dist/Len)
+          4. Sketch toolbar vertex pick (intersection point snap)
+          5. Fillet / Shell dialogs
+          6. Position dialog positioning mode
         """
         from OCP.TopAbs import TopAbs_VERTEX
 
@@ -1089,6 +1103,18 @@ class MainWindow(QMainWindow):
         if not consumed and self._wp3pts_picking and shape_type == TopAbs_VERTEX:
             print(f"[route] {type_name} pick -> By-3-Points")
             self._on_wp3pts_vertex_picked(raw_shape)
+            consumed = True
+
+        if not consumed and self._measure_mode == "dist" and \
+                shape_type == TopAbs_VERTEX:
+            print(f"[route] {type_name} pick -> distPtPt measurement")
+            self._on_measure_vertex_picked(raw_shape)
+            consumed = True
+
+        if not consumed and self._measure_mode == "len" and \
+                shape_type == TopAbs_EDGE:
+            print(f"[route] {type_name} pick -> edgeLen measurement")
+            self._on_measure_edge_picked(raw_shape)
             consumed = True
 
         if not consumed and shape_type == TopAbs_VERTEX and \
@@ -1197,6 +1223,96 @@ class MainWindow(QMainWindow):
         self._workplane_dialog.set_active_part(self.tree.get_active_part())
         self._workplane_dialog.set_workplane(wp)
         self.statusBar().showMessage("Workplane created by 3 points.", 4000)
+
+    # -----------------------------------------------------------------------
+    # Calculator measurement (PHASE 2 follow-up, DESIGN_BACKLOG item 33).
+    # Mirrors KodaCAD's distPtPt/edgeLen exactly -- these method names are
+    # what rpn_calculator.py's measure() looks up via getattr(caller, ...).
+    # Rad/Ang are left as no-ops: they're unimplemented in KodaCAD itself
+    # too (its own rpnCalculator.py wires them to self.noop), so this
+    # isn't a regression.
+    # -----------------------------------------------------------------------
+
+    def distPtPt(self):
+        """
+        Arm point-distance measurement: pick 2 points anywhere in the
+        model, push the distance into the calculator's X register.
+        Sticky, like sketch tools -- stays armed for another
+        measurement until End Operation or a different operation
+        starts. Called by the calculator's "Dist" button.
+        """
+        if self._assembly is None:
+            return
+        if self._sketch_toolbar._active_tool is not None:
+            self._sketch_toolbar._do_cancel_tool()
+        self._measure_mode = "dist"
+        self._measure_points = []
+        from OCP.AIS import AIS_Shape
+        ctx = self.viewport.context
+        for ais in self.viewport._ais_shapes:
+            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_VERTEX))
+        ctx.UpdateCurrentViewer()
+        self.statusBar().showMessage("Dist: pick point 1.")
+
+    def _on_measure_vertex_picked(self, raw_shape):
+        from OCP.BRep import BRep_Tool
+        from OCP.TopoDS import TopoDS
+        try:
+            vertex = TopoDS.Vertex_s(raw_shape)
+            pnt = BRep_Tool.Pnt_s(vertex)
+        except Exception as e:
+            print(f"[distPtPt] Could not resolve picked vertex: {e}")
+            return
+        self._measure_points.append(pnt)
+        if len(self._measure_points) == 1:
+            self.statusBar().showMessage("Dist: pick point 2.")
+            return
+        from OCP.gp import gp_Vec
+        p1, p2 = self._measure_points
+        self._measure_points = []
+        dist = gp_Vec(p1, p2).Magnitude()
+        if self.calculator is not None:
+            self.calculator.putx(dist)
+        self.statusBar().showMessage(
+            f"Distance = {dist:.3f} mm  (pick 2 more points for another, "
+            f"or End Operation to stop.)", 6000)
+        # Sticky -- self._measure_mode stays "dist" for another round.
+
+    def edgeLen(self):
+        """
+        Arm edge-length measurement: pick an edge anywhere in the
+        model, push its length into the calculator's X register.
+        Sticky. Called by the calculator's "Len" button.
+        """
+        if self._assembly is None:
+            return
+        if self._sketch_toolbar._active_tool is not None:
+            self._sketch_toolbar._do_cancel_tool()
+        self._measure_mode = "len"
+        from OCP.AIS import AIS_Shape
+        ctx = self.viewport.context
+        for ais in self.viewport._ais_shapes:
+            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_EDGE))
+        ctx.UpdateCurrentViewer()
+        self.statusBar().showMessage("Len: pick an edge.")
+
+    def _on_measure_edge_picked(self, raw_shape):
+        from OCP.TopoDS import TopoDS
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.CPnts import CPnts_AbscissaPoint
+        try:
+            edge = TopoDS.Edge_s(raw_shape)
+            length = CPnts_AbscissaPoint.Length_s(BRepAdaptor_Curve(edge))
+        except Exception as e:
+            self.statusBar().showMessage(
+                f"Could not measure that edge: {e}", 5000)
+            return
+        if self.calculator is not None:
+            self.calculator.putx(length)
+        self.statusBar().showMessage(
+            f"Length = {length:.3f} mm  (pick another edge, or End "
+            f"Operation to stop.)", 6000)
+        # Sticky -- self._measure_mode stays "len" for another round.
 
     def _on_fillet_clicked(self):
         """Open the Fillet dialog."""
