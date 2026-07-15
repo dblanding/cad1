@@ -78,6 +78,14 @@ class AssemblyTreeWidget(QTreeWidget):
     # Carries (new_compound_node, parent_node).
     sub_assembly_created = Signal(object, object)
 
+    # PHASE 3 (DESIGN_BACKLOG item 33): persistent workplanes, listed
+    # in their own "WP" section above the assembly tree, KodaCAD-style.
+    # uid is a string like "wp1", assigned by main_app.py.
+    workplane_visibility_changed = Signal(str, bool)   # uid, visible
+    workplane_set_active_requested = Signal(str)        # uid
+    workplane_clear_active_requested = Signal()
+    workplane_delete_requested = Signal(str)             # uid
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setHeaderLabels(["Part / Assembly"])
@@ -104,6 +112,29 @@ class AssemblyTreeWidget(QTreeWidget):
         # Currently active part node for Cut/Mill (None = no active part)
         self._active_part = None
         self._active_part_item = None
+
+        # PHASE 3 (DESIGN_BACKLOG item 33): persistent workplanes, in
+        # their own "WP" top-level section, above the assembly tree
+        # (KodaCAD-style). Kept entirely separate from _item_to_node/
+        # _make_item's build123d-node machinery -- workplanes are
+        # plain Python objects (src/workplane.py's WorkPlane), not
+        # build123d nodes, and have their own show/hide + RMB
+        # Set-Active/Delete semantics rather than reusing "Set Active
+        # Assembly"/"Set Active Part".
+        self._wp_root_item = QTreeWidgetItem(["WP"])
+        self._wp_root_item.setFlags(
+            self._wp_root_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        self.addTopLevelItem(self._wp_root_item)
+        self._wp_root_item.setExpanded(True)
+        self._item_to_wp_uid = {}   # id(QTreeWidgetItem) -> wp uid (str)
+        self._wp_uid_to_item = {}   # wp uid -> QTreeWidgetItem
+        self._active_wp_uid = None
+        self._active_wp_item = None
+        # Set by load_assembly_into_tree() -- the fallback parent for
+        # add_node_to_tree(parent_node=None). Was topLevelItem(0)
+        # before the WP section existed at index 0; now tracked
+        # explicitly since WP always occupies index 0.
+        self._assembly_root_item = None
 
     # ------------------------------------------------------------------
     # Public API: active assembly
@@ -186,6 +217,48 @@ class AssemblyTreeWidget(QTreeWidget):
         item.setText(0, f"{prefix}{base_label}" if active else base_label)
 
     # ------------------------------------------------------------------
+    # Public API: persistent workplanes (PHASE 3, DESIGN_BACKLOG item 33)
+    # ------------------------------------------------------------------
+
+    def add_workplane_item(self, uid, label):
+        """Add a new row under the WP section. Returns the QTreeWidgetItem."""
+        item = QTreeWidgetItem([label])
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.CheckState.Checked)
+        self._wp_root_item.addChild(item)
+        self._item_to_wp_uid[id(item)] = uid
+        self._wp_uid_to_item[uid] = item
+        return item
+
+    def remove_workplane_item(self, uid):
+        """Remove a workplane's row. Clears active status if it was active."""
+        item = self._wp_uid_to_item.pop(uid, None)
+        if item is None:
+            return
+        self._item_to_wp_uid.pop(id(item), None)
+        self._wp_root_item.removeChild(item)
+        if self._active_wp_uid == uid:
+            self._active_wp_uid = None
+            self._active_wp_item = None
+
+    def set_active_workplane(self, uid):
+        """Mark `uid` as the active workplane (bold + ► prefix), matching
+        the existing active-assembly/active-part visual convention.
+        Pass None to clear."""
+        if self._active_wp_item is not None:
+            self._set_item_active_style(self._active_wp_item, False, "► ")
+            self._active_wp_item = None
+        self._active_wp_uid = uid
+        if uid is not None:
+            item = self._wp_uid_to_item.get(uid)
+            if item is not None:
+                self._set_item_active_style(item, True, "► ")
+                self._active_wp_item = item
+
+    def get_active_workplane_uid(self):
+        return self._active_wp_uid
+
+    # ------------------------------------------------------------------
     # Tree population
     # ------------------------------------------------------------------
 
@@ -196,8 +269,23 @@ class AssemblyTreeWidget(QTreeWidget):
         self._active_item = None
         self._root_assembly = assembly
 
+        # Recreate the WP section (PHASE 3, DESIGN_BACKLOG item 33) --
+        # self.clear() just wiped it. Only called once at startup
+        # (see main_app.py's load()), before any workplanes could
+        # exist, so there's nothing to preserve here.
+        self._wp_root_item = QTreeWidgetItem(["WP"])
+        self._wp_root_item.setFlags(
+            self._wp_root_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        self.addTopLevelItem(self._wp_root_item)
+        self._wp_root_item.setExpanded(True)
+        self._item_to_wp_uid = {}
+        self._wp_uid_to_item = {}
+        self._active_wp_uid = None
+        self._active_wp_item = None
+
         root_item = self._make_item(assembly)
         self.addTopLevelItem(root_item)
+        self._assembly_root_item = root_item
         self._populate_children(root_item, assembly)
         self.expandAll()
 
@@ -227,7 +315,7 @@ class AssemblyTreeWidget(QTreeWidget):
         Returns the new QTreeWidgetItem.
         """
         if parent_node is None:
-            parent_item = self.topLevelItem(0)
+            parent_item = self._assembly_root_item
         else:
             parent_item = None
             for item_id, node in self._item_to_node.items():
@@ -235,7 +323,7 @@ class AssemblyTreeWidget(QTreeWidget):
                     parent_item = self._find_item_by_id(item_id)
                     break
             if parent_item is None:
-                parent_item = self.topLevelItem(0)
+                parent_item = self._assembly_root_item
 
         new_item = self._make_item(new_node)
         parent_item.addChild(new_item)
@@ -293,6 +381,15 @@ class AssemblyTreeWidget(QTreeWidget):
         item = self.itemAt(pos)
         if item is None:
             return
+
+        if item is self._wp_root_item:
+            return  # no menu on the "WP" section header itself
+
+        wp_uid = self._item_to_wp_uid.get(id(item))
+        if wp_uid is not None:
+            self._show_wp_context_menu(pos, wp_uid)
+            return
+
         node = self._item_to_node.get(id(item))
         if node is None:
             return
@@ -395,6 +492,31 @@ class AssemblyTreeWidget(QTreeWidget):
 
         print(f"Created sub-assembly '{name}' under '{parent_node.label}'")
         self.sub_assembly_created.emit(new_assy, parent_node)
+
+    def _show_wp_context_menu(self, pos, uid):
+        """RMB menu for a row in the WP section -- Set Active / Delete,
+        deliberately NOT reusing Set Active Assembly/Part's semantics."""
+        menu = QMenu(self)
+
+        act_set_active = QAction("► Set Active", self)
+        act_set_active.triggered.connect(
+            lambda: self.workplane_set_active_requested.emit(uid))
+        menu.addAction(act_set_active)
+
+        if uid == self._active_wp_uid:
+            act_clear = QAction("✕ Clear Active", self)
+            act_clear.triggered.connect(
+                lambda: self.workplane_clear_active_requested.emit())
+            menu.addAction(act_clear)
+
+        menu.addSeparator()
+
+        act_delete = QAction("🗑 Delete", self)
+        act_delete.triggered.connect(
+            lambda: self.workplane_delete_requested.emit(uid))
+        menu.addAction(act_delete)
+
+        menu.exec(self.viewport().mapToGlobal(pos))
 
     def _on_rename(self, item, node):
         """Prompt for a new name and update both the tree item and node label."""

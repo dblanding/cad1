@@ -5,19 +5,32 @@ THE MAIN APPLICATION -- wires together all components of cad1.
 
 ARCHITECTURE:
   MainWindow (QMainWindow)
-    |- menuBar()             -- File / Position / Create / Modify / Utility
-    |                            (PHASE 1 of the UI revision, see
-    |                            DESIGN_BACKLOG item 33 -- additive only,
-    |                            mirrors existing button handlers)
-    |- statusBar()           -- shared QLineEdit + units label
+    |- menuBar()             -- File / Workplane / Create 3D / Modify /
+    |                            Position / Utility (KodaCAD-style;
+    |                            PHASE 3 of the UI revision, see
+    |                            DESIGN_BACKLOG item 33 -- WorkplaneDialog
+    |                            retired. Workplane creation and Create
+    |                            3D (Extrude/Revolve) are pure menu +
+    |                            status-bar flows now, no dialog)
+    |- statusBar()           -- shared QLineEdit + Current Operation
+    |                            label + End Operation button + units
     |- Calculator            (rpn_calculator.py)      -- RPN calculator,
     |                            ported from KodaCAD; sends values to
-    |                            whichever QLineEdit has focus
+    |                            whichever QLineEdit has focus, or
+    |                            straight to an armed operation's queue
     |- SyncedViewportWidget  (subclass of assembly_viewer.SyncedViewportWidget)
     |    Adds: _node_id_to_ais_shape, _apply_shape_to_node(),
     |          active-part orange overlay, edge/vertex mode management
     |- AssemblyTreeWidget    (assembly_tree_widget.py)
-    |- WorkplaneDialog       (workplane_dialog.py)   -- Create Part workflow
+    |    Includes a persistent "WP" section (PHASE 3) -- workplanes
+    |    created via the Workplane menu are listed here and stay until
+    |    deleted via RMB, each with its own show/hide checkbox. One can
+    |    be marked Active (RMB) -- Create 3D / the sketch toolbar
+    |    operate on whichever workplane is currently active.
+    |- SketchToolBar         (sketch_toolbar.py)       -- follows the tree's
+    |                            active workplane, not a dialog
+    |- solid_ops.py          -- standalone extrude()/revolve() functions,
+    |                            called directly by Create 3D menu actions
     |- FilletDialog          (fillet_dialog.py)      -- Fillet workflow
     |- ShellDialog           (shell_dialog.py)       -- Shell workflow
     +- PositionDialog        (position_dialog.py)    -- Mate/Align workflow
@@ -85,11 +98,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from assembly_viewer import OcctViewportWidget  # noqa: E402
 from assembly_tree_widget import AssemblyTreeWidget  # noqa: E402
 from position_dialog import PositionDialog  # noqa: E402
-from workplane_dialog import WorkplaneDialog  # noqa: E402
 from fillet_dialog import FilletDialog  # noqa: E402
 from shell_dialog import ShellDialog  # noqa: E402
 from rpn_calculator import Calculator  # noqa: E402
 from sketch_toolbar import SketchToolBar  # noqa: E402
+import solid_ops  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from workplane import WorkPlane  # noqa: E402
@@ -602,16 +615,12 @@ class MainWindow(QMainWindow):
         self._position_btn.clicked.connect(self._on_position_clicked)
         tree_layout.addWidget(self._position_btn)
 
-        # Create Part button -- opens the Workplane → Sketch → Extrude
-        # dialog to create a new solid and add it to the assembly.
-        self._create_part_btn = QPushButton("⊞  Workplane...")
-        self._create_part_btn.setEnabled(False)
-        self._create_part_btn.setToolTip(
-            "Pick a face to place a workplane, sketch a profile,\n"
-            "then extrude to create a new part or cut into an existing one."
-        )
-        self._create_part_btn.clicked.connect(self._on_create_part_clicked)
-        tree_layout.addWidget(self._create_part_btn)
+        # NOTE: the old "⊞ Workplane..." button (opened WorkplaneDialog)
+        # was removed here in PHASE 3 (DESIGN_BACKLOG item 33) -- the
+        # dialog is retired. Workplane creation is now purely the
+        # Workplane menu (At Origin / On Face / By 3 Points), and
+        # Extrude/Revolve are purely the Create 3D menu, both driven by
+        # the status bar, KodaCAD-style. See _build_menu_bar().
 
         self._fillet_btn = QPushButton("⌀  Fillet...")
         self._fillet_btn.setEnabled(False)
@@ -661,12 +670,11 @@ class MainWindow(QMainWindow):
 
         splitter.setSizes([350, 1050])
 
-        # --- Sketch toolbar (PHASE 2 of the UI revision, DESIGN_BACKLOG
+        # --- Sketch toolbar (PHASE 2/3 of the UI revision, DESIGN_BACKLOG
         # item 33) -- KodaCAD-style: a real, persistent QToolBar docked
-        # on the main window, rather than embedded inside a modal dialog.
-        # Enabled/disabled and pointed at the active WorkPlane by
-        # WorkplaneDialog (which still owns the Extrude/Cut/Add controls)
-        # and by the direct At-Origin/By-3-Points flows below.
+        # on the main window. Follows whichever workplane is currently
+        # marked Active in the tree's WP section (PHASE 3 -- see
+        # _on_wp_set_active_requested below), not a dialog.
         self._sketch_toolbar = SketchToolBar(self)
         self.addToolBar(Qt.ToolBarArea.RightToolBarArea, self._sketch_toolbar)
 
@@ -676,12 +684,14 @@ class MainWindow(QMainWindow):
         self._position_dialog.request_redisplay.connect(self._on_redisplay_after_move)
         self._position_dialog.positioning_done.connect(self._on_positioning_done)
 
-        # --- Workplane / Create Part dialog (floating dock) ----------
-        self._workplane_dialog = WorkplaneDialog(
-            self, viewport=self.viewport, sketch_toolbar=self._sketch_toolbar)
-        self._workplane_dialog.hide()
-        self._workplane_dialog.part_created.connect(self._on_part_created)
-        self._workplane_dialog.part_cut.connect(self._on_part_cut)
+        # --- Persistent workplanes (PHASE 3, DESIGN_BACKLOG item 33) --
+        # WorkplaneDialog is retired. A workplane created via the
+        # Workplane menu now registers here and in the tree's WP
+        # section (uid -> dict), staying until deleted via RMB, rather
+        # than being thrown away when a dialog closed. See
+        # _register_new_workplane() / _on_wp_*.
+        self._workplanes = {}   # uid -> {"wp", "border_ais", "visible"}
+        self._wp_counter = 0
         self._active_part_tree_item = None   # tree item with orange background
         self._active_part_overlay_ais = None  # wireframe overlay AIS
 
@@ -703,6 +713,14 @@ class MainWindow(QMainWindow):
         self.tree.node_delete_requested.connect(self._on_node_delete_requested)
         self.tree.sub_assembly_created.connect(self._on_sub_assembly_created)
         self.tree.active_part_changed.connect(self._on_active_part_changed)
+        # PHASE 3: persistent workplane tree signals. (Visibility
+        # toggling is handled directly in _on_tree_item_changed below,
+        # mirroring how regular node checkboxes work via Qt's built-in
+        # itemChanged rather than a custom signal -- so there's no
+        # workplane_visibility_changed connection here.)
+        self.tree.workplane_set_active_requested.connect(self._on_wp_set_active_requested)
+        self.tree.workplane_clear_active_requested.connect(self._on_wp_clear_active_requested)
+        self.tree.workplane_delete_requested.connect(self._on_wp_delete_requested)
 
         self.step_path = step_path
         self._assembly = None  # set by load()
@@ -711,6 +729,25 @@ class MainWindow(QMainWindow):
         # item 33) -- mirrors KodaCAD's win.ptStack for wpBy3Pts.
         self._wp3pts_picking = False
         self._wp3pts_points = []
+
+        # On-Face workplane creation state (PHASE 3, DESIGN_BACKLOG item
+        # 33) -- mirrors KodaCAD's win.faceStack for wpOnFace. Pure
+        # status-bar flow now, replaces WorkplaneDialog's Step 1.
+        self._wp_onface_picking = False
+        self._wp_onface_faces = []
+
+        # Create 3D state (PHASE 3, DESIGN_BACKLOG item 33) -- Extrude
+        # and Revolve, purely menu + status-bar driven, matching
+        # KodaCAD's extrude()/revolve() flow exactly (see
+        # _on_create3d_extrude / _on_create3d_revolve below).
+        # _create3d_mode: None | "extrude" | "revolve"
+        # _create3d_stage: which input we're waiting for next
+        #   extrude: "length" -> "name"
+        #   revolve: "axis" (2 vertex picks) -> "name"
+        self._create3d_mode = None
+        self._create3d_stage = None
+        self._create3d_length = None
+        self._create3d_points = []
 
         # Calculator measurement state (PHASE 2 follow-up, DESIGN_BACKLOG
         # item 33) -- mirrors KodaCAD's distPtPt/edgeLen. None, "dist",
@@ -743,25 +780,29 @@ class MainWindow(QMainWindow):
         self._add_action(file_menu, "Import STEP...", self._on_import_clicked)
         self._add_action(file_menu, "Export STEP...", self._on_export_clicked)
 
-        position_menu = menubar.addMenu("&Position")
-        self._add_action(position_menu, "Position selected...",
-                         self._on_position_clicked)
-
         workplane_menu = menubar.addMenu("&Workplane")
         self._add_action(workplane_menu, "At Origin, XY Plane",
                          self._on_workplane_at_origin)
         self._add_action(workplane_menu, "On Face...",
-                         self._on_create_part_clicked)
+                         self._on_workplane_on_face)
         self._add_action(workplane_menu, "By 3 Points...",
                          self._on_workplane_by_3pts)
 
-        create_menu = menubar.addMenu("&Create")
-        self._add_action(create_menu, "Workplane / Sketch / Extrude...",
-                         self._on_create_part_clicked)
+        # PHASE 3 (DESIGN_BACKLOG item 33): pure menu + status-bar flow,
+        # matching KodaCAD's Create 3D menu exactly -- no dialog.
+        # Operates on whichever workplane is currently Active in the
+        # tree's WP section.
+        create3d_menu = menubar.addMenu("&Create 3D")
+        self._add_action(create3d_menu, "Extrude", self._on_create3d_extrude)
+        self._add_action(create3d_menu, "Revolve", self._on_create3d_revolve)
 
-        modify_menu = menubar.addMenu("&Modify")
+        modify_menu = menubar.addMenu("&Modify Active Part")
         self._add_action(modify_menu, "Fillet...", self._on_fillet_clicked)
         self._add_action(modify_menu, "Shell...", self._on_shell_clicked)
+
+        position_menu = menubar.addMenu("&Position")
+        self._add_action(position_menu, "Position selected...",
+                         self._on_position_clicked)
 
         utility_menu = menubar.addMenu("&Utility")
         self._add_action(utility_menu, "Calculator", self.launch_calculator)
@@ -824,18 +865,23 @@ class MainWindow(QMainWindow):
         operation is currently in progress, checked in the same
         priority order as _on_geometry_picked's routing:
           1. An armed sketch tool (Circle, Line, etc.)
-          2. Workplane dialog revolve-axis picking
-          3. By-3-Points workplane picking
-          4. Calculator measurement mode (Dist/Len)
-          5. On-Face workplane picking
+          2. Create 3D (Extrude/Revolve)
+          3. On-Face workplane picking
+          4. By-3-Points workplane picking
+          5. Calculator measurement mode (Dist/Len)
         """
         if self._sketch_toolbar.isEnabled() and \
                 self._sketch_toolbar._active_tool is not None:
             self._sketch_toolbar._do_cancel_tool()
             return
-        if self._workplane_dialog.is_in_revolve_pick_mode():
-            self._workplane_dialog._cancel_revolve_pick()
-            self.statusBar().showMessage("Revolve cancelled.", 4000)
+        if self._create3d_mode is not None:
+            self._cancel_create3d()
+            self.statusBar().showMessage("Create 3D cancelled.", 4000)
+            return
+        if self._wp_onface_picking:
+            self._wp_onface_picking = False
+            self._wp_onface_faces = []
+            self.statusBar().showMessage("On Face cancelled.", 4000)
             return
         if self._wp3pts_picking:
             self._wp3pts_picking = False
@@ -847,21 +893,28 @@ class MainWindow(QMainWindow):
             self._measure_points = []
             self.statusBar().showMessage("Measurement cancelled.", 4000)
             return
-        if self._workplane_dialog.is_in_pick_mode():
-            self._workplane_dialog._cancel_pick_mode()
-            self.statusBar().showMessage("Face pick cancelled.", 4000)
-            return
         self.statusBar().showMessage("Nothing to cancel.", 3000)
 
     def _on_lineedit_return(self):
         """
-        Enter pressed in the shared status-bar line edit. If a number
-        was typed, queue it for whichever sketch tool needs a numeric
-        parameter next (e.g. Circle's radius) -- see
-        SketchToolBar.push_pending_float() and _retry_active_tool().
+        Enter pressed in the shared status-bar line edit.
+
+        Priority:
+          1. An armed Create 3D operation (Extrude/Revolve) -- gets the
+             RAW text, since it needs a string (part name) at some
+             stages, not just numbers. See _advance_create3d_text().
+          2. Otherwise, if a number was typed, queue it for whichever
+             sketch tool needs a numeric parameter next (e.g. Circle's
+             radius) -- see SketchToolBar.push_pending_float() and
+             _retry_active_tool().
         """
         text = self.lineEdit.text()
         self.lineEdit.clear()
+
+        if self._create3d_mode is not None:
+            self._advance_create3d_text(text)
+            return
+
         try:
             value = float(text)
         except ValueError:
@@ -904,13 +957,16 @@ class MainWindow(QMainWindow):
         window. Checking the armed tool instead sidesteps window-focus
         entirely.
 
-        Otherwise (no tool armed), targets whichever QLineEdit
-        currently has keyboard focus -- e.g. the Depth field in the
-        Workplane dialog -- so the calculator is immediately useful
-        with every existing dialog's input fields, with no per-dialog
-        wiring required. Falls back to the shared status-bar line edit
-        if nothing else has focus.
+        Otherwise (no tool/operation active), targets whichever
+        QLineEdit currently has keyboard focus -- e.g. a field in the
+        Fillet or Shell dialog -- so the calculator is immediately
+        useful with every existing dialog's input fields, with no
+        per-dialog wiring required. Falls back to the shared status-bar
+        line edit if nothing else has focus.
         """
+        if self._create3d_mode == "extrude" and self._create3d_stage == "length":
+            self._advance_create3d_text(str(value))
+            return
         if self._sketch_toolbar.isEnabled() and \
                 self._sketch_toolbar._active_tool is not None:
             self._sketch_toolbar.push_pending_float(value)
@@ -935,7 +991,6 @@ class MainWindow(QMainWindow):
 
         self._export_btn.setEnabled(True)
         self._import_btn.setEnabled(True)
-        self._create_part_btn.setEnabled(True)
         self._fillet_btn.setEnabled(True)
         self._shell_btn.setEnabled(True)
 
@@ -1016,6 +1071,12 @@ class MainWindow(QMainWindow):
         setCheckState() call below would otherwise re-trigger this
         same handler).
         """
+        wp_uid = self.tree._item_to_wp_uid.get(id(item))
+        if wp_uid is not None:
+            visible = item.checkState(0) == Qt.CheckState.Checked
+            self._on_wp_visibility_changed(wp_uid, visible)
+            return
+
         node = self.tree._item_to_node.get(id(item))
         if node is None:
             return
@@ -1082,35 +1143,36 @@ class MainWindow(QMainWindow):
 
     def _on_geometry_picked(self, raw_shape, shape_type):
         """
-        Route a viewport pick to whichever dialog/toolbar is active.
-        Priority (each handler can decline by returning/leaving
-        `consumed` False, letting the pick fall through to the next
-        one -- see WorkplaneDialog.receive_pick's self-heal for why
-        this isn't a plain if/elif chain):
-          1. Workplane dialog face-pick mode (On Face)
-          2. Workplane dialog revolve-axis-pick mode (Revolve)
+        Route a viewport pick to whichever mode/toolbar is active.
+        Priority (each handler can decline by leaving `consumed`
+        False, letting the pick fall through to the next one):
+          1. On-Face workplane creation (2 face picks)
+          2. Create 3D Revolve's axis-pick stage (2 vertex picks)
           3. By-3-Points workplane vertex-pick mode
           4. Calculator measurement mode (Dist/Len)
           5. Sketch toolbar vertex pick (intersection point snap)
           6. Fillet / Shell dialogs
           7. Position dialog positioning mode
+
+        PHASE 3 (DESIGN_BACKLOG item 33): WorkplaneDialog is retired --
+        On-Face and Revolve's picking used to route through it; both
+        are inlined here now (self-contained state on MainWindow,
+        mirroring the pattern already used for By-3-Points).
         """
         from OCP.TopAbs import TopAbs_VERTEX
 
         type_name = {TopAbs_VERTEX: "VERTEX"}.get(shape_type, str(shape_type))
         consumed = False
 
-        if self._workplane_dialog.isVisible() and \
-                self._workplane_dialog.is_in_pick_mode():
-            print(f"[route] {type_name} pick -> WorkplaneDialog.receive_pick "
-                  f"(face-pick mode)")
-            consumed = self._workplane_dialog.receive_pick(raw_shape, shape_type)
+        if self._wp_onface_picking and shape_type == TopAbs_FACE:
+            print(f"[route] {type_name} pick -> On-Face workplane")
+            self._on_wp_onface_face_picked(raw_shape)
+            consumed = True
 
-        if not consumed and self._workplane_dialog.is_in_revolve_pick_mode() \
-                and shape_type == TopAbs_VERTEX:
-            print(f"[route] {type_name} pick -> WorkplaneDialog.receive_axis_pick "
-                  f"(revolve-axis mode)")
-            self._workplane_dialog.receive_axis_pick(raw_shape)
+        if not consumed and self._create3d_mode == "revolve" and \
+                self._create3d_stage == "axis" and shape_type == TopAbs_VERTEX:
+            print(f"[route] {type_name} pick -> Create3D Revolve axis")
+            self._on_create3d_vertex_picked(raw_shape)
             consumed = True
 
         if not consumed and self._wp3pts_picking and shape_type == TopAbs_VERTEX:
@@ -1152,27 +1214,151 @@ class MainWindow(QMainWindow):
 
         if not consumed:
             print(f"[route] {type_name} pick matched no active handler -- "
-                  f"workplane_dialog visible={self._workplane_dialog.isVisible()} "
-                  f"pick_mode={self._workplane_dialog.is_in_pick_mode()} "
+                  f"wp_onface_picking={self._wp_onface_picking} "
+                  f"create3d_mode={self._create3d_mode} "
                   f"sketch_toolbar enabled={self._sketch_toolbar.isEnabled()}")
 
     # -----------------------------------------------------------------------
-    # Workplane menu handlers (PHASE 2 of the UI revision, DESIGN_BACKLOG
-    # item 33). "On Face..." reuses the existing _on_create_part_clicked
-    # flow unchanged. The two below are new.
+    # Workplane menu handlers (PHASE 3 of the UI revision, DESIGN_BACKLOG
+    # item 33). WorkplaneDialog is retired -- all three creation routes
+    # now register a persistent workplane (tree WP section) instead of
+    # opening a dialog, and none of them auto-activate it: per spec, a
+    # workplane must be explicitly marked Active via RMB before Create 3D
+    # or the sketch toolbar will operate on it.
     # -----------------------------------------------------------------------
+
+    def _register_new_workplane(self, wp):
+        """
+        Shared registration path for all three workplane-creation
+        routes: assigns a uid ("wp1", "wp2", ...), displays its border,
+        and adds it to the tree's WP section. Does NOT activate it --
+        the user marks a workplane Active via RMB in the tree.
+        """
+        self._wp_counter += 1
+        uid = f"wp{self._wp_counter}"
+        self._workplanes[uid] = {"wp": wp, "border_ais": None, "visible": True}
+        self._display_workplane_border(uid)
+        self.tree.add_workplane_item(uid, uid)
+        return uid
+
+    def _display_workplane_border(self, uid):
+        """
+        Show a workplane as a semi-transparent green border face plus
+        pink U/V crosshair lines (CoCreate style) -- ported from the
+        retired WorkplaneDialog._display_workplane(), now per-uid so
+        multiple workplanes can be displayed at once.
+        """
+        entry = self._workplanes.get(uid)
+        if entry is None:
+            return
+        wp = entry["wp"]
+        border = wp.border
+        if border is None:
+            return
+
+        from OCP.AIS import AIS_Shape, AIS_DisplayMode
+        from OCP.Quantity import Quantity_Color, Quantity_TypeOfColor
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+        from OCP.GC import GC_MakeSegment
+        from OCP.gp import gp_Pnt
+
+        wp_color = Quantity_Color(0.3, 0.75, 0.4,
+                                  Quantity_TypeOfColor.Quantity_TOC_RGB)
+        axis_color = Quantity_Color(0.85, 0.2, 0.55,
+                                    Quantity_TypeOfColor.Quantity_TOC_RGB)
+        ctx = self.viewport.context
+
+        ais_border = AIS_Shape(border)
+        ais_border.SetColor(wp_color)
+        ais_border.SetDisplayMode(AIS_DisplayMode.AIS_Shaded)
+        ais_border.SetTransparency(0.5)
+        ctx.Display(ais_border, False)
+        ctx.Deactivate(ais_border)
+
+        size = wp.size
+
+        def make_axis_line(p1_2d, p2_2d):
+            p1 = gp_Pnt(p1_2d[0], p1_2d[1], 0).Transformed(wp.Trsf)
+            p2 = gp_Pnt(p2_2d[0], p2_2d[1], 0).Transformed(wp.Trsf)
+            edge = BRepBuilderAPI_MakeEdge(
+                GC_MakeSegment(p1, p2).Value()).Edge()
+            ais = AIS_Shape(edge)
+            ais.SetColor(axis_color)
+            ais.SetWidth(1.5)
+            return ais
+
+        ais_u = make_axis_line((-size, 0), (size, 0))
+        ais_v = make_axis_line((0, -size), (0, size))
+        for ais_line in (ais_u, ais_v):
+            ctx.Display(ais_line, False)
+            ctx.Deactivate(ais_line)
+
+        ctx.UpdateCurrentViewer()
+        self.viewport.update()
+        entry["border_ais"] = [ais_border, ais_u, ais_v]
+
+    def _erase_workplane_border(self, uid):
+        entry = self._workplanes.get(uid)
+        if entry is None or entry["border_ais"] is None:
+            return
+        ctx = self.viewport.context
+        for ais in entry["border_ais"]:
+            ctx.Erase(ais, False)
+        ctx.UpdateCurrentViewer()
+        self.viewport.update()
+        entry["border_ais"] = None
 
     def _on_workplane_at_origin(self):
         """Default workplane located in the X-Y plane at the origin."""
         if self._assembly is None:
             return
         wp = WorkPlane(size=80)
-        self._workplane_dialog.show()
-        self._workplane_dialog.raise_()
-        self._workplane_dialog.set_active_part(self.tree.get_active_part())
-        self._workplane_dialog.set_workplane(wp)
+        uid = self._register_new_workplane(wp)
         self.statusBar().showMessage(
-            "Workplane created at origin, XY plane.", 4000)
+            f"Workplane '{uid}' created at origin, XY plane. "
+            f"Right-click it in the tree and choose Set Active to use it.",
+            6000)
+
+    def _on_workplane_on_face(self):
+        """
+        Arm On-Face picking: 2 face picks, matching KodaCAD's wpOnFace
+        -- the first sets the workplane's plane, the second sets the U
+        direction. Pure status-bar flow now (PHASE 3) -- was the last
+        remaining use of WorkplaneDialog's Step 1, now inlined here.
+        """
+        if self._assembly is None:
+            return
+        self._wp_onface_picking = True
+        self._wp_onface_faces = []
+        from OCP.AIS import AIS_Shape
+        ctx = self.viewport.context
+        for ais in self.viewport._ais_shapes:
+            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_FACE))
+        ctx.UpdateCurrentViewer()
+        self.statusBar().showMessage(
+            "On Face: click a face to set the workplane's plane.")
+
+    def _on_wp_onface_face_picked(self, raw_shape):
+        self._wp_onface_faces.append(raw_shape)
+        if len(self._wp_onface_faces) == 1:
+            self.statusBar().showMessage(
+                "On Face: now click a second face to set the U direction.")
+            return
+
+        face_w, face_u = self._wp_onface_faces
+        self._wp_onface_picking = False
+        self._wp_onface_faces = []
+        try:
+            wp = WorkPlane(size=80, face=face_w, faceU=face_u)
+        except Exception as e:
+            self.statusBar().showMessage(
+                f"Could not create a workplane from those two faces: {e}",
+                6000)
+            return
+        uid = self._register_new_workplane(wp)
+        self.statusBar().showMessage(
+            f"Workplane '{uid}' created on face. Right-click it in the "
+            f"tree and choose Set Active to use it.", 6000)
 
     def _on_workplane_by_3pts(self):
         """
@@ -1231,11 +1417,214 @@ class MainWindow(QMainWindow):
                 f"(are they collinear?): {e}", 6000)
             return
 
-        self._workplane_dialog.show()
-        self._workplane_dialog.raise_()
-        self._workplane_dialog.set_active_part(self.tree.get_active_part())
-        self._workplane_dialog.set_workplane(wp)
-        self.statusBar().showMessage("Workplane created by 3 points.", 4000)
+        uid = self._register_new_workplane(wp)
+        self.statusBar().showMessage(
+            f"Workplane '{uid}' created by 3 points. Right-click it in "
+            f"the tree and choose Set Active to use it.", 6000)
+
+    # -----------------------------------------------------------------------
+    # Tree "WP" section signal handlers (PHASE 3, DESIGN_BACKLOG item 33)
+    # -----------------------------------------------------------------------
+
+    def _on_wp_visibility_changed(self, uid, visible):
+        entry = self._workplanes.get(uid)
+        if entry is None:
+            return
+        entry["visible"] = visible
+        ctx = self.viewport.context
+        if entry["border_ais"] is not None:
+            for ais in entry["border_ais"]:
+                if visible:
+                    ctx.Display(ais, False)
+                else:
+                    ctx.Erase(ais, False)
+        # If this is the active workplane, its live sketch AIS
+        # (construction lines / profile / markers) follow too.
+        if uid == self._active_wp_uid() and self._sketch_toolbar.isEnabled():
+            for ais, _ in list(self._sketch_toolbar._sketch_ais):
+                ctx.Display(ais, False) if visible else ctx.Erase(ais, False)
+            for ais in list(self._sketch_toolbar._isect_ais):
+                ctx.Display(ais, False) if visible else ctx.Erase(ais, False)
+        ctx.UpdateCurrentViewer()
+        self.viewport.update()
+
+    def _active_wp_uid(self):
+        return self.tree.get_active_workplane_uid()
+
+    def _on_wp_set_active_requested(self, uid):
+        entry = self._workplanes.get(uid)
+        if entry is None:
+            return
+        # Deactivate whatever was active before (erases ITS live
+        # construction-line/profile/marker AIS -- the underlying
+        # WorkPlane data is untouched and will redisplay correctly if
+        # reactivated later, since set_workplane() now also calls
+        # _redisplay_profile()).
+        if self._sketch_toolbar.isEnabled():
+            self._sketch_toolbar.deactivate()
+        self.tree.set_active_workplane(uid)
+        self._sketch_toolbar.set_workplane(entry["wp"], self.viewport)
+        self.statusBar().showMessage(f"'{uid}' is now the active workplane.", 4000)
+
+    def _on_wp_clear_active_requested(self):
+        if self._sketch_toolbar.isEnabled():
+            self._sketch_toolbar.deactivate()
+        self.tree.set_active_workplane(None)
+        self.statusBar().showMessage("No active workplane.", 4000)
+
+    def _on_wp_delete_requested(self, uid):
+        entry = self._workplanes.get(uid)
+        if entry is None:
+            return
+        if uid == self._active_wp_uid() and self._sketch_toolbar.isEnabled():
+            self._sketch_toolbar.deactivate()
+        self._erase_workplane_border(uid)
+        del self._workplanes[uid]
+        self.tree.remove_workplane_item(uid)
+        self.statusBar().showMessage(f"Workplane '{uid}' deleted.", 4000)
+
+    # -----------------------------------------------------------------------
+    # Create 3D: Extrude / Revolve (PHASE 3, DESIGN_BACKLOG item 33).
+    # Pure menu + status-bar flow, matching KodaCAD's extrude()/revolve()
+    # exactly -- no dialog. Both operate on whichever workplane is
+    # currently marked Active in the tree's WP section.
+    # -----------------------------------------------------------------------
+
+    def _active_workplane(self):
+        """Return the active WorkPlane instance, or None."""
+        uid = self._active_wp_uid()
+        if uid is None:
+            return None
+        entry = self._workplanes.get(uid)
+        return entry["wp"] if entry else None
+
+    def _on_create3d_extrude(self):
+        wp = self._active_workplane()
+        if wp is None:
+            self.statusBar().showMessage(
+                "No active workplane. Right-click one in the tree and "
+                "choose Set Active first.", 6000)
+            return
+        if not wp.edgeList:
+            self.statusBar().showMessage(
+                "The active workplane has no sketch profile yet.", 6000)
+            return
+        self._create3d_mode = "extrude"
+        self._create3d_stage = "length"
+        self._create3d_length = None
+        self.currOpLabel.setText("Current Operation: extrude")
+        self.statusBar().showMessage(
+            "Enter extrusion length, then enter part name.")
+        self.lineEdit.setFocus()
+
+    def _on_create3d_revolve(self):
+        wp = self._active_workplane()
+        if wp is None:
+            self.statusBar().showMessage(
+                "No active workplane. Right-click one in the tree and "
+                "choose Set Active first.", 6000)
+            return
+        if not wp.edgeList:
+            self.statusBar().showMessage(
+                "The active workplane has no sketch profile yet.", 6000)
+            return
+        if self._sketch_toolbar._active_tool is not None:
+            self._sketch_toolbar._do_cancel_tool()
+        self._create3d_mode = "revolve"
+        self._create3d_stage = "axis"
+        self._create3d_points = []
+        self.currOpLabel.setText("Current Operation: revolve")
+        from OCP.AIS import AIS_Shape
+        ctx = self.viewport.context
+        for ais in self.viewport._ais_shapes:
+            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_VERTEX))
+        ctx.UpdateCurrentViewer()
+        self.statusBar().showMessage("Pick two points on revolve axis.")
+
+    def _on_create3d_vertex_picked(self, raw_shape):
+        """Revolve's axis picks (2 points), while _create3d_stage == 'axis'."""
+        from OCP.BRep import BRep_Tool
+        from OCP.TopoDS import TopoDS
+        try:
+            vertex = TopoDS.Vertex_s(raw_shape)
+            pnt = BRep_Tool.Pnt_s(vertex)
+        except Exception as e:
+            print(f"[Revolve] Could not resolve picked vertex: {e}")
+            return
+        self._create3d_points.append(pnt)
+        if len(self._create3d_points) == 1:
+            self.statusBar().showMessage("Select 2nd point on revolve axis.")
+        elif len(self._create3d_points) == 2:
+            self._create3d_stage = "name"
+            self.statusBar().showMessage("Enter part name.")
+            self.lineEdit.setFocus()
+
+    def _advance_create3d_text(self, text):
+        """
+        Called from _on_lineedit_return when a Create 3D operation is
+        armed -- routes a typed Enter to the right stage. Extrude:
+        length (float) then name (string). Revolve: name (string) only,
+        after the 2 axis picks are already done.
+        """
+        if self._create3d_mode == "extrude":
+            if self._create3d_stage == "length":
+                try:
+                    length = float(text)
+                except ValueError:
+                    self.statusBar().showMessage(
+                        "Invalid length -- enter a number.", 4000)
+                    return
+                if length <= 0:
+                    self.statusBar().showMessage(
+                        "Length must be positive.", 4000)
+                    return
+                self._create3d_length = length
+                self._create3d_stage = "name"
+                self.statusBar().showMessage("Enter part name.")
+                return
+            if self._create3d_stage == "name":
+                self._finish_create3d_extrude(text.strip() or "new_part")
+                return
+
+        if self._create3d_mode == "revolve" and self._create3d_stage == "name":
+            self._finish_create3d_revolve(text.strip() or "new_part")
+
+    def _finish_create3d_extrude(self, name):
+        wp = self._active_workplane()
+        try:
+            node = solid_ops.extrude(wp, self._create3d_length, name)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f"Extrude failed: {e}", 8000)
+            self._cancel_create3d()
+            return
+        self._on_part_created(node)
+        self._cancel_create3d()
+        self.statusBar().showMessage(f"Part '{name}' created.", 4000)
+
+    def _finish_create3d_revolve(self, name):
+        wp = self._active_workplane()
+        p1, p2 = self._create3d_points
+        try:
+            node = solid_ops.revolve(wp, p1, p2, name)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f"Revolve failed: {e}", 8000)
+            self._cancel_create3d()
+            return
+        self._on_part_created(node)
+        self._cancel_create3d()
+        self.statusBar().showMessage(f"Part '{name}' created.", 4000)
+
+    def _cancel_create3d(self):
+        self._create3d_mode = None
+        self._create3d_stage = None
+        self._create3d_length = None
+        self._create3d_points = []
+        self.currOpLabel.setText("Current Operation: None")
+
 
     # -----------------------------------------------------------------------
     # Calculator measurement (PHASE 2 follow-up, DESIGN_BACKLOG item 33).
@@ -1431,17 +1820,6 @@ class MainWindow(QMainWindow):
         """Shell complete -- same replace-in-place pattern as fillet/cut.
         NOTE: Makes the modified instance an independent copy. See item 26."""
         self._apply_shape_to_node(node, new_shape, operation="shell")
-
-    def _on_create_part_clicked(self):
-        """Open the Workplane/Create Part dialog."""
-        if self._assembly is None:
-            return
-        self._workplane_dialog.show()
-        self._workplane_dialog.raise_()
-        # Sync the current active part in case it was set before dialog opened
-        self._workplane_dialog.set_active_part(self.tree.get_active_part())
-        # Auto-enter pick mode so user can click a face immediately
-        self._workplane_dialog.enter_pick_mode()
 
     def _on_part_created(self, new_node):
         """
@@ -1783,10 +2161,6 @@ class MainWindow(QMainWindow):
             else:
                 self._active_part_overlay_ais = None
                 print(f"Active part: '{node.label}' (no AIS shape found).")
-
-        # Notify the workplane dialog
-        if hasattr(self, '_workplane_dialog'):
-            self._workplane_dialog.set_active_part(node)
 
     def _suspend_active_part_overlay(self):
         """

@@ -3,8 +3,11 @@ sketch_toolbar.py
 
 THE SKETCH TOOLBAR -- 2D drawing tools for the active workplane.
 
-Lives inside WorkplaneDialog. Activated after a workplane face is picked.
-Each button calls a WorkPlane method (src/workplane.py) and displays the
+Lives on MainWindow as a persistent QToolBar (PHASE 2, DESIGN_BACKLOG
+item 33). Follows whichever workplane is currently marked Active in
+the tree's WP section (PHASE 3) -- activated via set_workplane(),
+called by MainWindow's _on_wp_set_active_requested(). Each button
+calls a WorkPlane method (src/workplane.py) and displays the
 resulting geometry as AIS objects in the 3D viewport.
 
 TOOLS:
@@ -151,6 +154,15 @@ class SketchToolBar(QToolBar):
         showing," since that overlay and the active part's own vertex
         selection were directly competing with the sketch's
         intersection markers when a workplane sits on that same part.
+
+        PHASE 3 (DESIGN_BACKLOG item 33): workplanes now persist (a
+        "WP" tree section, KodaCAD-style) and can be RE-activated after
+        already having sketch content from an earlier session -- so
+        this also redisplays any existing profile edges via
+        _redisplay_profile(), not just construction lines. Previously
+        this was a non-issue since a workplane was thrown away the
+        moment its dialog closed, so set_workplane() was only ever
+        called on a brand-new, empty WorkPlane.
         """
         self._workplane = workplane
         self._viewport = viewport
@@ -160,6 +172,7 @@ class SketchToolBar(QToolBar):
         self._pending_floats = []
         self.setEnabled(True)
         self._display_clines()
+        self._redisplay_profile()
         win = self.window()
         if hasattr(win, "_suspend_active_part_overlay"):
             win._suspend_active_part_overlay()

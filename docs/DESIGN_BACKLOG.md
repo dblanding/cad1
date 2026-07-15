@@ -2774,3 +2774,165 @@ p1 as origin, p1->p2 as direction -- was chosen to match what
 `gp_Ax1` needs directly, differs slightly from KodaCAD's identical
 `p1, p2 = win.ptStack.pop(), win.ptStack.pop()` pop order but should
 produce the same result).
+
+## 35. Phase 3B: Clean Break From WorkplaneDialog -- Persistent Workplanes + Pure Menu/Status-Bar Create 3D
+
+**Status: COMPLETE (not yet tested against a running Qt/OCCT display).**
+
+### Scope
+
+Full rewrite requested to match KodaCAD's actual architecture exactly,
+not just its look: workplanes become persistent, listed objects (a
+"WP" tree section, KodaCAD-style) created independently of any
+part-creation operation, with their own show/hide and RMB Set-Active/
+Delete -- rather than a workplane living and dying inside a dialog.
+Extrude and Revolve become pure menu + status-bar flows with no
+dialog at all, operating on whichever workplane is currently Active.
+
+**`WorkplaneDialog` (gui/workplane_dialog.py) is retired.** The file
+is left on disk but nothing imports it anymore -- safe to delete.
+
+### New files
+
+**`gui/solid_ops.py`** -- `extrude(wp, depth, name)`, `revolve(wp, p1,
+p2, name, angle_deg=360.0)`, and `register_raw_shape()` (the STEP
+round-trip for XDE registration), extracted from
+`WorkplaneDialog._extrude()`/`_revolve()`/`_register_raw_shape()` as
+plain functions with no dialog/`self` involved, callable directly from
+menu actions.
+
+### `gui/assembly_tree_widget.py` -- persistent "WP" section
+
+- New always-present top-level `self._wp_root_item` ("WP"), inserted
+  before the assembly root (matching KodaCAD's WP-then-3D ordering).
+  Deliberately kept SEPARATE from `_item_to_node`'s build123d-node
+  machinery -- workplanes are plain `WorkPlane` objects (not build123d
+  nodes) with their own show/hide + RMB semantics (Set Active/Delete,
+  not "Set Active Assembly"/"Set Active Part").
+- New public API: `add_workplane_item(uid, label)`,
+  `remove_workplane_item(uid)`, `set_active_workplane(uid)`,
+  `get_active_workplane_uid()`.
+- New signals: `workplane_set_active_requested(uid)`,
+  `workplane_clear_active_requested()`, `workplane_delete_requested(uid)`.
+  (`workplane_visibility_changed` is declared but unused directly --
+  checkbox toggling is handled inline in `main_app.py`'s
+  `_on_tree_item_changed`, mirroring how regular node checkboxes
+  already work via Qt's built-in `itemChanged` rather than a custom
+  signal.)
+- `_show_context_menu` now checks for a WP item first (RMB: Set
+  Active / Clear Active if already active / Delete) before falling
+  through to the existing build123d-node menu logic.
+- Fixed two latent bugs this surfaced: `add_node_to_tree`'s
+  parent-fallback used `self.topLevelItem(0)`, which was safe when the
+  assembly root was always index 0 -- now that "WP" occupies index 0,
+  this would have silently added new parts under the WP section.
+  Replaced both fallback sites with an explicit `self._assembly_root_item`
+  reference, set once in `load_assembly_into_tree`.
+
+### `gui/sketch_toolbar.py`
+
+- `set_workplane()` now also calls `_redisplay_profile()`, not just
+  `_display_clines()`. Previously a non-issue -- a workplane was
+  thrown away the moment its dialog closed, so `set_workplane()` was
+  only ever called on a brand-new, empty `WorkPlane`. Now that
+  workplanes persist and can be RE-activated after already having
+  profile geometry from an earlier session, the profile needs
+  explicit redisplay too, or switching back to a previously-sketched
+  workplane would show its construction lines but not its actual
+  profile.
+
+### `gui/main_app.py` -- the bulk of the change
+
+**Removed:** the `WorkplaneDialog` import/instantiation, the old
+"⊞ Workplane..." side-panel button, `_on_create_part_clicked`, and
+every reference to `self._workplane_dialog`.
+
+**Added -- persistent workplane registry:**
+`self._workplanes` (uid -> `{"wp", "border_ais", "visible"}`),
+`_register_new_workplane(wp)` (assigns "wp1"/"wp2"/... , displays
+border, adds tree row -- does NOT auto-activate, per spec), plus
+`_display_workplane_border(uid)` / `_erase_workplane_border(uid)`
+(ported from the retired dialog's `_display_workplane()`/
+`_erase_workplane()`, now per-uid so multiple workplanes can be shown
+at once). Tree signal handlers: `_on_wp_visibility_changed` (also
+toggles the active workplane's live sketch AIS if it's the one being
+shown/hidden), `_on_wp_set_active_requested` (deactivates whatever was
+previously active, erasing its live construction/profile/marker AIS
+-- the underlying `WorkPlane` DATA is untouched and redisplays
+correctly if reactivated later, per the `sketch_toolbar.py` fix
+above), `_on_wp_clear_active_requested`, `_on_wp_delete_requested`.
+
+**Rewired workplane creation:** `_on_workplane_at_origin` and
+`_finish_workplane_by_3pts` now call `_register_new_workplane()`
+instead of opening a dialog. **New `_on_workplane_on_face()`** --
+On Face's 2-face pick (plane, then U direction) is now a pure
+status-bar flow inlined here (mirrors the existing By-3-Points
+pattern), replacing the dialog's Step 1.
+
+**New Create 3D (Extrude/Revolve), matching the exact spec given:**
+- `_on_create3d_extrude()`: checks for an active workplane with a
+  profile, arms `_create3d_mode="extrude"`/`_create3d_stage="length"`,
+  status bar shows "Enter extrusion length, then enter part name."
+- `_on_create3d_revolve()`: same active-workplane check, arms
+  `_create3d_mode="revolve"`/`_create3d_stage="axis"`, activates
+  vertex picking, status bar shows "Pick two points on revolve axis."
+- `_on_create3d_vertex_picked()`: collects revolve's 2 axis points,
+  then advances to `_create3d_stage="name"` ("Select 2nd point..."
+  then "Enter part name.").
+- `_advance_create3d_text()`: called from `_on_lineedit_return` with
+  the RAW typed text (not pre-parsed as a float, since a part name is
+  a string) -- routes by `_create3d_mode`/`_create3d_stage`.
+- `_finish_create3d_extrude()` / `_finish_create3d_revolve()`: call
+  `solid_ops.extrude()`/`solid_ops.revolve()` directly, then
+  `_on_part_created(node)` (called as a plain method now, not via a
+  dialog's Qt signal -- there's no separate dialog object to emit one).
+- `_cancel_create3d()`, wired into `_on_end_operation`.
+
+**Menu bar restructured to match KodaCAD's exactly:** File / Workplane
+/ Create 3D / Modify Active Part / Position / Utility (Position isn't
+a KodaCAD menu -- BasiCAD-specific, placed after Modify Active Part so
+the first four match KodaCAD's order precisely). The old "Create"
+menu (which only ever held the mega-dialog item) is gone.
+
+**Routing (`_on_geometry_picked`, `_on_end_operation`):** rewritten
+--  On-Face and Revolve-axis picking are now inline branches (mirroring
+the existing By-3-Points pattern) instead of reaching into a dialog.
+
+### Scope decisions -- flagging explicitly, not implemented this round
+
+- **Cut Into Active Part / Add To Active Part** (boolean cut/fuse of
+  an extrusion into an existing part) existed in the old dialog but
+  wasn't part of the Extrude/Revolve spec given, and conceptually
+  belongs under KodaCAD's separate "Modify Active Part" menu (which
+  currently only holds Fillet/Shell) rather than "Create 3D". Not
+  ported this round -- flagging in case it's wanted back, likely as a
+  future Modify Active Part menu item with its own active-part-pick
+  design, matching KodaCAD's approach rather than reusing the old
+  dialog's version.
+- **Revolve angle** is hardcoded to a full 360° in the menu flow --
+  `solid_ops.revolve()`'s `angle_deg` parameter supports a partial
+  angle, just not exposed in the UI yet (KodaCAD's own revolve() menu
+  flow doesn't prompt for one either, so this matches).
+- **Workplane geometry visibility while inactive**: only the border
+  (green translucent rectangle + U/V crosshairs) stays visible for an
+  inactive-but-shown workplane; construction lines, intersection
+  markers, and profile edges are only shown for the currently ACTIVE
+  workplane (erased when a different one is activated, redisplayed via
+  the `sketch_toolbar.py` fix above if reactivated). This keeps
+  multiple simultaneously-visible workplanes from cluttering the
+  viewport with full sketch detail, at the cost of not literally
+  showing every workplane's complete sketch content at once. Flagging
+  as a design choice, not confirmed against the reference images.
+- **`gui/workplane_dialog.py`** is left on disk, unused. Safe to
+  delete -- nothing imports it anymore.
+
+### Not yet tested against a running Qt/OCCT display
+
+This is the largest change of the whole revision -- please
+smoke-test thoroughly: create workplanes via all 3 routes (none
+should auto-activate), confirm the WP tree section's checkboxes and
+RMB menu (Set Active / Clear Active / Delete) work, confirm switching
+the active workplane properly hides the old one's sketch and shows
+the new one's (including redisplaying an existing profile if
+reactivating one you'd already sketched on), and run through the
+exact Extrude and Revolve sequences from the spec end to end.
