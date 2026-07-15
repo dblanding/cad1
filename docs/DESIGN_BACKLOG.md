@@ -2979,3 +2979,159 @@ the sequence that triggers it: use Dist or Len once (even without
 completing it), then try any sketch tool afterward -- it should now
 work immediately, and clicking Dist/Len should show up in the Current
 Operation label so it's never silently active again.
+
+## 36. Phase 3B follow-up: FilletDialog retired, Mill/Pull (boss/pocket) added
+
+Reported during the bottle tutorial: no way to add a boss (the neck)
+to an existing part -- Cut/Add into Active Part was intentionally
+dropped in item 35's scope decisions, and turned out to be needed
+immediately. Separately: FilletDialog's own radius field wasn't wired
+to the shared status-bar line edit or the calculator at all (it's a
+totally separate `QLineEdit`), so the ONLY way to enter a radius was
+clicking the dialog's own Apply button -- and the dialog also got in
+the way generally. Direct request: retire it, same treatment as
+Extrude/Revolve.
+
+### Investigated KodaCAD's mill()/pull()/fillet() first
+
+All three are pure status-bar flows in KodaCAD, none use a dialog:
+- **mill()**: cuts the active workplane's profile INTO the active
+  part (extrude in -w, `BRepAlgoAPI_Cut`). Prompts "Enter milling
+  depth" if `lineEditStack` is empty, else completes immediately.
+- **pull()**: fuses the profile ONTO the active part (extrude in +w,
+  `BRepAlgoAPI_Fuse`). Same pattern, "Enter pull distance."
+- **fillet()**: accumulates any number of picked edges
+  (`win.edgeStack`) before a radius is typed; once both a radius AND
+  at least one edge exist, applies to all of them at once and ends
+  (`win.clearCallback()` -- non-sticky, unlike the sketch tools).
+
+### `gui/solid_ops.py` -- three new functions
+
+- **`cut_active_part(wp, work_shape, depth)`** / **`pull_active_part(wp,
+  work_shape, length)`** -- mirror KodaCAD's mill()/pull() exactly,
+  same structure as the existing `extrude()`/`revolve()`. Return a raw
+  `TopoDS_Shape` (these MODIFY an existing node, unlike Extrude/Revolve
+  which create a new one -- so no XDE re-registration needed; the
+  existing `_apply_shape_to_node()` in main_app.py already handles
+  assigning a raw shape straight to `node._wrapped`).
+- **`apply_fillet(work_shape, picked_edges, radius)`** -- ported
+  verbatim from the retired `FilletDialog._apply_fillet()`, including
+  the midpoint-distance edge-matching step: edges picked from the
+  viewport's AIS display are different C++ objects than the edges
+  actually in `work_shape` (post-STEP-round-trip), so
+  `BRepFilletAPI_MakeFillet` needs each picked edge matched to its
+  counterpart in `work_shape` by midpoint distance (1mm tolerance)
+  before being added -- this detail would have been easy to lose in a
+  naive reimplementation.
+
+### `gui/main_app.py`
+
+**FilletDialog fully retired** -- import, instantiation, `fillet_done`
+signal wiring, and all `self._fillet_dialog` references removed. The
+side-panel "Fillet" button (previously wired to the dialog-opening
+`_on_fillet_clicked`) now points directly at the new
+`_on_modify_fillet`.
+
+**New Fillet flow** (`_on_modify_fillet` / `_on_fillet_edge_picked` /
+`_advance_fillet_text` / `_cancel_fillet`): arms `TopAbs_EDGE`
+selection on the active part, accumulates any number of edge picks
+(status bar shows a running count), then a typed/calculator radius
+applies the fillet to all accumulated edges at once via
+`solid_ops.apply_fillet()` + `_apply_shape_to_node()`. Non-sticky,
+matching KodaCAD -- ends after applying rather than staying armed for
+another batch.
+
+**New Mill/Pull flow** (`_on_modify_mill` / `_on_modify_pull` /
+shared `_start_modify()` / `_advance_modify_text()` /
+`_cancel_modify()`): requires both an active PART (tree RMB) and an
+active WORKPLANE with a sketch profile; prompts for depth/length,
+typed or from the calculator, then calls
+`solid_ops.cut_active_part()`/`pull_active_part()` +
+`_apply_shape_to_node()`.
+
+**Menu bar**: "Modify Active Part" now has Fillet / Mill (Cut) / Pull
+(Boss) / Shell... (Shell is unchanged -- still a dialog, see below).
+
+**Routing (`_on_geometry_picked`, `_on_lineedit_return`,
+`valueFromCalc`, `_on_end_operation`)**: all four updated with Fillet
+and Modify's priority slots, in the same pattern as every other
+operation type. **`_cancel_other_operations()`** (item 33's follow-up
+fix for the stuck-measurement-mode bug) extended to cover `"modify"`
+and `"fillet"` too, so this pair can't strand any of the others the
+same way, symmetric with everything else.
+
+### Deferred, flagged again
+
+**`ShellDialog` was NOT converted this round** -- out of scope for
+what was reported, but very likely has the exact same
+disconnected-QLineEdit problem FilletDialog had, since it's built the
+same way. Flagging clearly: if Shell gives the same "can't type a
+value" trouble, that's expected, not a new bug -- same fix pattern
+(pure status-bar flow, no dialog) would apply.
+
+**Not yet tested against a running Qt/OCCT display.** Please retry
+the exact sequence that was blocked: place a workplane on the
+existing part, sketch the neck's circle, Pull (or the neck might need
+Mill first depending on the tutorial's actual geometry) to attach it
+to the active part. Also worth confirming Fillet's multi-edge
+accumulation and the edge-matching tolerance hold up on the bottle's
+actual edge geometry.
+
+## 37. Phase 3B follow-up: ShellDialog retired too, for consistency
+
+Requested: retire ShellDialog the same way FilletDialog was, for
+consistency -- it's built the same way (its own disconnected
+`QLineEdit`) and would have hit the identical problem. Confirmed
+KodaCAD's `shell()` first: same structure as `fillet()` -- accumulate
+any number of picked faces, then a typed thickness applies once and
+ends (non-sticky).
+
+**Position dialog is explicitly staying as-is** -- no KodaCAD
+reference to model it on, being evaluated on its own merits for now.
+This is the last BasiCAD-native dialog remaining, and that's by
+deliberate choice, not an oversight.
+
+### `gui/solid_ops.py`
+
+**`apply_shell(active_part_node, picked_faces, thickness)`** -- ported
+verbatim from the retired `ShellDialog._apply_shell()`, including the
+face-center-of-mass matching (same STEP-round-trip issue as Fillet's
+edge matching, just for faces instead of edges). Takes the build123d
+NODE rather than a raw shape (unlike `cut_active_part()`/
+`pull_active_part()`) because the matching needs both the node's local
+shape (passed to `MakeThickSolid`) and its world-space transform, for
+accurate center-of-mass comparison against the picked (world-space)
+faces.
+
+### `gui/main_app.py`
+
+**ShellDialog fully retired** -- import, instantiation, `shell_done`
+signal wiring, and all `self._shell_dialog` references removed. The
+side-panel "Shell" button now points directly at the new
+`_on_modify_shell`.
+
+**New Shell flow** (`_on_modify_shell` / `_on_shell_face_picked` /
+`_advance_shell_text` / `_cancel_shell`) -- structurally identical to
+Fillet's: arms `TopAbs_FACE` selection on the active part, accumulates
+any number of face picks, a typed/calculator thickness applies to all
+of them via `solid_ops.apply_shell()` + `_apply_shape_to_node()`.
+Non-sticky, matching KodaCAD.
+
+**Menu bar**: "Modify Active Part" is now Fillet / Mill (Cut) / Pull
+(Boss) / Shell -- all four pure status-bar actions, no dialogs left
+in this menu at all.
+
+**Wired into the same shared infrastructure as everything else**:
+`_cancel_other_operations()` (now covers `"shell"` too, so it can't
+strand or be stranded by any of the other six operation types),
+`_on_geometry_picked`, `_on_lineedit_return`, `valueFromCalc`,
+`_on_end_operation` -- all updated with Shell's priority slot,
+following the exact same pattern as Fillet before it.
+
+### Current dialog inventory
+
+Only **`PositionDialog`** remains. Every other former dialog
+(Workplane/Sketch/Extrude, Fillet, Shell) has been replaced by pure
+menu + status-bar flows across items 33/35/36/37.
+
+**Not yet tested against a running Qt/OCCT display.**

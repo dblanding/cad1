@@ -29,11 +29,17 @@ ARCHITECTURE:
     |    operate on whichever workplane is currently active.
     |- SketchToolBar         (sketch_toolbar.py)       -- follows the tree's
     |                            active workplane, not a dialog
-    |- solid_ops.py          -- standalone extrude()/revolve() functions,
-    |                            called directly by Create 3D menu actions
-    |- FilletDialog          (fillet_dialog.py)      -- Fillet workflow
-    |- ShellDialog           (shell_dialog.py)       -- Shell workflow
-    +- PositionDialog        (position_dialog.py)    -- Mate/Align workflow
+    |- solid_ops.py          -- standalone extrude()/revolve()/cut_active_part()/
+    |                            pull_active_part()/apply_fillet()/apply_shell()
+    |                            functions, called directly by Create 3D /
+    |                            Modify Active Part menu actions (PHASE 3B,
+    |                            DESIGN_BACKLOG item 33 -- FilletDialog and
+    |                            ShellDialog both retired, same pure menu +
+    |                            status-bar treatment as Extrude/Revolve)
+    +- PositionDialog        (position_dialog.py)    -- Mate/Align workflow.
+                                 Deliberately staying a dialog -- no prior
+                                 KodaCAD experience to model it on, being
+                                 evaluated as-is for now.
 
 TWO-WAY SYNC (tree and viewport):
   Click part in viewport  -> viewport emits part_selected(node)
@@ -98,8 +104,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 from assembly_viewer import OcctViewportWidget  # noqa: E402
 from assembly_tree_widget import AssemblyTreeWidget  # noqa: E402
 from position_dialog import PositionDialog  # noqa: E402
-from fillet_dialog import FilletDialog  # noqa: E402
-from shell_dialog import ShellDialog  # noqa: E402
 from rpn_calculator import Calculator  # noqa: E402
 from sketch_toolbar import SketchToolBar  # noqa: E402
 import solid_ops  # noqa: E402
@@ -622,20 +626,22 @@ class MainWindow(QMainWindow):
         # Extrude/Revolve are purely the Create 3D menu, both driven by
         # the status bar, KodaCAD-style. See _build_menu_bar().
 
-        self._fillet_btn = QPushButton("⌀  Fillet...")
+        self._fillet_btn = QPushButton("⌀  Fillet")
         self._fillet_btn.setEnabled(False)
         self._fillet_btn.setToolTip(
-            "Select edges on the active part and apply a fillet (blend)."
+            "Pick edge(s) on the active part, then enter a radius in "
+            "the status bar (or send one from the calculator)."
         )
-        self._fillet_btn.clicked.connect(self._on_fillet_clicked)
+        self._fillet_btn.clicked.connect(self._on_modify_fillet)
         tree_layout.addWidget(self._fillet_btn)
 
-        self._shell_btn = QPushButton("⬡  Shell...")
+        self._shell_btn = QPushButton("⬡  Shell")
         self._shell_btn.setEnabled(False)
         self._shell_btn.setToolTip(
-            "Select face(s) to leave open, then hollow out the active part."
+            "Pick face(s) to remove, then enter a wall thickness in "
+            "the status bar (or send one from the calculator)."
         )
-        self._shell_btn.clicked.connect(self._on_shell_clicked)
+        self._shell_btn.clicked.connect(self._on_modify_shell)
         tree_layout.addWidget(self._shell_btn)
 
         # Import button -- loads a new STEP file and adds it to the
@@ -695,13 +701,17 @@ class MainWindow(QMainWindow):
         self._active_part_tree_item = None   # tree item with orange background
         self._active_part_overlay_ais = None  # wireframe overlay AIS
 
-        self._fillet_dialog = FilletDialog(self, viewport=self.viewport)
-        self._fillet_dialog.hide()
-        self._fillet_dialog.fillet_done.connect(self._on_fillet_done)
-
-        self._shell_dialog = ShellDialog(self, viewport=self.viewport)
-        self._shell_dialog.hide()
-        self._shell_dialog.shell_done.connect(self._on_shell_done)
+        # Fillet / Mill / Pull state (PHASE 3B, DESIGN_BACKLOG item 33)
+        # -- FilletDialog retired, same pure menu + status-bar treatment
+        # as Extrude/Revolve. _modify_mode: None | "mill" | "pull".
+        # Fillet accumulates any number of edges (non-sticky --
+        # matches KodaCAD's fillet() ending after each apply, unlike
+        # the sticky sketch tools).
+        self._modify_mode = None
+        self._fillet_picking = False
+        self._fillet_edges = []
+        self._shell_picking = False
+        self._shell_faces = []
 
         # --- Wire the standard sync signals --------------------------
         self.viewport.part_selected.connect(self._on_part_selected_in_viewport)
@@ -797,8 +807,10 @@ class MainWindow(QMainWindow):
         self._add_action(create3d_menu, "Revolve", self._on_create3d_revolve)
 
         modify_menu = menubar.addMenu("&Modify Active Part")
-        self._add_action(modify_menu, "Fillet...", self._on_fillet_clicked)
-        self._add_action(modify_menu, "Shell...", self._on_shell_clicked)
+        self._add_action(modify_menu, "Fillet", self._on_modify_fillet)
+        self._add_action(modify_menu, "Mill (Cut)", self._on_modify_mill)
+        self._add_action(modify_menu, "Pull (Boss)", self._on_modify_pull)
+        self._add_action(modify_menu, "Shell", self._on_modify_shell)
 
         position_menu = menubar.addMenu("&Position")
         self._add_action(position_menu, "Position selected...",
@@ -866,9 +878,12 @@ class MainWindow(QMainWindow):
         priority order as _on_geometry_picked's routing:
           1. An armed sketch tool (Circle, Line, etc.)
           2. Create 3D (Extrude/Revolve)
-          3. On-Face workplane picking
-          4. By-3-Points workplane picking
-          5. Calculator measurement mode (Dist/Len)
+          3. Modify Active Part (Mill/Pull)
+          4. Fillet edge picking
+          5. Shell face picking
+          6. On-Face workplane picking
+          7. By-3-Points workplane picking
+          8. Calculator measurement mode (Dist/Len)
         """
         if self._sketch_toolbar.isEnabled() and \
                 self._sketch_toolbar._active_tool is not None:
@@ -877,6 +892,18 @@ class MainWindow(QMainWindow):
         if self._create3d_mode is not None:
             self._cancel_create3d()
             self.statusBar().showMessage("Create 3D cancelled.", 4000)
+            return
+        if self._modify_mode is not None:
+            self._cancel_modify()
+            self.statusBar().showMessage("Modify Active Part cancelled.", 4000)
+            return
+        if self._fillet_picking:
+            self._cancel_fillet()
+            self.statusBar().showMessage("Fillet cancelled.", 4000)
+            return
+        if self._shell_picking:
+            self._cancel_shell()
+            self.statusBar().showMessage("Shell cancelled.", 4000)
             return
         if self._wp_onface_picking:
             self._wp_onface_picking = False
@@ -902,7 +929,13 @@ class MainWindow(QMainWindow):
           1. An armed Create 3D operation (Extrude/Revolve) -- gets the
              RAW text, since it needs a string (part name) at some
              stages, not just numbers. See _advance_create3d_text().
-          2. Otherwise, if a number was typed, queue it for whichever
+          2. An armed Modify Active Part operation (Mill/Pull) --
+             numeric only (depth/length). See _advance_modify_text().
+          3. Fillet, once at least one edge is picked -- numeric only
+             (radius). See _advance_fillet_text().
+          4. Shell, once at least one face is picked -- numeric only
+             (thickness). See _advance_shell_text().
+          5. Otherwise, if a number was typed, queue it for whichever
              sketch tool needs a numeric parameter next (e.g. Circle's
              radius) -- see SketchToolBar.push_pending_float() and
              _retry_active_tool().
@@ -912,6 +945,18 @@ class MainWindow(QMainWindow):
 
         if self._create3d_mode is not None:
             self._advance_create3d_text(text)
+            return
+
+        if self._modify_mode is not None:
+            self._advance_modify_text(text)
+            return
+
+        if self._fillet_picking:
+            self._advance_fillet_text(text)
+            return
+
+        if self._shell_picking:
+            self._advance_shell_text(text)
             return
 
         try:
@@ -957,14 +1002,22 @@ class MainWindow(QMainWindow):
         entirely.
 
         Otherwise (no tool/operation active), targets whichever
-        QLineEdit currently has keyboard focus -- e.g. a field in the
-        Fillet or Shell dialog -- so the calculator is immediately
-        useful with every existing dialog's input fields, with no
-        per-dialog wiring required. Falls back to the shared status-bar
-        line edit if nothing else has focus.
+        QLineEdit currently has keyboard focus -- so the calculator is
+        immediately useful with any other dialog's input fields, with
+        no per-dialog wiring required. Falls back to the shared
+        status-bar line edit if nothing else has focus.
         """
         if self._create3d_mode == "extrude" and self._create3d_stage == "length":
             self._advance_create3d_text(str(value))
+            return
+        if self._modify_mode is not None:
+            self._advance_modify_text(str(value))
+            return
+        if self._fillet_picking and self._fillet_edges:
+            self._advance_fillet_text(str(value))
+            return
+        if self._shell_picking and self._shell_faces:
+            self._advance_shell_text(str(value))
             return
         if self._sketch_toolbar.isEnabled() and \
                 self._sketch_toolbar._active_tool is not None:
@@ -1150,13 +1203,15 @@ class MainWindow(QMainWindow):
           3. By-3-Points workplane vertex-pick mode
           4. Calculator measurement mode (Dist/Len)
           5. Sketch toolbar vertex pick (intersection point snap)
-          6. Fillet / Shell dialogs
-          7. Position dialog positioning mode
+          6. Fillet edge picking (any number of edges on active part)
+          7. Shell face picking (any number of faces on active part)
+          8. Position dialog positioning mode
 
-        PHASE 3 (DESIGN_BACKLOG item 33): WorkplaneDialog is retired --
-        On-Face and Revolve's picking used to route through it; both
-        are inlined here now (self-contained state on MainWindow,
-        mirroring the pattern already used for By-3-Points).
+        PHASE 3 (DESIGN_BACKLOG item 33): WorkplaneDialog, FilletDialog,
+        and ShellDialog are all retired -- On-Face, Revolve, Fillet,
+        and Shell's picking used to route through dialogs; all are
+        inlined here now (self-contained state on MainWindow, mirroring
+        the pattern already used for By-3-Points).
         """
         from OCP.TopAbs import TopAbs_VERTEX
 
@@ -1196,14 +1251,14 @@ class MainWindow(QMainWindow):
             print(f"[route] {type_name} pick -> SketchToolBar.receive_vertex_pick")
             consumed = self._sketch_toolbar.receive_vertex_pick(raw_shape)
 
-        if not consumed and self._fillet_dialog.isVisible() and \
-                shape_type == TopAbs_EDGE:
-            self._fillet_dialog.receive_edge_pick(raw_shape, shape_type)
+        if not consumed and self._fillet_picking and shape_type == TopAbs_EDGE:
+            print(f"[route] {type_name} pick -> Fillet edge")
+            self._on_fillet_edge_picked(raw_shape)
             consumed = True
 
-        if not consumed and self._shell_dialog.isVisible() and \
-                shape_type == TopAbs_FACE:
-            self._shell_dialog.receive_face_pick(raw_shape, shape_type)
+        if not consumed and self._shell_picking and shape_type == TopAbs_FACE:
+            print(f"[route] {type_name} pick -> Shell face")
+            self._on_shell_face_picked(raw_shape)
             consumed = True
 
         if not consumed and self._position_dialog.isVisible() and \
@@ -1629,8 +1684,8 @@ class MainWindow(QMainWindow):
     def _cancel_other_operations(self, keep=None):
         """
         Cancel every armed operation EXCEPT `keep` (one of "sketch",
-        "measure", "create3d", "wp3pts", "onface", or None to cancel
-        everything). Called at the start of every operation-arming
+        "measure", "create3d", "wp3pts", "onface", "modify", "fillet",
+        "shell", or None to cancel everything). Called at the start of every operation-arming
         entry point (BUG FIX, DESIGN_BACKLOG item 33): these all
         compete for the same vertex/edge picks in
         _on_geometry_picked's routing chain, several are sticky (stay
@@ -1655,6 +1710,12 @@ class MainWindow(QMainWindow):
         if keep != "onface" and self._wp_onface_picking:
             self._wp_onface_picking = False
             self._wp_onface_faces = []
+        if keep != "modify" and self._modify_mode is not None:
+            self._cancel_modify()
+        if keep != "fillet" and self._fillet_picking:
+            self._cancel_fillet()
+        if keep != "shell" and self._shell_picking:
+            self._cancel_shell()
 
     # -----------------------------------------------------------------------
     # Calculator measurement (PHASE 2 follow-up, DESIGN_BACKLOG item 33).
@@ -1757,21 +1818,165 @@ class MainWindow(QMainWindow):
         self._measure_points = []
         self.currOpLabel.setText("Current Operation: None")
 
-    def _on_fillet_clicked(self):
-        """Open the Fillet dialog."""
+    # -----------------------------------------------------------------------
+    # Modify Active Part: Fillet / Mill (cut) / Pull (boss) -- PHASE 3B,
+    # DESIGN_BACKLOG item 33. FilletDialog is retired: it had its own
+    # disconnected QLineEdit, so typing a radius or using the calculator
+    # never worked -- the ONLY way in was clicking its own Apply button.
+    # Mill/Pull (cut/add material using the active workplane's profile
+    # into/onto the active part) didn't exist in BasiCAD at all before
+    # this. All three are now pure menu + status-bar flows, matching
+    # KodaCAD's fillet()/mill()/pull() exactly -- no dialog.
+    # -----------------------------------------------------------------------
+
+    def _on_modify_fillet(self):
+        """Arm Fillet: pick any number of edges on the active part, then
+        type a radius (or send one from the calculator) to apply to all
+        of them at once. Non-sticky -- matches KodaCAD's fillet(), which
+        ends after each apply rather than staying armed."""
         if self._assembly is None:
             return
         active = self.tree.get_active_part()
         if active is None:
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.information(
-                self, "No active part",
-                "RMB on a part in the tree and choose '⚙ Set Active Part' first."
-            )
+            self.statusBar().showMessage(
+                "No active part. Right-click one in the tree and choose "
+                "'Set Active Part' first.", 6000)
             return
-        self._fillet_dialog.set_active_part(active)
-        self._fillet_dialog.show()
-        self._fillet_dialog.raise_()
+        self._cancel_other_operations(keep=None)
+        self._fillet_picking = True
+        self._fillet_edges = []
+        self.currOpLabel.setText("Current Operation: fillet")
+        from OCP.AIS import AIS_Shape
+        ctx = self.viewport.context
+        for ais in self.viewport._ais_shapes:
+            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_EDGE))
+        ctx.UpdateCurrentViewer()
+        self.statusBar().showMessage(
+            "Fillet: pick edge(s) on the active part, then enter a "
+            "radius.")
+
+    def _on_fillet_edge_picked(self, raw_shape):
+        from OCP.TopoDS import TopoDS
+        try:
+            edge = TopoDS.Edge_s(raw_shape)
+        except Exception as e:
+            print(f"[Fillet] Could not cast pick to an edge: {e}")
+            return
+        self._fillet_edges.append(edge)
+        self.statusBar().showMessage(
+            f"Fillet: {len(self._fillet_edges)} edge(s) selected. Pick "
+            f"more, or enter a radius.")
+
+    def _advance_fillet_text(self, text):
+        try:
+            radius = float(text)
+        except ValueError:
+            self.statusBar().showMessage(
+                "Invalid radius -- enter a number.", 4000)
+            return
+        if radius <= 0:
+            self.statusBar().showMessage("Radius must be positive.", 4000)
+            return
+        if not self._fillet_edges:
+            self.statusBar().showMessage(
+                "No edges selected yet -- pick at least one edge first.",
+                5000)
+            return
+        part = self.tree.get_active_part()
+        if part is None:
+            self.statusBar().showMessage(
+                "Active part no longer available.", 5000)
+            self._cancel_fillet()
+            return
+        try:
+            new_shape = solid_ops.apply_fillet(
+                part.wrapped, self._fillet_edges, radius)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f"Fillet failed: {e}", 8000)
+            self._cancel_fillet()
+            return
+        self._cancel_fillet()
+        self._apply_shape_to_node(part, new_shape, operation="fillet")
+        self.statusBar().showMessage("Fillet complete.", 4000)
+
+    def _cancel_fillet(self):
+        self._fillet_picking = False
+        self._fillet_edges = []
+        self.currOpLabel.setText("Current Operation: None")
+
+    def _on_modify_mill(self):
+        """Arm Mill (cut): the active workplane's profile is cut INTO
+        the active part, extruded in the -w direction. Type a depth
+        (or send one from the calculator) to complete."""
+        self._start_modify("mill", "Enter milling depth (cuts into "
+                           "active part).")
+
+    def _on_modify_pull(self):
+        """Arm Pull (boss): the active workplane's profile is fused
+        ONTO the active part, extruded in the +w direction. Type a
+        length (or send one from the calculator) to complete."""
+        self._start_modify("pull", "Enter pull distance (adds to "
+                           "active part).")
+
+    def _start_modify(self, mode, prompt):
+        part = self.tree.get_active_part()
+        if part is None:
+            self.statusBar().showMessage(
+                "No active part. Right-click one in the tree and choose "
+                "'Set Active Part' first.", 6000)
+            return
+        wp = self._active_workplane()
+        if wp is None:
+            self.statusBar().showMessage(
+                "No active workplane. Right-click one in the tree and "
+                "choose Set Active first.", 6000)
+            return
+        if not wp.edgeList:
+            self.statusBar().showMessage(
+                "The active workplane has no sketch profile yet.", 6000)
+            return
+        self._cancel_other_operations(keep=None)
+        self._modify_mode = mode
+        self.currOpLabel.setText(f"Current Operation: {mode}")
+        self.statusBar().showMessage(prompt)
+        self.lineEdit.setFocus()
+
+    def _advance_modify_text(self, text):
+        try:
+            value = float(text)
+        except ValueError:
+            self.statusBar().showMessage(
+                "Invalid value -- enter a number.", 4000)
+            return
+        part = self.tree.get_active_part()
+        wp = self._active_workplane()
+        if part is None or wp is None:
+            self.statusBar().showMessage(
+                "Active part or active workplane no longer available.",
+                6000)
+            self._cancel_modify()
+            return
+        mode = self._modify_mode
+        try:
+            if mode == "mill":
+                new_shape = solid_ops.cut_active_part(wp, part.wrapped, value)
+            else:
+                new_shape = solid_ops.pull_active_part(wp, part.wrapped, value)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f"{mode} failed: {e}", 8000)
+            self._cancel_modify()
+            return
+        self._cancel_modify()
+        self._apply_shape_to_node(part, new_shape, operation=mode)
+        self.statusBar().showMessage(f"{mode} complete.", 4000)
+
+    def _cancel_modify(self):
+        self._modify_mode = None
+        self.currOpLabel.setText("Current Operation: None")
 
     def _apply_shape_to_node(self, node, new_shape, operation="modify"):
         """
@@ -1841,26 +2046,82 @@ class MainWindow(QMainWindow):
         """
         self._apply_shape_to_node(node, new_shape, operation="fillet")
 
-    def _on_shell_clicked(self):
-        """Open the Shell dialog."""
+    def _on_modify_shell(self):
+        """Arm Shell: pick any number of faces to remove, then type a
+        wall thickness (or send one from the calculator) to apply.
+        Non-sticky -- matches KodaCAD's shell(), which ends after each
+        apply rather than staying armed."""
         if self._assembly is None:
             return
         active = self.tree.get_active_part()
         if active is None:
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.information(
-                self, "No active part",
-                "RMB on a part in the tree and choose '⚙ Set Active Part' first."
-            )
+            self.statusBar().showMessage(
+                "No active part. Right-click one in the tree and choose "
+                "'Set Active Part' first.", 6000)
             return
-        self._shell_dialog.set_active_part(active)
-        self._shell_dialog.show()
-        self._shell_dialog.raise_()
+        self._cancel_other_operations(keep=None)
+        self._shell_picking = True
+        self._shell_faces = []
+        self.currOpLabel.setText("Current Operation: shell")
+        from OCP.AIS import AIS_Shape
+        ctx = self.viewport.context
+        for ais in self.viewport._ais_shapes:
+            ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_FACE))
+        ctx.UpdateCurrentViewer()
+        self.statusBar().showMessage(
+            "Shell: pick face(s) to remove, then enter a wall "
+            "thickness.")
 
-    def _on_shell_done(self, node, new_shape):
-        """Shell complete -- same replace-in-place pattern as fillet/cut.
-        NOTE: Makes the modified instance an independent copy. See item 26."""
-        self._apply_shape_to_node(node, new_shape, operation="shell")
+    def _on_shell_face_picked(self, raw_shape):
+        from OCP.TopoDS import TopoDS
+        try:
+            face = TopoDS.Face_s(raw_shape)
+        except Exception as e:
+            print(f"[Shell] Could not cast pick to a face: {e}")
+            return
+        self._shell_faces.append(face)
+        self.statusBar().showMessage(
+            f"Shell: {len(self._shell_faces)} face(s) selected. Pick "
+            f"more, or enter a wall thickness.")
+
+    def _advance_shell_text(self, text):
+        try:
+            thickness = float(text)
+        except ValueError:
+            self.statusBar().showMessage(
+                "Invalid thickness -- enter a number.", 4000)
+            return
+        if thickness <= 0:
+            self.statusBar().showMessage("Thickness must be positive.", 4000)
+            return
+        if not self._shell_faces:
+            self.statusBar().showMessage(
+                "No faces selected yet -- pick at least one face first.",
+                5000)
+            return
+        part = self.tree.get_active_part()
+        if part is None:
+            self.statusBar().showMessage(
+                "Active part no longer available.", 5000)
+            self._cancel_shell()
+            return
+        try:
+            new_shape = solid_ops.apply_shell(
+                part, self._shell_faces, thickness)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f"Shell failed: {e}", 8000)
+            self._cancel_shell()
+            return
+        self._cancel_shell()
+        self._apply_shape_to_node(part, new_shape, operation="shell")
+        self.statusBar().showMessage("Shell complete.", 4000)
+
+    def _cancel_shell(self):
+        self._shell_picking = False
+        self._shell_faces = []
+        self.currOpLabel.setText("Current Operation: None")
 
     def _on_part_created(self, new_node):
         """
@@ -2267,14 +2528,6 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"[restore_active_part_overlay] display failed: {e}")
         ctx.UpdateCurrentViewer()
-
-        # Notify the fillet dialog
-        if hasattr(self, '_fillet_dialog') and self._fillet_dialog.isVisible():
-            self._fillet_dialog.set_active_part(node)
-
-        # Notify the shell dialog
-        if hasattr(self, '_shell_dialog') and self._shell_dialog.isVisible():
-            self._shell_dialog.set_active_part(node)
 
 
     def _on_part_cut(self, node, new_shape):

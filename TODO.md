@@ -35,7 +35,7 @@ Both developer and user contributions welcome.
         * Save session would increment value of n and save to the newly incremented filename.
 * RMB in tree (Doesn't work in KodaCAD either)
     * Delete item doesn't work for 3d items (Does work for wp's)
-
+* Add "Box Select" to grab all the edges in the bottle for filleting
 
 ---
 
