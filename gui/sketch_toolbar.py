@@ -346,7 +346,26 @@ class SketchToolBar(QToolBar):
         the toolbar button each time -- only Cancel Tool / End
         Operation, Clear All, or clicking a DIFFERENT tool button ends
         the repeat.
+
+        BUG FIX (DESIGN_BACKLOG item 33): distPtPt()/edgeLen() already
+        cancel an active sketch tool when armed, but nothing did the
+        reverse -- so once measurement mode was armed even once
+        (possibly in an earlier session), it stayed sticky AND has
+        higher priority than the sketch toolbar in
+        _on_geometry_picked's routing, silently hijacking every future
+        vertex pick meant for sketching, with no visible sign why
+        (distPtPt/edgeLen never updated the status bar's Current
+        Operation label either, now also fixed). Reported as "made a
+        circle center pick and nothing happened" while the console
+        showed picks being routed to distPtPt. Now symmetric: starting
+        any sketch tool cancels measurement mode first.
         """
+        win = self.window()
+        if hasattr(win, "_cancel_other_operations"):
+            win._cancel_other_operations(keep="sketch")
+        elif hasattr(win, "_measure_mode") and win._measure_mode is not None:
+            win._cancel_measure()
+
         self._set_active_tool(name)
         self._active_prompt = prompt
         if self._try_complete(name):

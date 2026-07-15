@@ -889,8 +889,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("By 3 Points cancelled.", 4000)
             return
         if self._measure_mode is not None:
-            self._measure_mode = None
-            self._measure_points = []
+            self._cancel_measure()
             self.statusBar().showMessage("Measurement cancelled.", 4000)
             return
         self.statusBar().showMessage("Nothing to cancel.", 3000)
@@ -1328,6 +1327,7 @@ class MainWindow(QMainWindow):
         """
         if self._assembly is None:
             return
+        self._cancel_other_operations(keep="onface")
         self._wp_onface_picking = True
         self._wp_onface_faces = []
         from OCP.AIS import AIS_Shape
@@ -1368,6 +1368,7 @@ class MainWindow(QMainWindow):
         """
         if self._assembly is None:
             return
+        self._cancel_other_operations(keep="wp3pts")
         self._wp3pts_picking = True
         self._wp3pts_points = []
         from OCP.AIS import AIS_Shape
@@ -1509,6 +1510,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "The active workplane has no sketch profile yet.", 6000)
             return
+        self._cancel_other_operations(keep="create3d")
         self._create3d_mode = "extrude"
         self._create3d_stage = "length"
         self._create3d_length = None
@@ -1528,8 +1530,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "The active workplane has no sketch profile yet.", 6000)
             return
-        if self._sketch_toolbar._active_tool is not None:
-            self._sketch_toolbar._do_cancel_tool()
+        self._cancel_other_operations(keep="create3d")
         self._create3d_mode = "revolve"
         self._create3d_stage = "axis"
         self._create3d_points = []
@@ -1625,6 +1626,35 @@ class MainWindow(QMainWindow):
         self._create3d_points = []
         self.currOpLabel.setText("Current Operation: None")
 
+    def _cancel_other_operations(self, keep=None):
+        """
+        Cancel every armed operation EXCEPT `keep` (one of "sketch",
+        "measure", "create3d", "wp3pts", "onface", or None to cancel
+        everything). Called at the start of every operation-arming
+        entry point (BUG FIX, DESIGN_BACKLOG item 33): these all
+        compete for the same vertex/edge picks in
+        _on_geometry_picked's routing chain, several are sticky (stay
+        armed after completing), and only a couple of pairwise cancels
+        existed (distPtPt/edgeLen already cancelled the sketch tool,
+        but not vice versa) -- so ANY one of them getting stuck armed,
+        even from an earlier session, would silently hijack picks
+        meant for whichever one the user actually clicked next, with
+        no visible sign why. Reported concretely as stale measurement
+        mode swallowing sketch-tool circle-center picks; this closes
+        the whole bug class rather than just that one pairing.
+        """
+        if keep != "sketch" and self._sketch_toolbar._active_tool is not None:
+            self._sketch_toolbar._do_cancel_tool()
+        if keep != "measure" and self._measure_mode is not None:
+            self._cancel_measure()
+        if keep != "create3d" and self._create3d_mode is not None:
+            self._cancel_create3d()
+        if keep != "wp3pts" and self._wp3pts_picking:
+            self._wp3pts_picking = False
+            self._wp3pts_points = []
+        if keep != "onface" and self._wp_onface_picking:
+            self._wp_onface_picking = False
+            self._wp_onface_faces = []
 
     # -----------------------------------------------------------------------
     # Calculator measurement (PHASE 2 follow-up, DESIGN_BACKLOG item 33).
@@ -1645,10 +1675,10 @@ class MainWindow(QMainWindow):
         """
         if self._assembly is None:
             return
-        if self._sketch_toolbar._active_tool is not None:
-            self._sketch_toolbar._do_cancel_tool()
+        self._cancel_other_operations(keep="measure")
         self._measure_mode = "dist"
         self._measure_points = []
+        self.currOpLabel.setText("Current Operation: dist")
         from OCP.AIS import AIS_Shape
         ctx = self.viewport.context
         for ais in self.viewport._ais_shapes:
@@ -1667,6 +1697,7 @@ class MainWindow(QMainWindow):
             return
         self._measure_points.append(pnt)
         if len(self._measure_points) == 1:
+            print("[distPtPt] Point 1 captured. Waiting for point 2.")
             self.statusBar().showMessage("Dist: pick point 2.")
             return
         from OCP.gp import gp_Vec
@@ -1675,6 +1706,7 @@ class MainWindow(QMainWindow):
         dist = gp_Vec(p1, p2).Magnitude()
         if self.calculator is not None:
             self.calculator.putx(dist)
+        print(f"[distPtPt] Distance = {dist:.3f} mm")
         self.statusBar().showMessage(
             f"Distance = {dist:.3f} mm  (pick 2 more points for another, "
             f"or End Operation to stop.)", 6000)
@@ -1688,9 +1720,9 @@ class MainWindow(QMainWindow):
         """
         if self._assembly is None:
             return
-        if self._sketch_toolbar._active_tool is not None:
-            self._sketch_toolbar._do_cancel_tool()
+        self._cancel_other_operations(keep="measure")
         self._measure_mode = "len"
+        self.currOpLabel.setText("Current Operation: len")
         from OCP.AIS import AIS_Shape
         ctx = self.viewport.context
         for ais in self.viewport._ais_shapes:
@@ -1711,10 +1743,19 @@ class MainWindow(QMainWindow):
             return
         if self.calculator is not None:
             self.calculator.putx(length)
+        print(f"[edgeLen] Length = {length:.3f} mm")
         self.statusBar().showMessage(
             f"Length = {length:.3f} mm  (pick another edge, or End "
             f"Operation to stop.)", 6000)
         # Sticky -- self._measure_mode stays "len" for another round.
+
+    def _cancel_measure(self):
+        """Shared teardown for measurement mode -- used by End
+        Operation and by SketchToolBar._start_tool()'s symmetric
+        cancel (see sketch_toolbar.py)."""
+        self._measure_mode = None
+        self._measure_points = []
+        self.currOpLabel.setText("Current Operation: None")
 
     def _on_fillet_clicked(self):
         """Open the Fillet dialog."""

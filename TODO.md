@@ -7,20 +7,41 @@ Both developer and user contributions welcome.
 
 ## 1. Broken (should work but doesn't)
 
----
-
-## 3. Future development ideas
-
-* Project edge as construction lines
-    * They would be c-lines, c-circles
-* Make the sketching UI more like Kodacad's
-    * Able to put in x,y
-    * Keep tool active (instead of having to pick it repeatedly)
-* Add calculator (like on kodacad)
+* RMB in viewport
+    * View TOP actually views BOTTOM
+* Utility
+    * Set units (Missing)
 
 ---
 
-## 2. Known limitations (by design, not bugs)
+## 2. New Features to implement
+
+* Additional Tools in toolbar
+    * Delete all construction
+    * Delete all geometry (profile types)
+    * Project edge as construction lines
+        * They would be c-lines, c-circles
+* New buttons on calculator
+    * Measure distance between 2 (parallel) faces
+    * Measure angle between 2 (non-parallel) faces
+* Move selected (part or assy) precisely in a prescribed dof
+    * Can the AIS manipulator be adpated to allow a precise value to be specified?
+    * How about move between 2 points?
+        * (I already have the abiltiy to align 2 cylindrical faces)
+* For saving sessions:
+    * Propose saving a step file to a /tmp/sessions/folder using an appended '_n' (incrementing)
+    * By default:
+        * Load session would load the one with the highest value
+        * Save session would increment value of n and save to the newly incremented filename.
+* RMB in tree (Doesn't work in KodaCAD either)
+    * Delete item doesn't work for 3d items (Does work for wp's)
+
+
+---
+
+## 3. Known limitations (by design, not bugs)
+
+* Can't propagate modifications to other shared instances. Must first make copy, then modify.
 
 ---
 

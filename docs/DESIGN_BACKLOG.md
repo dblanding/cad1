@@ -2936,3 +2936,46 @@ the active workplane properly hides the old one's sketch and shows
 the new one's (including redisplaying an existing profile if
 reactivating one you'd already sketched on), and run through the
 exact Extrude and Revolve sequences from the spec end to end.
+
+### Phase 3 follow-up: stuck measurement mode silently hijacking sketch-tool picks
+
+Reported during the bottle tutorial: after successfully placing 7 H
+clines via the calculator, picking a center + point for Constr
+Circle/Circle did nothing -- console showed every vertex pick being
+routed to `distPtPt measurement` instead. Persisted across creating a
+brand-new workplane too.
+
+**Root cause:** `distPtPt()`/`edgeLen()` already cancelled an active
+sketch tool when armed, but nothing did the reverse. Measurement mode
+is sticky (stays armed after each successful measurement) AND has
+higher priority than the sketch toolbar in `_on_geometry_picked`'s
+routing chain -- so once armed even once (evidently in an earlier
+part of the session, not visible in the pasted log), it silently
+hijacked every subsequent vertex pick meant for sketching, for the
+rest of the session, with no visible sign why: `distPtPt()`/`edgeLen()`
+never updated the status bar's "Current Operation" label either, so
+there was no UI indication it was still active.
+
+**Fix -- went further than a pairwise patch, closing the whole bug
+class:** all five operation types that compete for the same
+vertex/edge picks (sketch tools, measurement, Create 3D, By-3-Points,
+On-Face) can now potentially strand each other the same way if any
+pair lacks a mutual cancel. Added a single
+`MainWindow._cancel_other_operations(keep=...)` that cancels every
+armed operation except the one being started, called at the top of
+every arming entry point: `SketchToolBar._start_tool()` (via
+`self.window()`, replacing the narrower measure-only check),
+`distPtPt()`, `edgeLen()`, `_on_create3d_extrude()`,
+`_on_create3d_revolve()`, `_on_workplane_by_3pts()`,
+`_on_workplane_on_face()`. Also added the missing
+`currOpLabel` updates to `distPtPt()`/`edgeLen()` (now show "Current
+Operation: dist"/"len"), and a couple of `print()` statements in
+`_on_measure_vertex_picked()` for better console visibility into
+which point-capture stage is active.
+
+**Not yet tested against a running Qt/OCCT display.** Given this
+exact bug already slipped through once, please specifically retest
+the sequence that triggers it: use Dist or Len once (even without
+completing it), then try any sketch tool afterward -- it should now
+work immediately, and clicking Dist/Len should show up in the Current
+Operation label so it's never silently active again.

@@ -1,4 +1,4 @@
-# cad1 — DIY CAD app (working name)
+# BasiCAD — DIY CAD app
 
 A from-scratch CAD application built on `build123d`/OCP (OpenCascade),
 patterned after HP's dynamic/direct modeling lineage (ME-30 →
