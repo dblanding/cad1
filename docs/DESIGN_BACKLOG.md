@@ -3177,3 +3177,45 @@ draw a circle, and Circle should now automatically un-arm after it
 completes (status bar shows "(done.)"), with a second pick doing
 nothing unless the Circle button is clicked again. Line/Arc should
 still stay armed for repeated placement as before.
+
+## 39. Phase 4 cleanup: removed redundant side-panel buttons
+
+Checked back against item 33's original 4-phase plan -- Phase 4
+("fold in remaining Modify Part tools -- Fillet, Shell, Revolve -- as
+individual menu actions") turned out to already be complete, across
+items 35 (Revolve), 36 (Fillet), and 37 (Shell). What was left was
+pure cleanup: five side-panel buttons (Position selected.../Fillet/
+Shell/Import STEP.../Export STEP...) that are now exact duplicates of
+menu items (Position menu, Modify Active Part menu, File menu
+respectively) -- leftover from Phase 1's deliberately additive-only
+approach ("don't remove buttons, just add menus that call the same
+handlers"), never cleaned up since.
+
+Also addressed directly: the tree "has gotten kind of long" as
+real assemblies accumulate parts. Removing the 5 buttons reclaims
+that vertical space; additionally, the 3-line instructional text
+above the tree ("Checkbox: show/hide...") moved from a permanent
+`QLabel` into `self.tree.setToolTip(...)` -- same information,
+available on hover, but no longer permanently eating rows.
+
+**`gui/main_app.py`:**
+- Removed `self._position_btn`, `self._fillet_btn`, `self._shell_btn`,
+  `self._import_btn`, `self._export_btn` and their construction
+  entirely.
+- Removed the permanent hint `QLabel`; its text is now
+  `self.tree.setToolTip(...)`.
+- Cleaned up the now-dangling `setEnabled(True)` calls in `load()`
+  and `_on_tree_selection_changed()` (the latter kept its OTHER job --
+  updating the Position dialog's moving node when the tree selection
+  changes while it's open -- just dropped the button-enable line).
+- The now-unused local `from PySide6.QtWidgets import QPushButton`
+  import (only ever used for these 5 buttons) was removed along with
+  them.
+
+No functional capability lost -- every one of these was already
+reachable via a menu before this change.
+
+**Not yet tested against a running Qt/OCCT display.** Please confirm
+the tree panel now shows noticeably more rows without scrolling, and
+that hovering over the tree still shows the show/hide + drag-to-reparent
+hint as a tooltip.

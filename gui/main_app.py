@@ -596,77 +596,21 @@ class MainWindow(QMainWindow):
         tree_layout = QVBoxLayout(tree_panel)
         tree_layout.setContentsMargins(4, 4, 4, 4)
 
-        hint = QLabel(
-            "Checkbox: show/hide.  Click a row: highlight in 3D.\n"
-            "Drag a row onto another: reparent (hierarchy only,\n"
-            "no effect on position)."
-        )
-        hint.setWordWrap(True)
-        tree_layout.addWidget(hint)
-
+        # Instructional text moved to a tooltip (PHASE 4 cleanup,
+        # DESIGN_BACKLOG item 33) -- was a permanent 3-line label plus
+        # 5 buttons (Position/Fillet/Shell/Import/Export) that are all
+        # now pure duplicates of menu items (Position menu, Modify
+        # Active Part menu, File menu respectively). Removing them
+        # gives the tree significantly more vertical room, which
+        # matters more now that it's grown to hold a full assembly's
+        # worth of parts plus the WP section.
         self.tree = AssemblyTreeWidget(tree_panel)
+        self.tree.setToolTip(
+            "Checkbox: show/hide.  Click a row: highlight in 3D.\n"
+            "Drag a row onto another: reparent (hierarchy only, no "
+            "effect on position)."
+        )
         tree_layout.addWidget(self.tree)
-
-        # Position button -- opens the Mate/Align dialog for whichever
-        # part/assembly is currently selected in the tree.
-        from PySide6.QtWidgets import QPushButton
-        self._position_btn = QPushButton("⊕  Position selected...")
-        self._position_btn.setEnabled(False)
-        self._position_btn.setToolTip(
-            "Open the Mate/Align positioning dialog for the\n"
-            "currently selected part or assembly."
-        )
-        self._position_btn.clicked.connect(self._on_position_clicked)
-        tree_layout.addWidget(self._position_btn)
-
-        # NOTE: the old "⊞ Workplane..." button (opened WorkplaneDialog)
-        # was removed here in PHASE 3 (DESIGN_BACKLOG item 33) -- the
-        # dialog is retired. Workplane creation is now purely the
-        # Workplane menu (At Origin / On Face / By 3 Points), and
-        # Extrude/Revolve are purely the Create 3D menu, both driven by
-        # the status bar, KodaCAD-style. See _build_menu_bar().
-
-        self._fillet_btn = QPushButton("⌀  Fillet")
-        self._fillet_btn.setEnabled(False)
-        self._fillet_btn.setToolTip(
-            "Pick edge(s) on the active part, then enter a radius in "
-            "the status bar (or send one from the calculator)."
-        )
-        self._fillet_btn.clicked.connect(self._on_modify_fillet)
-        tree_layout.addWidget(self._fillet_btn)
-
-        self._shell_btn = QPushButton("⬡  Shell")
-        self._shell_btn.setEnabled(False)
-        self._shell_btn.setToolTip(
-            "Pick face(s) to remove, then enter a wall thickness in "
-            "the status bar (or send one from the calculator)."
-        )
-        self._shell_btn.clicked.connect(self._on_modify_shell)
-        tree_layout.addWidget(self._shell_btn)
-
-        # Import button -- loads a new STEP file and adds it to the
-        # current assembly at the top level, ready to be re-parented
-        # and positioned.
-        self._import_btn = QPushButton("📂  Import STEP...")
-        self._import_btn.setEnabled(False)
-        self._import_btn.setToolTip(
-            "Import a STEP file and add it to the current\n"
-            "assembly. Drag it in the tree to re-parent it,\n"
-            "then use Position to place it correctly."
-        )
-        self._import_btn.clicked.connect(self._on_import_clicked)
-        tree_layout.addWidget(self._import_btn)
-
-        # Export button -- saves the current assembly state to a STEP
-        # file alongside the input file, with _exported suffix.
-        self._export_btn = QPushButton("💾  Export STEP...")
-        self._export_btn.setEnabled(False)
-        self._export_btn.setToolTip(
-            "Export the current assembly (with all positioning\n"
-            "applied) to a STEP file."
-        )
-        self._export_btn.clicked.connect(self._on_export_clicked)
-        tree_layout.addWidget(self._export_btn)
 
         splitter.addWidget(tree_panel)
 
@@ -1041,11 +985,6 @@ class MainWindow(QMainWindow):
             self.tree.load_assembly_into_tree(self._assembly)
             print("Loaded into both tree and viewport.")
 
-        self._export_btn.setEnabled(True)
-        self._import_btn.setEnabled(True)
-        self._fillet_btn.setEnabled(True)
-        self._shell_btn.setEnabled(True)
-
         # Force OCCT to resize its internal window to match the Qt widget.
         # Without this, the viewport only fills a corner of its allocated
         # space when started without a STEP file (no FitAll triggers resize).
@@ -1169,10 +1108,9 @@ class MainWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _on_tree_selection_changed(self):
-        """Enable the Position button when something is selected in the tree."""
+        """If the Position dialog is open, update its moving node
+        immediately when the tree selection changes."""
         selected = self.tree.selectedItems()
-        self._position_btn.setEnabled(len(selected) > 0)
-        # If dialog is open, update its moving node immediately.
         if self._position_dialog.isVisible() and selected:
             item = selected[0]
             node = self.tree._item_to_node.get(id(item))
