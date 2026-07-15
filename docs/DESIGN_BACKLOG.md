@@ -2587,3 +2587,68 @@ kind of cancel, not a replacement.
 
 **Not yet tested against a running Qt/OCCT display**, same caveat as
 before.
+
+### Phase 2 follow-up: typed X,Y points, removed Cancel Tool, active-part occlusion fix, makeWire() diagnostics
+
+From a detailed operational check. Three fixes plus one diagnostic-only
+addition, all requested/prioritized directly by testing.
+
+**1. Points can now be typed as X,Y anywhere a point is needed
+(`gui/sketch_toolbar.py`).** Previously only H Cline/V Cline (Y or X
+shortcut) and Circle/Constr Circle (radius) accepted typed/calculator
+numeric input -- every other point (Line, Rect, both Arc tools, LBCL,
+HVCL, and the "2nd point" variants of Angled Cline/Circle) required a
+click, no typing alternative. Added `_take_point()` (pops a click if
+available, else two queued floats as (x, y) in entry order) and
+`_available_points()` (click count + floor(float count / 2), for
+atomic pre-checks before calling `_take_point()` the needed number of
+times). All ten `_try_complete_*` methods rewritten to use these.
+Existing scalar-only shortcuts (HCL's Y, VCL's X, Circle's radius,
+ACL's angle) are preserved exactly -- a full point (click, or a float
+pair) is tried first, falling back to the single-scalar shortcut only
+when a full point isn't available, so typing just one number still
+behaves as it did before. Per direction received: prompts were NOT
+changed to advertise this -- it just works silently.
+
+**2. Removed "Cancel Tool" from the toolbar.** Redundant with the
+status bar's "End Operation" button (which does the same thing for
+sketch tools, plus also covers By-3-Points/On-Face picking), and the
+toolbar was getting crowded with more tools planned. `_do_cancel_tool`
+itself is unchanged, still called by `MainWindow._on_end_operation`.
+
+**3. Active-part overlay was blocking/occluding sketch picks
+(`gui/main_app.py`, `gui/sketch_toolbar.py`).** Reported: "unable to
+pick center point for circle when part was showing," part "couldn't
+be completely blanked. (still in viewport as wireframe)," fixed by
+clicking in the background. Root cause: `_on_active_part_changed`
+activates EDGE+VERTEX selection on the active part's own AIS_Shape
+(for fillet/positioning picks) AND displays a persistent orange
+wireframe overlay -- both correct for those workflows, but directly
+competing with a sketch's intersection markers for clicks (same
+TopAbs_VERTEX selection mode, same screen area) and visually
+cluttering them, whenever a workplane sits on that same active part.
+Added `MainWindow._suspend_active_part_overlay()` /
+`_restore_active_part_overlay()`: deactivate the active part's own
+edge/vertex selection, erase its overlay, and `ClearSelected()` (the
+same effect as the user's manual "click in the background"
+workaround, done automatically). `SketchToolBar.set_workplane()` calls
+suspend; `deactivate()` calls restore.
+
+**4. `WorkPlane.makeWire()` diagnostics (`src/workplane.py`,
+additive only, doesn't change return value/behavior).** The reported
+"Could not cut part: makeWire() failed" / "Could not add material:
+makeWire() failed" on a lone-circle profile wasn't reproducible from
+code inspection alone -- `_cut`/`_pull`/`_extrude` all call the exact
+same `wp.makeWire()` on the exact same `wp.edgeList`, and a single
+closed circular edge should normally form a valid wire on its own.
+Per direction received, NOT chasing this further right now (the
+wizard is being replaced in Phase 3 anyway) -- but `makeWire()` now
+prints the real `BRepBuilderAPI_WireError` code and each edge's
+endpoints on failure, so if it recurs post-Phase-3 there's actual data
+instead of needing to re-diagnose blind.
+
+**Not yet tested against a running Qt/OCCT display**, same caveat as
+before -- in particular, worth re-attempting the exact "workplane on
+face of just-created part, with that part also set active" sequence
+that surfaced the occlusion issue, to confirm the suspend/restore
+fix actually resolves it.

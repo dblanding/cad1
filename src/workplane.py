@@ -641,4 +641,29 @@ class WorkPlane:
         if wireBldr.IsDone():
             self.wire = wireBldr.Wire()
             return True
+        # DIAGNOSTIC (added while chasing a "makeWire() failed" report
+        # that wasn't otherwise reproducible -- see DESIGN_BACKLOG item
+        # 33) -- purely additive, doesn't change return value/behavior.
+        # BRepBuilderAPI_WireError: 0=WireDone 1=EmptyWire
+        # 2=DisconnectedWire 3=NonManifoldWire
+        try:
+            from OCP.TopExp import TopExp_Explorer
+            from OCP.TopAbs import TopAbs_VERTEX
+            print(f"[WorkPlane.makeWire] FAILED. Error code="
+                  f"{wireBldr.Error()}  edgeList has {len(self.edgeList)} "
+                  f"edge(s):")
+            for i, edge in enumerate(self.edgeList):
+                try:
+                    pts = []
+                    exp = TopExp_Explorer(edge, TopAbs_VERTEX)
+                    while exp.More():
+                        p = BRep_Tool.Pnt_s(TopoDS.Vertex_s(exp.Current()))
+                        pts.append((round(p.X(), 3), round(p.Y(), 3), round(p.Z(), 3)))
+                        exp.Next()
+                    print(f"  edge[{i}]: endpoints={pts}")
+                except Exception as e:
+                    print(f"  edge[{i}]: (could not inspect: {e})")
+        except Exception as e:
+            print(f"[WorkPlane.makeWire] FAILED (diagnostic print itself "
+                  f"errored: {e})")
         return False

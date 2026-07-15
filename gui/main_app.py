@@ -1659,6 +1659,71 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_workplane_dialog'):
             self._workplane_dialog.set_active_part(node)
 
+    def _suspend_active_part_overlay(self):
+        """
+        PHASE 2 follow-up fix, DESIGN_BACKLOG item 33: reported as
+        "unable to pick center point for circle when part was
+        showing." Root cause: the active part has EDGE+VERTEX
+        selection activated on its own geometry (for fillet/positioning
+        picks) plus a persistent orange wireframe overlay -- both
+        useful normally, but directly competing with a sketch's
+        intersection markers for clicks (and visually cluttering them)
+        when a workplane sits on that same active part. Called by
+        SketchToolBar.set_workplane() while a workplane is active;
+        paired with _restore_active_part_overlay() below.
+        """
+        node = getattr(self, '_active_part_node', None)
+        if node is None:
+            return
+        ais = self.viewport._node_id_to_ais_shape.get(id(node))
+        overlay = getattr(self, '_active_part_overlay_ais', None)
+        ctx = self.viewport.context
+        if ais is not None:
+            try:
+                ctx.Deactivate(ais, AIS_Shape.SelectionMode_s(TopAbs_EDGE))
+                ctx.Deactivate(ais, AIS_Shape.SelectionMode_s(TopAbs_VERTEX))
+            except Exception as e:
+                print(f"[suspend_active_part_overlay] deactivate failed: {e}")
+        if overlay is not None:
+            try:
+                ctx.Erase(overlay, False)
+            except Exception as e:
+                print(f"[suspend_active_part_overlay] erase failed: {e}")
+        # Also clear any stale hover/selection highlight -- matches the
+        # user's own manual workaround of clicking empty space, done
+        # here automatically instead.
+        try:
+            ctx.ClearSelected(False)
+        except Exception:
+            pass
+        ctx.UpdateCurrentViewer()
+
+    def _restore_active_part_overlay(self):
+        """Undo _suspend_active_part_overlay() -- called by
+        SketchToolBar.deactivate() when the sketch session ends."""
+        node = getattr(self, '_active_part_node', None)
+        if node is None:
+            return
+        ais = self.viewport._node_id_to_ais_shape.get(id(node))
+        overlay = getattr(self, '_active_part_overlay_ais', None)
+        ctx = self.viewport.context
+        edge_mode = AIS_Shape.SelectionMode_s(TopAbs_EDGE)
+        vertex_mode = AIS_Shape.SelectionMode_s(TopAbs_VERTEX)
+        if ais is not None:
+            try:
+                ctx.Activate(ais, edge_mode)
+                ctx.Activate(ais, vertex_mode)
+                ctx.SetSelectionSensitivity(ais, edge_mode, 6)
+                ctx.SetSelectionSensitivity(ais, vertex_mode, 8)
+            except Exception as e:
+                print(f"[restore_active_part_overlay] activate failed: {e}")
+        if overlay is not None:
+            try:
+                ctx.Display(overlay, False)
+            except Exception as e:
+                print(f"[restore_active_part_overlay] display failed: {e}")
+        ctx.UpdateCurrentViewer()
+
         # Notify the fillet dialog
         if hasattr(self, '_fillet_dialog') and self._fillet_dialog.isVisible():
             self._fillet_dialog.set_active_part(node)

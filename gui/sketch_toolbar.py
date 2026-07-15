@@ -144,6 +144,13 @@ class SketchToolBar(QToolBar):
         required. Calling _display_clines() here renders the initial
         clines/markers immediately, matching what the user actually
         sees when they open the sketch toolbar.
+
+        Also suspends the active part's overlay/edge-vertex picking
+        (see MainWindow._suspend_active_part_overlay) -- reported as
+        "unable to pick center point for circle when part was
+        showing," since that overlay and the active part's own vertex
+        selection were directly competing with the sketch's
+        intersection markers when a workplane sits on that same part.
         """
         self._workplane = workplane
         self._viewport = viewport
@@ -153,6 +160,9 @@ class SketchToolBar(QToolBar):
         self._pending_floats = []
         self.setEnabled(True)
         self._display_clines()
+        win = self.window()
+        if hasattr(win, "_suspend_active_part_overlay"):
+            win._suspend_active_part_overlay()
 
     def clear_sketch(self):
         """Erase all sketch AIS objects and reset the WorkPlane geometry."""
@@ -177,6 +187,9 @@ class SketchToolBar(QToolBar):
         self._set_active_tool(None)
         self._active_prompt = None
         self.setEnabled(False)
+        win = self.window()
+        if hasattr(win, "_restore_active_part_overlay"):
+            win._restore_active_part_overlay()
 
     def receive_vertex_pick(self, raw_shape):
         """
@@ -250,6 +263,34 @@ class SketchToolBar(QToolBar):
         """Pop the next queued numeric value, or None if empty."""
         if self._pending_floats:
             return self._pending_floats.pop(0)
+        return None
+
+    def _available_points(self):
+        """
+        How many complete points can currently be assembled from the
+        queues -- each click is one point, each PAIR of queued floats
+        (typed X then Y, or sent from the calculator) is also one
+        point. Integer division, so a stray unpaired float doesn't
+        count. Used to check BEFORE calling _take_point() the needed
+        number of times, so a tool's completion check stays atomic
+        (all-or-nothing) even though a "point" can come from either
+        queue.
+        """
+        return len(self._pending_uvs) + len(self._pending_floats) // 2
+
+    def _take_point(self):
+        """
+        Pop one point: a clicked/snapped (u, v) if available, else two
+        queued floats consumed as (x, y) in the order they were
+        entered. Returns None if neither is available -- callers
+        should check _available_points() first for atomicity.
+        """
+        if self._pending_uvs:
+            return self._pending_uvs.pop(0)
+        if len(self._pending_floats) >= 2:
+            x = self._pending_floats.pop(0)
+            y = self._pending_floats.pop(0)
+            return (x, y)
         return None
 
     def _notify_status(self, text):
@@ -348,50 +389,56 @@ class SketchToolBar(QToolBar):
     # ------------------------------------------------------------------
 
     def _try_complete_hcl(self):
-        """H Cline needs 1 point (click), or 1 float (typed/calc Y value)."""
-        if self._pending_uvs:
-            pt = self._pending_uvs.pop(0)
-            self._workplane.hcl(pt)
-        elif self._pending_floats:
+        """
+        H Cline needs 1 point -- a click, OR two typed/calculator
+        floats (X then Y; only Y is actually used). Falls back to a
+        single typed/calculator float as a direct Y-value shortcut if
+        a full point isn't available (e.g. just one number typed).
+        """
+        pt = self._take_point()
+        if pt is None:
+            if not self._pending_floats:
+                return False
             y = self._pending_floats.pop(0)
-            self._workplane.hcl((0, y))
-        else:
-            return False
+            pt = (0, y)
+        self._workplane.hcl(pt)
         self._display_clines()
         return True
 
     def _try_complete_vcl(self):
-        """V Cline needs 1 point (click), or 1 float (typed/calc X value)."""
-        if self._pending_uvs:
-            pt = self._pending_uvs.pop(0)
-            self._workplane.vcl(pt)
-        elif self._pending_floats:
+        """V Cline: same as H Cline above, but for X."""
+        pt = self._take_point()
+        if pt is None:
+            if not self._pending_floats:
+                return False
             x = self._pending_floats.pop(0)
-            self._workplane.vcl((x, 0))
-        else:
-            return False
+            pt = (x, 0)
+        self._workplane.vcl(pt)
         self._display_clines()
         return True
 
     def _try_complete_hvcl(self):
-        """H+V Cline needs 1 point (click only -- a single typed number
-        can't unambiguously give both X and Y)."""
-        if not self._pending_uvs:
+        """H+V Cline needs 1 point -- a click, or two typed/calculator
+        floats (X then Y)."""
+        pt = self._take_point()
+        if pt is None:
             return False
-        pt = self._pending_uvs.pop(0)
         self._workplane.hvcl(pt)
         self._display_clines()
         return True
 
     def _try_complete_acl(self):
-        """Angled Cline needs 1 point + EITHER a 2nd point (direction)
-        OR a float (angle in degrees)."""
-        if len(self._pending_uvs) >= 2:
-            p1 = self._pending_uvs.pop(0)
-            p2 = self._pending_uvs.pop(0)
+        """
+        Angled Cline needs 1 point (click or typed X,Y) + EITHER a 2nd
+        point (direction; click or typed X,Y) OR a single leftover
+        float (angle in degrees).
+        """
+        if self._available_points() >= 2:
+            p1 = self._take_point()
+            p2 = self._take_point()
             self._workplane.acl(p1, pnt2=p2)
-        elif self._pending_uvs and self._pending_floats:
-            p1 = self._pending_uvs.pop(0)
+        elif self._available_points() >= 1 and self._pending_floats:
+            p1 = self._take_point()
             ang = self._pending_floats.pop(0)
             self._workplane.acl(p1, ang=ang)
         else:
@@ -400,11 +447,11 @@ class SketchToolBar(QToolBar):
         return True
 
     def _try_complete_lbcl(self):
-        """Linear Bisector needs 2 points (click only)."""
-        if len(self._pending_uvs) < 2:
+        """Linear Bisector needs 2 points (click, or typed X,Y each)."""
+        if self._available_points() < 2:
             return False
-        p1 = self._pending_uvs.pop(0)
-        p2 = self._pending_uvs.pop(0)
+        p1 = self._take_point()
+        p2 = self._take_point()
         self._workplane.lbcl(p1, p2)
         self._display_clines()
         return True
@@ -413,16 +460,17 @@ class SketchToolBar(QToolBar):
         """
         Circle / Constr Circle: TWO ways to specify it (mirrors
         KodaCAD) -- 2 points (center + point-on-circle, radius by
-        distance), or 1 point + a float (center + typed/calculator
+        distance; either point can be a click or typed X,Y), or 1
+        point + a single leftover float (center + typed/calculator
         radius).
         """
-        if len(self._pending_uvs) >= 2:
-            p1 = self._pending_uvs.pop(0)
-            p2 = self._pending_uvs.pop(0)
+        if self._available_points() >= 2:
+            p1 = self._take_point()
+            p2 = self._take_point()
             r = self._workplane.p2p_dist(p1, p2)
             self._workplane.circle(p1, r, constr=constr)
-        elif self._pending_uvs and self._pending_floats:
-            p1 = self._pending_uvs.pop(0)
+        elif self._available_points() >= 1 and self._pending_floats:
+            p1 = self._take_point()
             r = self._pending_floats.pop(0)
             self._workplane.circle(p1, r, constr=constr)
         else:
@@ -434,43 +482,44 @@ class SketchToolBar(QToolBar):
         return True
 
     def _try_complete_line(self):
-        """Line needs 2 points (click only)."""
-        if len(self._pending_uvs) < 2:
+        """Line needs 2 points (click, or typed X,Y each)."""
+        if self._available_points() < 2:
             return False
-        p1 = self._pending_uvs.pop(0)
-        p2 = self._pending_uvs.pop(0)
+        p1 = self._take_point()
+        p2 = self._take_point()
         self._workplane.line(p1, p2)
         self._display_profile(n_new=1)
         return True
 
     def _try_complete_rect(self):
-        """Rectangle needs 2 points (click only)."""
-        if len(self._pending_uvs) < 2:
+        """Rectangle needs 2 points (click, or typed X,Y each)."""
+        if self._available_points() < 2:
             return False
-        p1 = self._pending_uvs.pop(0)
-        p2 = self._pending_uvs.pop(0)
+        p1 = self._take_point()
+        p2 = self._take_point()
         self._workplane.rect(p1, p2)
         self._display_profile(n_new=4)
         return True
 
     def _try_complete_arcc2p(self):
-        """Arc Ctr-2Pts needs 3 points: center, start, end (click only)."""
-        if len(self._pending_uvs) < 3:
+        """Arc Ctr-2Pts needs 3 points: center, start, end (click, or
+        typed X,Y each)."""
+        if self._available_points() < 3:
             return False
-        center = self._pending_uvs.pop(0)
-        p1 = self._pending_uvs.pop(0)
-        p2 = self._pending_uvs.pop(0)
+        center = self._take_point()
+        p1 = self._take_point()
+        p2 = self._take_point()
         self._workplane.arcc2p(center, p1, p2)
         self._display_profile(n_new=1)
         return True
 
     def _try_complete_arc3p(self):
-        """Arc 3Pts needs 3 points (click only)."""
-        if len(self._pending_uvs) < 3:
+        """Arc 3Pts needs 3 points (click, or typed X,Y each)."""
+        if self._available_points() < 3:
             return False
-        p1 = self._pending_uvs.pop(0)
-        p2 = self._pending_uvs.pop(0)
-        p3 = self._pending_uvs.pop(0)
+        p1 = self._take_point()
+        p2 = self._take_point()
+        p3 = self._take_point()
         self._workplane.arc3p(p1, p2, p3)
         self._display_profile(n_new=1)
         return True
@@ -496,8 +545,12 @@ class SketchToolBar(QToolBar):
         self.addSeparator()
         self.addAction(_icon("del_el"),"Delete Last",      self._do_del_el)
         self.addAction(_icon("del_g"), "Clear All",        self._do_clear)
-        self.addSeparator()
-        self.addAction(_icon("del_c"), "Cancel Tool",      self._do_cancel_tool)
+        # "Cancel Tool" removed from the toolbar (PHASE 2 follow-up,
+        # DESIGN_BACKLOG item 33) -- redundant with the status bar's
+        # "End Operation" button, which does the same thing for sketch
+        # tools AND also covers By-3-Points/On-Face picking. Toolbar
+        # was getting crowded with more tools planned; _do_cancel_tool
+        # itself stays, still called by MainWindow._on_end_operation.
 
     def _guard(self):
         """Return False and warn if no workplane is set."""
