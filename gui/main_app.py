@@ -1355,9 +1355,12 @@ class MainWindow(QMainWindow):
 
     def _on_workplane_by_3pts(self):
         """
-        Direction from pt1 to pt2 sets the workplane's W direction
-        (normal); pt2 becomes the origin. Direction from pt2 to pt3
-        sets the U direction. Mirrors KodaCAD's wpBy3Pts.
+        Point 1 is the origin. Point 2 is on the U axis (sets the U
+        direction). Point 3 specifies the V axis -- in practice, the
+        component of (point 3 - origin) perpendicular to U, i.e.
+        point 3 just needs to be on the +V side of the U axis to
+        determine the UV plane; it doesn't need to sit exactly on the
+        V axis itself.
         """
         if self._assembly is None:
             return
@@ -1370,8 +1373,7 @@ class MainWindow(QMainWindow):
             ctx.Activate(ais, AIS_Shape.SelectionMode_s(TopAbs_VERTEX))
         ctx.UpdateCurrentViewer()
         self.statusBar().showMessage(
-            "By 3 Points: pick point 1 (with point 2, sets the W/normal "
-            "direction).")
+            "By 3 Points: pick point 1 (the origin).")
 
     def _on_wp3pts_vertex_picked(self, raw_shape):
         from OCP.BRep import BRep_Tool
@@ -1387,10 +1389,10 @@ class MainWindow(QMainWindow):
         n = len(self._wp3pts_points)
         if n == 1:
             self.statusBar().showMessage(
-                "By 3 Points: pick point 2 (becomes the workplane origin).")
+                "By 3 Points: pick point 2 (on the U axis).")
         elif n == 2:
             self.statusBar().showMessage(
-                "By 3 Points: pick point 3 (sets the U direction).")
+                "By 3 Points: pick point 3 (specifies the V axis).")
         elif n == 3:
             self._finish_workplane_by_3pts()
 
@@ -1401,9 +1403,28 @@ class MainWindow(QMainWindow):
         self._wp3pts_points = []
 
         try:
-            wDir = gp_Dir(gp_Vec(p1, p2))
-            uDir = gp_Dir(gp_Vec(p2, p3))
-            axis3 = gp_Ax3(p2, wDir, uDir)
+            # Origin = p1. U direction = p1 -> p2.
+            u_vec = gp_Vec(p1, p2)
+            uDir = gp_Dir(u_vec)
+
+            # V direction from p3: NOT required to sit exactly on the
+            # V axis -- take (p3 - p1) and remove its U component
+            # (Gram-Schmidt), leaving the part perpendicular to U, on
+            # whichever side p3 was picked. This is what "point 3
+            # specifies the V axis" actually means under the hood.
+            u_unit = gp_Vec(uDir)
+            raw_v = gp_Vec(p1, p3)
+            v_vec = raw_v.Subtracted(u_unit.Multiplied(raw_v.Dot(u_unit)))
+            if v_vec.Magnitude() < 1e-9:
+                raise RuntimeError(
+                    "point 3 is collinear with the U axis -- pick a "
+                    "point off to the side to define the V direction."
+                )
+            vDir = gp_Dir(v_vec)
+            w_vec = u_unit.Crossed(v_vec)
+            wDir = gp_Dir(w_vec)
+
+            axis3 = gp_Ax3(p1, wDir, uDir)
             wp = WorkPlane(size=80, ax3=axis3)
         except Exception as e:
             self.statusBar().showMessage(

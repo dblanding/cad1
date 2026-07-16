@@ -31,10 +31,10 @@ Both developer and user contributions welcome.
     * Can the AIS manipulator be adpated to allow a precise value to be specified?
     * How about move between 2 points?
         * (I already have the abiltiy to align 2 cylindrical faces)
-* Add function: **Copy part/assy**
 
 ---
 
+* Add function: **Copy part/assy**
 * For saving sessions:
     * Propose saving a step file to a /tmp/sessions/folder using an appended '_n' (incrementing)
     * By default:

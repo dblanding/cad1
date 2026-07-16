@@ -1,16 +1,16 @@
 # BasiCAD — DIY CAD app
 
-A from-scratch CAD application
+A from-scratch 3D CAD application
 * Built on `build123d`/OCP (OpenCascade)
-* Patterned after HP's dynamic/direct modeling lineage (ME-30 → SolidDesigner → CoCreate)
-* Intended to meet this basic workflow:
+* Patterned after HP's dynamic modeling lineage (ME-30 → SolidDesigner)
+* Intended to meet the basic requirements in a typical CAD workflow:
     * Start a new session or load a previous one (saved in STEP format)
     * Import components in STEP format
     * Position them within an assembly structure
-    * Create simple mounting plates / brackets
+    * Create simple mounting plates & brackets
     * Save session in STEP format
 * Part creation workflow: workplane → sketch → extrude/revolve → modify 
-* Based on the original [KodaCAD](https://dblanding.github.io/kodacad/)
+* Based on the original [KodaCAD](https://github.com/dblanding/kodacad)
 
 ## Layout
 

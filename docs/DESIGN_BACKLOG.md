@@ -3219,3 +3219,35 @@ reachable via a menu before this change.
 the tree panel now shows noticeably more rows without scrolling, and
 that hovering over the tree still shows the show/hide + drag-to-reparent
 hint as a tooltip.
+
+## 40. By 3 Points: switched to Origin / U-axis-point / V-side-point semantics
+
+Requested: clearer prompts for the By 3 Points workplane route.
+Previously mirrored KodaCAD's `wpBy3Pts` literally -- point 1 -> point
+2 set the W/normal direction, point 2 became the origin, point 2 ->
+point 3 set U. Confusing to explain and to use. New semantics:
+
+- **Point 1** = the origin.
+- **Point 2** = on the U axis (direction from origin to point 2 = U).
+- **Point 3** = specifies the V axis -- but does NOT need to sit
+  exactly on it. Under the hood, only the component of
+  (point 3 - origin) perpendicular to U is used (Gram-Schmidt), so
+  point 3 just needs to be on the +V side of the U axis to determine
+  the UV plane. Prompts say "specifies the V axis" rather than
+  "on the V axis" specifically to avoid implying it must be exact.
+
+**`gui/main_app.py`, `_finish_workplane_by_3pts`:** `uDir =
+gp_Dir(gp_Vec(p1, p2))`; `v_vec` = `(p3 - p1)` minus its projection
+onto U (the perpendicular residual); raises a clear "collinear with
+the U axis" error if that residual is ~zero (i.e. point 3 picked
+directly on the U axis, giving no V information at all);
+`wDir = gp_Dir(u_unit.Crossed(v_vec))`; `gp_Ax3(p1, wDir, uDir)` ->
+`WorkPlane(size=80, ax3=axis3)`, same construction path as before.
+
+Status-bar prompts updated to match: "pick point 1 (the origin)" ->
+"pick point 2 (on the U axis)" -> "pick point 3 (specifies the V
+axis)".
+
+**Not yet tested against a running Qt/OCCT display.** Please confirm
+the resulting workplane's origin/U/V orientation matches intuition
+for a simple 3-point pick (e.g. three corners of a rectangular face).
