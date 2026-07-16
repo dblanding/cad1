@@ -1,34 +1,16 @@
 # BasiCAD — DIY CAD app
 
-A from-scratch CAD application built on `build123d`/OCP (OpenCascade),
-patterned after HP's dynamic/direct modeling lineage (ME-30 →
-SolidDesigner → CoCreate), with a workplane → sketch → extrude/revolve
-→ modify workflow and a native assembly tree + 3D viewport, in the
-spirit of the original [KodaCAD](https://dblanding.github.io/kodacad/).
-
-## Status
-
-- ✅ **STEP round-trip** (import assembly → inspect hierarchy → add/
-  remove parts → export) — confirmed working on real-world files from
-  multiple CAD systems. See `docs/STEP_NOTES.md` for the full story,
-  including a real upstream `build123d` bug found and worked around.
-- ✅ **GUI / 3D viewport** — native OCCT viewer embedded in PySide6:
-  render, orbit/pan/zoom, click-to-select picking (face/edge/vertex),
-  assembly tree with show/hide and drag-and-drop reparenting,
-  bidirectional selection sync between tree and viewport. See
-  `docs/VIEWPORT_NOTES.md`.
-- ✅ **Pose math + real-geometry picking, proven end to end** —
-  `PointRef`/`DirectionRef` picking-target resolution (including a
-  circle-fit fallback for STEP files that don't encode clean `CIRCLE`
-  edges), `Plane`-based frame construction, and moving a real part in
-  place via `Shape.move()` — all verified together on a real,
-  multi-part STEP assembly: pick → resolve → move → export → reload
-  in an independent viewer. See `docs/DESIGN_BACKLOG.md` §5 for the
-  full account, including two real bugs found and fixed along the way.
-- 🚧 **Position/Mate-Align accumulator workflow, undo/redo, file
-  format** — designed in conversation, not yet built. The groundwork
-  above is the proven foundation the accumulator sits on. See
-  `docs/DESIGN_BACKLOG.md`.
+A from-scratch CAD application
+* Built on `build123d`/OCP (OpenCascade)
+* Patterned after HP's dynamic/direct modeling lineage (ME-30 → SolidDesigner → CoCreate)
+* Intended to meet this basic workflow:
+    * Start a new session or load a previous one (saved in STEP format)
+    * Import components in STEP format
+    * Position them within an assembly structure
+    * Create simple mounting plates / brackets
+    * Save session in STEP format
+* Part creation workflow: workplane → sketch → extrude/revolve → modify 
+* Based on the original [KodaCAD](https://dblanding.github.io/kodacad/)
 
 ## Layout
 
@@ -64,15 +46,12 @@ archive_diagnostics/
 uv sync          # installs everything from pyproject.toml / uv.lock
 ```
 
-## Running things
+## Usage:
+* Run *main_app.py* in terminal (optional STEP file to open as argument):
+    * `uv run gui/main_app.py` 
+    * `uv run gui/main_app.py step/as1-oc-214.stp`
 
-```bash
-uv run src/step_assembly_poc.py [path/to/assembly.step]
-uv run src/pose.py                                # pose/circle-fit self-test (no GUI)
-uv run gui/main_app.py [path/to/assembly.step]     # the real, merged app
-uv run gui/test_move_rod_axially.py step/as1-oc-214.stp   # full pick->pose->move->export test
-```
-
+    
 ## Docs index
 
 - [`docs/STEP_NOTES.md`](docs/STEP_NOTES.md) — STEP import/export
