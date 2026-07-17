@@ -3251,3 +3251,221 @@ axis)".
 **Not yet tested against a running Qt/OCCT display.** Please confirm
 the resulting workplane's origin/U/V orientation matches intuition
 for a simple 3-point pick (e.g. three corners of a rectangular face).
+
+## 41. Found and fixed the actual cause of the 198MB -> 1.1GB export bloat
+
+Reported: deleted ALL instances of several repeated parts (tires,
+hubs) from an imported 198MB assembly, then exported -- got 1.1GB.
+Confirmed by grep that the deleted parts' names don't appear anywhere
+in the output (ruling out "deleted geometry lingering"), which
+pointed the investigation toward the export process itself rather
+than deletion. Decisive check requested and run:
+
+```
+PRODUCT_DEFINITION:              3
+NEXT_ASSEMBLY_USAGE_OCCURRENCE:  2
+MANIFOLD_SOLID_BREP:           443
+```
+
+443 independent solid bodies under only 3 product definitions and 2
+assembly-occurrence references -- almost the entire multi-level part
+hierarchy had collapsed into a handful of monolithic, non-decomposed
+geometry blobs rather than a proper instanced assembly structure.
+
+**This matches a bug this project had already found and diagnosed
+once before**, in `archive_diagnostics/diagnose_root_assembly_flag.py`
+-- found originally while chasing a DIFFERENT symptom (exports
+failing entirely with `IFSelect_RetVoid`), but never actually fixed
+in the shipped code, since the fix that shipped (`step_export_fix.py`)
+only addressed a separate bug (the spurious-parent issue) found in
+the same investigation.
+
+**Root cause:** `build123d.exporters3d._create_xde()`'s per-node loop
+always registers the ROOT node via `shape_tool.AddShape(node.wrapped,
+False)` -- `makeAssembly` hard-coded `False`, regardless of whether
+the root is actually a multi-part assembly. Every child then gets
+added via `AddComponent(parent_label, node.wrapped)`, but per OCCT's
+own documentation, `AddComponent`'s target "must be `IsAssembly()` or
+`IsSimpleShape()`" -- a root registered with `makeAssembly=False` is
+a simple shape, not a genuine assembly, so the proper hierarchical
+component/instance structure `AddComponent` is supposed to build
+doesn't get established correctly beneath it. The underlying
+`TopoDS_Compound` topology still genuinely contains all the nested
+solids (hence 443 `MANIFOLD_SOLID_BREP` entries showing up at the
+geometry-writer level), but almost none of them get their own
+`PRODUCT_DEFINITION`/name/instance registration at the XDE level --
+which also means none of the size-saving instance/reference sharing
+STEP assemblies rely on for repeated parts is available; every one of
+those 443 solids gets fully, independently serialized.
+
+**Fix (`src/step_export_fix.py`, full rewrite):** the previous version
+was a thin wrapper that severed the spurious parent, then delegated
+to the REAL (buggy) `build123d.export_step()`. Since the actual bug
+lives inside `_create_xde()`, delegating can't fix it -- so this
+module now builds its own XDE document (`_create_xde_corrected()`,
+adapted directly from the diagnostic's already-tested
+`create_xde_corrected()`) with the root's `makeAssembly` flag computed
+dynamically (`isinstance(node, Compound) and len(node.children) > 0`)
+instead of hard-coded `False`, and writes it with a faithful copy of
+build123d's real writer setup (adapted from
+`diagnose_step_write_v2.py`, confirmed against source during that
+investigation) instead of delegating to build123d's writer path at
+all. The spurious-parent fix is preserved unchanged.
+
+Checked every call site in this codebase first (`main_app.py`,
+`workplane_dialog.py`, `test_move_rod_axially.py`,
+`step_assembly_poc.py`) -- none override `write_pcurves`,
+`precision_mode`, or `timestamp`, so those are accepted for signature
+compatibility but not fully wired into the reimplementation (a
+warning prints if a non-default `precision_mode` is ever passed).
+
+**Not tested against a running build123d/OCP install** -- this
+sandbox doesn't have either installed, so this was built and
+syntax-checked, but not run, by combining two already-independently-
+tested pieces from `archive_diagnostics/` rather than writing new,
+unverified OCCT/XDE logic from scratch. The module's own `__main__`
+self-test now also prints the same three entity counts used to
+diagnose this, specifically so re-running it against the same 198MB
+source file is a direct, fast confirmation:
+
+```
+python3 src/step_export_fix.py path/to/the_198mb_file.step
+```
+
+Please run that (or just retry the real delete+export workflow) and
+compare the resulting `PRODUCT_DEFINITION`/`NEXT_ASSEMBLY_USAGE_OCCURRENCE`
+/`MANIFOLD_SOLID_BREP` counts and file size against the numbers above.
+
+## 42. Hardened load_assembly() against non-Compound import results
+
+Follow-up to item 41. The 198MB-file investigation surfaced a second,
+concrete casualty of the root-assembly-flag bug: a session file
+(`as1-oc-214.stp`-derived) that had previously been exported by
+BasiCAD's own (then-buggy) exporter lost its top assembly wrapper
+("as1") entirely -- confirmed directly by the user. Re-importing that
+flattened file at startup handed back something that wasn't a genuine
+`Compound`, which crashed much later and far from the real cause,
+inside `add_node()`'s `isinstance` check (`ValueError: \`parent\` must
+be of type Compound`), while trying to attach an unrelated new STEP
+import under the corrupted root.
+
+**Fix (`src/step_assembly_poc.py`, `load_assembly()`):** checks the
+type of `import_step()`'s result; if it's not a `Compound` (any STEP
+file with a flattened/malformed root, not just ones affected by item
+41's bug specifically), wraps it in a fresh `Compound` immediately, so
+every downstream consumer (`add_node`, `get_target_node`, etc.) can
+keep relying on "the loaded root is always a Compound" unconditionally
+instead of that assumption breaking unpredictably, later, in unrelated
+code. `load_and_display_assembly()` (the startup-load path) already
+calls this same `load_assembly()`, so the fix covers both the
+command-line startup file and the Import STEP button without needing
+a second patch.
+
+Doesn't repair an already-flattened file's LOST structure (the "as1"
+wrapper itself is genuinely gone from that specific corrupted file --
+no way to reconstruct it after the fact) -- just prevents that kind of
+file from crashing the app; the user's own plan (redo the session
+export using the now-fixed exporter) is the actual resolution for the
+data itself.
+
+**Not tested against a running build123d/OCP install.**
+
+## 43. Confirmed: deleted parts' geometry can survive export via shared-instance sharing (ties to STEP_NOTES.md's deferred limitation)
+
+Follow-up to items 41/42. After ruling out three specific hypotheses
+(export-side collapse on a standalone nested file, a flat
+delete-then-export synthetic repro, and `.wrapped`/`.children`
+desync -- all came back clean), a small, fully human-readable test
+using real STEP files finally pinned it down.
+
+### The test
+
+- `as1-plate-only.step` (69KB) -- session containing just "as1" + "plate".
+- `clamping-hub- assembly.step` (3.9MB) -- external file with a hub
+  ("1301-0016-4012", wrapped in "1301-0016-4012_assembly") and a screw
+  ("2800-0004-0010_90128A207").
+- Imported the hub assembly into the session, exported ->
+  `as1-plate+hub-asy.step` (5,344,839 bytes).
+- Deleted the hub via RMB, exported again ->
+  `as1-plate+hub-del-hub.step` (5,345,255 bytes -- LARGER, despite a
+  part having just been deleted).
+
+### The evidence
+
+`MANIFOLD_SOLID_BREP` and `ADVANCED_FACE` counts are IDENTICAL before
+and after deletion (3 and 404, unchanged) -- the hub's actual geometry
+never left the file. Directly comparing the two files' `PRODUCT` and
+`NEXT_ASSEMBLY_USAGE_OCCURRENCE` entries by name:
+
+- The hub assembly's real name (`1301-0016-4012_assembly`) appears
+  TWICE in the post-deletion file -- once replaced by the literal
+  generic word `ASSEMBLY` early in the file, and once again, correctly
+  named, much further down.
+- The hub's own name (`1301-0016-4012`) is similarly replaced by the
+  literal generic word `SOLID`:
+  `#2469 = PRODUCT('SOLID','SOLID','',(#2470));`
+- One `NEXT_ASSEMBLY_USAGE_OCCURRENCE`'s name field contains
+  `=>[0:1:1:3]` -- OCCT's own internal `TDF_Label` entry-path
+  notation, not a real name. This is what
+  `shape_tool.SetAutoNaming_s(True)` (set in
+  `step_export_fix.py`'s `_create_xde_corrected()`) falls back to
+  synthesizing for a label that has no real name assigned.
+
+### What this means
+
+The hub's underlying shape data is still structurally present and
+gets re-registered during export -- unnamed -- even though its Python
+tree node was correctly removed by `remove_node()` beforehand
+(confirmed separately in item 42's diagnostic: `remove_node()` does
+correctly update the Python `.children` tree). The most likely
+explanation: this is the SAME limitation already flagged and
+deliberately deferred early in this project, documented in
+`docs/STEP_NOTES.md`'s "shared vs. copied assemblies" section --
+`import_step()` can leave leaf-level solids genuinely SHARING the
+same underlying OCCT `TShape` data across what look like independent
+Python objects, even when the container/assembly-level Python
+structure is fully independent per occurrence. If the hub's shape
+data happens to be shared at that level with something that's still
+present after deletion (its own wrapper assembly, most likely, or
+some other still-present sibling), removing the hub's Python node
+doesn't sever that shared reference -- and when `_create_xde_corrected()`
+walks whatever's left, it can rediscover and re-register that shared
+geometry through the survivor, with no name, since nothing in the
+export code explicitly visits or names that specific internal
+XCAF-level reference (it isn't a distinct node in the Python
+tree at all -- it's OCCT's own internal shared-component bookkeeping).
+
+This is NOT a simple one-line bug -- it's the practical, now
+concretely-demonstrated consequence of the exact thing
+`STEP_NOTES.md` called out as "a meaningfully bigger scope than
+anything else built so far" and deliberately deferred: properly
+handling shared/instanced geometry requires working with
+`XCAFDoc_ShapeTool`'s actual reference/instance semantics directly,
+rather than relying on build123d's Python-tree abstraction, which
+doesn't fully expose or track that sharing at the level needed to
+correctly sever it on deletion.
+
+### Low-risk mitigation available now (not a fix)
+
+`SetAutoNaming_s(True)` -> `False` in `step_export_fix.py` would stop
+the misleading `=>[0:1:1:N]`-style fake-looking names from being
+generated for orphaned/unnamed internal references. Would NOT stop
+the underlying geometry from surviving deletion -- just prevents it
+from being mistaken for genuine, meaningful data when someone goes
+looking (as happened here). Not yet applied -- worth doing either way,
+but flagging that it's cosmetic/honesty-preserving, not a resolution.
+
+### Real fix path (not started, substantial scope)
+
+Would need to work with `XCAFDoc_ShapeTool`'s shared-instance API
+directly (querying/tracking actual `TShape` sharing at the
+label/reference level, and either (a) genuinely deduplicating on
+export so a shared shape is written once and referenced, which would
+ALSO finally deliver proper compact assemblies for repeated parts
+generally -- tying back to item 41's original bloat investigation --
+or (b) detecting when a deletion would orphan a still-referenced
+shared shape and explicitly stripping that reference too, not just
+the Python-tree link). This is a genuinely bigger, dedicated body of
+work, not a quick patch -- consistent with `STEP_NOTES.md`'s original
+assessment. Deferred, by mutual agreement, for a dedicated future
+session rather than a late-night patch attempt.
